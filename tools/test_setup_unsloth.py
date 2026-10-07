@@ -1,5 +1,5 @@
 """Tests for setup.py's Unsloth choices (docs/UNSLOTH_Q4.md): UD-IQ4_XS (regular from 0.1.39) and the experimental
-UD-Q4_K_XL: the four pinned shards with
+UD-Q4_K_XL and UD-Q2_K_XL: the pinned shards with
 their sizes and SHA-256, the RAM budget from the PC's RAM, the pack with --compat-bf16 (never experts.bin), the
 engine version it needs, one GPU, no images.  Mocked - no GPU, no downloads, nothing written outside a temp folder.
 
@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 import setup  # noqa: E402
 
 M = "UD-Q4_K_XL"
+Q = "UD-Q2_K_XL"
 REV = "38bb39ee97821de2c9009abb7e93950eec396e66"
 
 
@@ -112,6 +113,7 @@ class Config(unittest.TestCase):
     def test_choices_from_config(self):
         with tempfile.TemporaryDirectory() as t:
             for name, family, model in (("strata-unsloth-ud-q4_k_xl.json", "unsloth", M),
+                                        ("strata-unsloth-ud-q2_k_xl.json", "unsloth", Q),
                                         ("strata-swift-iq3_xxs.json", "swift", "IQ3_XXS"),
                                         ("strata-iq3_s.json", "qwen", "IQ3_S"),
                                         ("strata-coder-iq1_m.json", "coder", "IQ1_M")):
@@ -407,7 +409,7 @@ class IQ4XS(Base):
             self.assertEqual(fam["sha256"][n], setup.UNSLOTH_SHARDS[n])
         self.assertAlmostEqual(setup.MODELS[X]["download_gb"], 93682584224 / 1e9, places=1)
         self.assertEqual(setup.MODELS[X]["families"], ("unsloth",))
-        self.assertEqual([m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ())], [M, X])
+        self.assertEqual([m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ())], [M, X, Q])
         self.assertIsNone(setup.gguf_unsupported(names[0]))                    # #444: a file setup runs now
         self.assertEqual(setup.gguf_choice(names[0]), ("unsloth", X))
         self.assertEqual(setup.budget_model({"args": ["--native", "/m/" + names[0]]}), X)
@@ -515,6 +517,141 @@ class IQ4XS(Base):
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip"], version="0.1.38", amd=r9700, m=X)
         self.assertNotIn("has not been run on AMD cards yet", out)
         self.assertIn("RAM budget: 40 GiB of UD-IQ4_XS's experts", out)
+
+
+class Q2KXL(Base):
+    """Experimental smaller Unsloth pack: pinned files, local-file setup, and no claim of hardware validation."""
+
+    def test_pins_and_model_limits(self):
+        expected = {
+            "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf":
+                (10946624, "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86"),
+            "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf":
+                (49979779296, "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6"),
+            "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf":
+                (28878402944, "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9"),
+        }
+        fam = setup.FAMILIES["unsloth"]
+        self.assertEqual(setup.UNSLOTH_Q2_K_XL_SHARDS, expected)
+        self.assertEqual(sum(size for size, _ in expected.values()), 78869128864)
+        self.assertEqual([setup.model_file(fam, Q, i) for i in range(1, setup.model_shards(fam, Q) + 1)],
+                         list(expected))
+        for name, pin in expected.items():
+            self.assertEqual(fam["sha256"][name], pin)
+        self.assertEqual(fam["hf"].format(q=Q),
+                         f"https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/{REV}/{Q}/")
+        model = setup.MODELS[Q]
+        self.assertEqual(model["families"], ("unsloth",))
+        self.assertTrue(model["experimental"])
+        self.assertTrue(model["nvidia_only"])
+        self.assertTrue(model["budget"])
+        self.assertEqual(model["ram_gb"], 48)
+        self.assertAlmostEqual(model["arena_gb"], 46.0849152)
+        self.assertEqual(model["download_gb"], 78.9)
+        self.assertFalse(model["vision"])
+
+    def test_budget_and_manual_file_recognition(self):
+        self.assertEqual(setup.resident_budget_gib(Q, 63.7), 40)
+        self.assertEqual(setup.resident_budget_gib(Q, 95.8), 42)
+        self.assertEqual(setup.resident_budget_gib(Q, 256), 42)
+        self.assertEqual(setup.resident_budget_gib(Q, 63.7, 1.7), 38)
+        self.assertAlmostEqual(setup.unsloth_split_need_gb(Q), 78.9 + setup.UNSLOTH_RAM_LEFT_GB)
+        first = "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"
+        self.assertIsNone(setup.gguf_unsupported(first))
+        self.assertEqual(setup.gguf_choice(first), ("unsloth", Q))
+        self.assertEqual(setup.budget_model({"args": ["--native", "/models/" + first]}), Q)
+        self.assertEqual(setup.gguf_unsupported("Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"),
+                         "UD-IQ3_XXS")
+
+    def test_install(self):
+        code, out, cfg = self.main(["--context", "8192"], version="0.1.40", m=Q)
+        self.assertEqual(code, 0, out)
+        self.assertIn("EXPERIMENTAL", out)
+        self.assertNotIn("quality checked against llama.cpp", out)
+        base = f"https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/{REV}/{Q}/"
+        self.assertEqual(self.downloads, [base + n for n in setup.UNSLOTH_Q2_K_XL_SHARDS])
+        self.assertEqual(self.verified, [(n, *v) for n, v in setup.UNSLOTH_Q2_K_XL_SHARDS.items()])
+        packs = [r for r in self.runs if r[1].endswith("iq_pack.py")]
+        self.assertEqual(len(packs), 1, self.runs)
+        self.assertIn("--compat-bf16", packs[0])
+        self.assertNotIn("--experts-bin", packs[0])
+        self.assertTrue(packs[0][packs[0].index("--gguf") + 1].endswith(f"{Q}-00001-of-00003.gguf"))
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "40")
+        self.assertTrue(args[args.index("--native") + 1].endswith(f"{Q}-00001-of-00003.gguf"))
+        for flag in ("--ple-gguf", "--mmap-experts", "--resident-experts", "--vision", "--kv-resident"):
+            self.assertNotIn(flag, args)
+        self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-unsloth-ud-q2_k_xl")
+        pack = self.t / "data" / "packs" / "unsloth-ud-q2_k_xl"
+        self.assertEqual(packs[0][packs[0].index("--out") + 1], str(pack))
+        self.assertEqual(args[args.index("--pack") + 1], str(pack))
+        self.assertEqual(cfg["tokenizer"], str(pack / "tokenizer"))
+        self.assertNotIn("vision", cfg)
+        ch = setup.choices_from_config(self.t / "strata-unsloth-ud-q2_k_xl.json")
+        self.assertEqual((ch["family"], ch["model"]), ("unsloth", Q))
+
+    def test_manually_downloaded_shards_are_used_in_place(self):
+        folder = self.t / "manual-download"
+        folder.mkdir()
+        for name in setup.UNSLOTH_Q2_K_XL_SHARDS:
+            (folder / name).write_bytes(b"")
+        with mock.patch.object(setup, "whole_shard", lambda s: True):
+            code, out, cfg = self.main(["--context", "8192", "--gguf-dir", str(folder)], version="0.1.40", m=Q)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.downloads, [])
+        self.assertEqual(self.verified, [(n, *v) for n, v in setup.UNSLOTH_Q2_K_XL_SHARDS.items()])
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--native") + 1], str(folder / next(iter(setup.UNSLOTH_Q2_K_XL_SHARDS))))
+        self.assertFalse(any("--experts-bin" in r for r in self.runs))
+
+    def test_old_engine_stops_before_the_download(self):
+        code, out, cfg = self.main(["--context", "8192"], version="0.1.39", m=Q)
+        self.assertEqual(code, 1, out)
+        self.assertIn("needs engine 0.1.40 or newer; this one is 0.1.39", out)
+        self.assertEqual(self.downloads, [])
+        self.assertIsNone(cfg)
+
+    def test_kv_streaming_and_larger_ram_budget(self):
+        code, out, cfg = self.main(["--context", "131072"], version="0.1.40", m=Q)
+        self.assertEqual(code, 0, out)
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--max-context") + 1], "131072")
+        self.assertEqual(args[args.index("--kv-resident") + 1], "32768")
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "38")
+        code, out, cfg = self.main(["--context", "8192"], version="0.1.40", ram=95.8, m=Q)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "42")
+
+    def test_third_menu_option_is_experimental(self):
+        code, out, cfg = self.main(["--context", "8192"], version="0.1.40", m=Q, model=False,
+                                   answers={"Which size": "3"})
+        self.assertEqual(code, 0, out)
+        line = next(ln for ln in out.splitlines() if ln.startswith("  3) UD-Q2_K_XL"))
+        self.assertIn("EXPERIMENTAL", line)
+        self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-unsloth-ud-q2_k_xl")
+
+    def test_amd_requires_a_choice_before_the_download(self):
+        r9700 = [{"index": 0, "name": "AMD Radeon AI PRO R9700", "vram_gb": 31.9, "arch": "gfx1201",
+                  "driver": "amdgpu"}]
+        code, out, cfg = self.main(["--context", "8192", "--backend", "hip", "--vision", "no"], version="0.1.40",
+                                   m=Q, model=False, amd=r9700, answers={"Which size": "3", "Try it anyway": "n"})
+        self.assertEqual(code, 1, out)
+        self.assertIn("has not been run on AMD cards yet", out)
+        self.assertIn("performance and correctness", out)
+        self.assertNotIn("prompt kernels are NVIDIA-only", out)
+        self.assertIn("--model UD-Q2_K_XL --yes", out)
+        self.assertEqual(self.downloads, [])
+        self.assertIsNone(cfg)
+
+    def test_no_images_or_expert_copy(self):
+        code, out, cfg = self.main(["--context", "8192", "--vision", "yes", "--low-ram", "on"],
+                                   version="0.1.40", m=Q)
+        self.assertEqual(code, 0, out)
+        self.assertIn("images are not available with UD-Q2_K_XL", out)
+        self.assertIn("--low-ram on does not apply", out)
+        self.assertNotIn("vision", cfg)
+        self.assertNotIn("--vision", cfg["args"])
+        self.assertFalse(any("--experts-bin" in r for r in self.runs))
 
 
 class LayerSplit(unittest.TestCase):

@@ -93,8 +93,8 @@ class GgufDirShards(unittest.TestCase):
 
 
 class GgufDirUnsupported(unittest.TestCase):
-    """#444: --gguf-dir with GGUFs Strata cannot run (Unsloth's UD-IQ3_XXS, UD-Q2_K_XL) says so, names the files it
-    runs (ISTA-DASLab's GSQ-RCO, the Coder's, Unsloth's UD-Q4_K_XL) and the --family/--model of the usable ones."""
+    """#444: --gguf-dir with unsupported GGUFs (Unsloth's UD-IQ3_XXS) says so, names the supported files and the
+    --family/--model of the usable ones, including experimental UD-Q2_K_XL."""
     UD = ["Qwen3.8-Flash-Next-UD-IQ3_XXS-%05d-of-00003.gguf" % i for i in range(1, 4)] + \
          ["Qwen3.8-Flash-Next-UD-Q2_K_XL-%05d-of-00003.gguf" % i for i in range(1, 4)]
 
@@ -109,7 +109,7 @@ class GgufDirUnsupported(unittest.TestCase):
 
     def test_quant_names(self):
         for name, want in (("Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf", "UD-IQ3_XXS"),
-                           ("Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", "UD-Q2_K_XL"),
+                           ("Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", None),
                            ("model-Q4_K_M.gguf", "Q4_K_M"),
                            ("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", None),
                            ("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", None),
@@ -122,19 +122,21 @@ class GgufDirUnsupported(unittest.TestCase):
         self.assertEqual(msg, "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf is UD-IQ3_XXS, a GGUF Strata "
                               "cannot run")
         self.assertIn("ISTA-DASLab's GSQ-RCO files", hint)
-        self.assertIn("Unsloth's UD-Q4_K_XL and UD-IQ4_XS only", hint)
+        self.assertIn("Unsloth's UD-Q4_K_XL, UD-IQ4_XS and experimental UD-Q2_K_XL", hint)
 
     def test_a_folder_without_the_choice_names_what_is_there(self):
         gsq = ["Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-%05d-of-00002.gguf" % i for i in (1, 2)]
         msg, hint = self.problem(self.UD + gsq, "unsloth", "UD-Q4_K_XL")
         self.assertEqual(msg, "<D> has no Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL file")
-        self.assertIn("Not usable here: Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf, "
-                      "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", hint)
-        self.assertIn("Usable here: --family coder --model IQ1_M", hint)
+        unusable = next(line for line in hint.splitlines() if "Not usable here:" in line)
+        self.assertIn("Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf", unusable)
+        self.assertNotIn("UD-Q2_K_XL", unusable)
+        self.assertIn("Usable here: --family coder --model IQ1_M, --family unsloth --model UD-Q2_K_XL", hint)
 
     def test_usable_folders_are_left_alone(self):
         good = ["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-%05d-of-00002.gguf" % i for i in (1, 2)]
         self.assertIsNone(self.problem(good + self.UD))
+        self.assertIsNone(self.problem(self.UD, "unsloth", "UD-Q2_K_XL"))
         self.assertIsNone(self.problem(["my-IQ3_XXS-%05d-of-00003.gguf" % i for i in (1, 2, 3)]))
         self.assertIsNone(self.problem([]))                 # nothing there: check_shards' "missing", as before
 
@@ -145,7 +147,7 @@ class GgufDirUnsupported(unittest.TestCase):
             code, out, _, _ = install(ram, found, ["--gguf-dir", d, "--family", "unsloth", "--model", "IQ3_XXS"])
         self.assertEqual(code, 1)
         self.assertIn("has no IQ3_XXS model file", out)
-        self.assertIn("choose one of: UD-IQ4_XS, UD-Q4_K_XL (or IQ3_XXS: --family qwen --model IQ3_XXS, --family swift --model "
+        self.assertIn("choose one of: UD-IQ4_XS, UD-Q4_K_XL, UD-Q2_K_XL (or IQ3_XXS: --family qwen --model IQ3_XXS, --family swift --model "
                       "IQ3_XXS)", out)
         self.assertIn("Strata runs ISTA-DASLab's GSQ-RCO files", out)
 
