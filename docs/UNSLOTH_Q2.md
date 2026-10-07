@@ -30,6 +30,48 @@ These use existing CPU and GPU paths. Setup packs with `--compat-bf16`, as for t
 small projections required in BF16 are converted with rounding recorded in `conversions.json`; the experts
 and native quantized projections retain their stored formats. No `experts.bin` copy is made.
 
+## Compatibility checks
+
+[Upstream PR #911](https://github.com/Niko1221/Strata/pull/911) identified the same expert formats and called out
+the Q4_K output head and Q5_K token embedding for runtime checks. Its header inspector was
+[ported into v0.1.40.2](https://github.com/Niko1221/Strata/pull/911#issuecomment-6037868027); it classifies this
+model as untested. [PR #844](https://github.com/Niko1221/Strata/pull/844) explores a setup-only integration of
+UD-Q3_K_XL, another mixed-format file. Its results concern that larger model and different hardware.
+
+Local checks on 2026-10-07, using engine source 0.1.40, CUDA 13.4.92 and an RTX 4050 Laptop GPU (6 GB):
+
+- Offline synthetic split-GGUF packing preserves the head, embedding, dense and expert formats, retains the
+  correct per-shard expert offsets, and converts the required small projections to BF16. Source files stay
+  unchanged, and the normal pack does not copy the experts.
+- `native_expert_parity` passes IQ2_XS/IQ4_NL, IQ3_XXS/IQ4_NL and Q5_K/Q8_0 against its GGML-dequantized reference.
+  CPU relative errors are 0.0137-0.0146 and GPU errors 0.0115-0.0130, below its 0.03 limit. Dequantized values and
+  embedding rows match the reference exactly.
+- `mmvq_multi_parity` passes its Q4_K, Q5_K and Q6_K cases, among the other formats tested. Its exact mode has
+  no differing or non-finite outputs across 148,480 values. This checks the multi-column arithmetic against the
+  single-column kernels; it is not an independent reference for a complete model.
+- `native_head_embed_test` loads a Q4_K head and Q5_K embedding from split GGUFs with a metadata-only first shard
+  and nonzero tensor offsets. The head's relative L1 errors against a GGML-dequantized CPU matrix product are
+  0.003612, 0.008655 and 0.004889 (limit 0.02). Both single-token and batched embedding gathers match the CPU
+  reference exactly. This exercises the actual loaders and GPU entry points with small synthetic weights.
+
+The offline packer checks need the normal Python dependencies but no GPU or model download:
+
+```bat
+.venv\Scripts\python.exe -m unittest tools.test_unsloth_q2_pack tools.test_iq_pack tools.test_setup_unsloth
+```
+
+For an existing CUDA build, build `native_expert_parity`, `mmvq_multi_parity` and `native_head_embed_test`, then
+run the executables from its output directory:
+
+```text
+native_expert_parity --synthetic iq2_xs/iq4_nl iq3_xxs/iq4_nl q5_K/q8_0
+mmvq_multi_parity
+native_head_embed_test
+```
+
+These small fixtures establish format compatibility for the paths tested. Full-model generation, prefill,
+memory use and performance still require the actual files.
+
 ## Try it
 
 For files already downloaded, in a Windows command prompt:
@@ -47,3 +89,6 @@ The remainder of the experts is read from the model files. This RAM calculation 
 the fixed weights, draft layer, context, prompt buffers and GPU expert cache must also fit.
 
 Until a full-model run is verified, there are no speed, quality or supported-context measurements for this choice.
+Start the validation at 8K to separate loading failures from context memory pressure. After coherent short answers
+and a multi-turn conversation work, try 64K and 128K separately and check both startup and a long prompt. A configured
+context limit alone does not establish that a prompt of that length fits or runs at a usable speed.
