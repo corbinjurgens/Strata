@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "buffer_layout.hpp"
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
@@ -287,7 +288,7 @@ struct Alloc {
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
     template <typename T> T* take(size_t n, bool& ok) {
-        uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
+        uint64_t bytes = detail::buffer_bytes((uint64_t) n * sizeof(T));
         if (count_only) {
             if (granule > 0) bytes = (bytes + granule - 1) / granule * granule;
             used += bytes;
@@ -567,9 +568,9 @@ struct Prefill::Impl {
     std::vector<int32_t> steps_host;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
-    int64_t sel_batch = 256, max_blocks = 0;
+    int64_t sel_batch = 0, max_blocks = 0;
     float* attn_scratch = nullptr;
-    int64_t attn_batch = 32, cap = 0;
+    int64_t attn_batch = 0, cap = 0;
     // MoE
     float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
           *shared = nullptr, *sg = nullptr;
@@ -704,6 +705,21 @@ namespace {
 constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
 constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
 
+uint64_t common_set_bytes(size_t T, bool f16_io, bool legacy_count = false) {
+    Alloc a; a.count_only = true; bool ok = true;
+    a.take<float>(T * N, ok); a.take<float>(T * D, ok);
+    if (legacy_count || gr_unfused()) a.take<float>(T * D, ok);
+    if (!legacy_count) a.take<float>(T * HC, ok);
+    a.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok);
+    a.take<float>(T * LR, ok); a.take<uint16_t>(T * LR, ok);
+    a.take<float>(T * D, ok); a.take<float>(T * HC, ok); a.take<float>(T * N, ok);
+    a.take<uint16_t>(T * N, ok); a.take<uint16_t>(T * N, ok); a.take<float>(T * N, ok);
+    if (bf16x2_hc(f16_io)) { a.take<uint16_t>(T * D, ok); a.take<uint16_t>(T * LR, ok); }
+    if (bf16x2(f16_io)) a.take<uint16_t>(T * N, ok);
+    a.take<int32_t>(T * strata::kernels::kStepCount, ok);
+    return a.used;
+}
+
 // THE ATTENTION HALF AND THE MoE HALF SHARE THEIR BUFFERS.  A layer runs its attention (GDN or QSA), writes it back
 // into the residual, and only then its MoE, so the three sets of scratch are never live at once: one region the size
 // of the largest holds them all.  That is ~260 KB of the ~680 KB a prompt token cost - which is what lets a chunk
@@ -770,6 +786,13 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
+detail::WeightScratchLayout weight_scratch_layout() {
+    const MmqPlan& mp = mmq_plan();
+    return detail::weight_scratch_layout((uint64_t) GEMM_SCRATCH * sizeof(uint16_t),
+        mp.any ? MMQ_GROUP * mp.gu_max + MMQ_TAIL : 0,
+        mp.any ? MMQ_GROUP * mp.d_max + MMQ_TAIL : 0,
+        1280ull * 2560 * sizeof(uint16_t), 2560ull * 640 * sizeof(uint16_t), mp.fallback ? DQ : 0);
+}
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
 // int8 activations, and Hq nothing: ~100 KB a token less than MMQ's FP32 GU / H and per-slot q8_1 rows, which is what
@@ -816,6 +839,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    if (chunk <= 0) { err = "prefill: the chunk must be positive"; return false; }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -912,7 +936,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     {
-        uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+        uint16_t* gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
@@ -944,16 +968,28 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
-    m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
-    m.grs = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
-    m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
-    m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
-    if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
-    if (bf16x2(m.f16_io)) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
-    m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
+    // Small common buffers have the same lifetime: one owned slab avoids a page tail per cudaMalloc. A borrowed
+    // layout keeps the same slices in its existing arena; m.borrowed still controls all lending semantics.
+    Alloc common;
+    if (o.base == nullptr) {
+        common.cap = common_set_bytes(T, m.f16_io);
+        common.base = o.take<uint8_t>((size_t) common.cap, ok);
+        if (!ok) return false;
+    }
+    Alloc& c0 = o.base == nullptr ? common : o;
+    m.emb = c0.take<float>(T * N, ok); m.R = c0.take<float>(T * D, ok);
+    m.xn = gr_unfused() ? c0.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
+    m.grs = c0.take<float>(T * HC, ok);
+    m.xn16 = c0.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = c0.take<float>(T * LR, ok); m.lo16 = c0.take<uint16_t>(T * LR, ok);
+    m.gated = c0.take<float>(T * D, ok); m.inj = c0.take<float>(T * HC, ok);
+    m.mixed = c0.take<float>(T * N, ok); m.mixed_bf = c0.take<uint16_t>(T * N, ok);
+    m.mixed_h = c0.take<uint16_t>(T * N, ok); m.bo = c0.take<float>(T * N, ok);
+    if (bf16x2_hc(m.f16_io)) { m.xn16_lo = c0.take<uint16_t>(T * D, ok); m.lo16_lo = c0.take<uint16_t>(T * LR, ok); }
+    if (bf16x2(m.f16_io)) m.mixed_bf_lo = c0.take<uint16_t>(T * N, ok);
+    m.steps_dev = c0.take<int32_t>(T * strata::kernels::kStepCount, ok);
+    const auto batches = detail::prompt_batch_caps(T);
+    m.sel_batch = batches.select;
+    m.attn_batch = batches.attention;
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -999,13 +1035,22 @@ bool Prefill::carve(size_t T, void* alloc) {
         }
         if (base == nullptr) ok = false;
     }
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    // Dense dequantization (including the shared expert) finishes before routed expert weights are gathered or
+    // dequantized. Their consumers and the next dense projection are ordered on m.cs. Keep the copy-stream ring
+    // and cuBLAS workspace separate. Each MMQ group rezeros its read-ahead tails after gathering. A stage helper
+    // uses these slices only for one-chunk prompts; the hand-off waits for its last expert result before this
+    // stage starts dense work on its own stream.
+    const auto weights = weight_scratch_layout();
+    uint8_t* wb = reinterpret_cast<uint8_t*>(m.gemm.scratch());
+    for (int i = 0; i < DQ; ++i) {
+        m.dq_gu[i] = mmq_plan().fallback ? reinterpret_cast<uint16_t*>(wb + i * weights.fallback_pair) : nullptr;
+        m.dq_d[i] = mmq_plan().fallback ? reinterpret_cast<uint16_t*>(wb + i * weights.fallback_pair + weights.fallback_down) : nullptr;
+    }
     if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.grp_gu = wb;
+        m.grp_d = wb + weights.group_down;
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -1051,7 +1096,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
-    uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    uint16_t* gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
     if (!ok || !carve((size_t) chunk, &o)) {
@@ -1486,46 +1531,29 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
 uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                     bool owned_pages) {
     // the same allocation sequence as `init`, counted
+    if (chunk <= 0) return 0;
     const size_t T = (size_t) chunk;
     bool ok = true;
     Alloc o;
     o.count_only = true;
     if (owned_pages) o.granule = 2ull << 20;
-    o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    // `carve`'s order, buffer for buffer: emb, R, xn, grs, xn16, lo, lo16, gated, inj, mixed, mixed_bf, mixed_h,
-    // bo.  This counted `xn` unconditionally (carve takes it only under STRATA_GR_UNFUSED) and never counted
-    // `grs`.  Net over-count T*(D-HC)*4 bytes: 42 MB at a 1024-token chunk, 252 MB (48 Q8_0 slots) at 6144 - the
-    // prompt path was told it had less room than it did.  Safe - the direction is over-estimating, and `take`
-    // still bounds-checks - but it under-sizes every loan, so every chunk the scan picks is one step smaller.
-    if (ring_bytes_on()) {
-        f(T * N); f(T * D);
-        if (gr_unfused()) f(T * D);
-        f(T * HC);
-    } else {   // STRATA_RING_BYTES=0: 0.1.39's count
-        f(T * N); f(T * D); f(T * D);
-    }
-    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
-    if (bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
-    if (bf16x2(f16_io)) o.take<uint16_t>(T * N, ok);
-    o.take<int32_t>(T * strata::kernels::kStepCount, ok);
+    if (owned_pages) o.take<uint8_t>((size_t) common_set_bytes(T, f16_io), ok);
+    else o.used += common_set_bytes(T, f16_io, !ring_bytes_on());   // retain the legacy borrowed count when requested
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    const auto batches = detail::prompt_batch_caps(T);
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, batches.select, batches.attention, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
-        const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
     if (owned_pages) {
         if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation

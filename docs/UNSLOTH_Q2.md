@@ -140,8 +140,88 @@ disabled so it would not expand `--spec 2` to a larger window:
 The engine kept 36.97 GiB of experts in RAM and used a two-token verifier with 44.6 MiB of device buffers.
 It reported **0 MiB of VRAM free** after loading. A 94-token conversation-history/arithmetic request returned
 the correct codename and product, generating 44 tokens at 14.3 tokens/s; prefill was 17.4 tokens/s.
-The saved local configuration was left at 96K. This verifies startup and a short response only: a full 96K
-prompt has not been tested, and the lack of VRAM headroom makes this a fragile experimental setting.
+At the end of that trial, the saved local configuration was left at 96K. This verifies startup and a short
+response only: a full 96K prompt has not been tested, and the lack of VRAM headroom makes this a fragile
+experimental setting.
+
+### Local allocation changes on the same GPU
+
+The local engine now packs native projection weights and their shared activation scratch into one aligned GPU
+allocation. It also sizes prompt selection/attention scratch to the configured chunk, packs common prompt buffers
+together, and shares weight scratch between dense projections and routed experts whose work does not overlap.
+The copy-stream upload ring and cuBLAS workspace remain separate. The dense GEMM workspace keeps its original
+capacity; these changes preserve the stored weight bytes and existing arithmetic kernels.
+
+Automatic expert-cache retries now retain the owned-prompt, draft-binding and pipeline allocations reserved by
+the initial sizing. Previously, the Windows post-touch check omitted the owned-prompt and draft-binding parts.
+`STRATA_OWNED_PRICE=exact` still needs an explicit reserve and runtime measurements to preserve useful headroom;
+its allocation estimate does not include every first-use library allocation.
+
+On 2026-10-08, two local CUDA 13.4.92 / MSVC 19.43 builds were compared with identical 64K/Q4 settings, a fixed
+one-slot expert cache, prompt chunk 64, two-token verifier and MTP/suffix/lookup drafting disabled. The comparison
+build predates the allocation changes; both builds contain the reserve-accounting correction, which does not
+affect the fixed-cache comparison.
+
+| Startup checkpoint | Before allocation changes | After allocation changes |
+| --- | --- | --- |
+| Weights and session loaded | 552 MiB free | 868 MiB free |
+| Prompt path initialized | 84 MiB free | 470 MiB free |
+| Verifier initialized | 38 MiB free | 424 MiB free |
+
+The observed final recovery was 386 MiB. A 78-token history/arithmetic/code request produced the same 83-token
+answer byte for byte. Prompt rates were 25.5 and 25.3 tokens/s; generation rates were 12.1 and 12.6 tokens/s.
+These single short samples do not establish a throughput improvement. Windows retained 34.91 versus 35.09 GiB
+of RAM experts, so host/file-tier conditions were not identical. No output-head offload or HC requantization was
+needed for this memory reduction.
+
+The focused allocation tests cover mixed-format native weights, optional packed Q8 copies, failed-load rollback,
+owned prompt allocation/reset, borrowed relayout, exact-sized selection/attention buffers and forced MMQ fallback.
+They passed on this GPU, as did the existing native expert, head/embedding and multi-column parity checks. CUDA
+Compute Sanitizer could not attach to the fixture process on this Windows setup; sanitizer coverage remains
+unverified. Multi-GPU/HIP behavior was reviewed in source but was not tested on hardware.
+
+### Validated 64K configuration after the allocation changes
+
+The same RTX 4050 Laptop 6 GB / i7-13700H / 64 GB Windows PC, without a pagefile, passed a fresh 58,119-token
+retrieval test and a conversation-reuse check with these settings. The GPU was freed of other model workloads
+before starting. Set `STRATA_OWNED_PRICE=exact` in the server config's `env` object as well as these engine args:
+
+```text
+--max-context 65536 --kv q4_0 --kv-resident 20480 --prefill 256 --no-prefill-borrow --spec 2 --suffix-draft 0 --lookup-chain 0 --expert-cache auto --vram-reserve-mib 448 --resident-budget-gib 39 --pool-workers 9
+```
+
+MTP and images remain disabled. The engine selected 39 GPU expert slots, kept 34.95 GiB of experts in RAM after
+the commit-headroom check, and reported 294 MiB free after initialization. That free-memory figure is a startup
+checkpoint, not a continuous measurement of headroom during requests.
+
+| Check | Measured result |
+| --- | --- |
+| Fresh 58,119-token prompt, codes near 5%, 50% and 95% of the text | All three codes correct; no reused tokens |
+| Fresh prompt processing | 595.249 s, 97.6 tokens/s |
+| 27-token answer | 1.759 s, 15.3 tokens/s; 597.251 s end to end |
+| Follow-up recalling the final code and calculating 17 x 23 | Both correct; 58,145 cached tokens, 34 newly read; 3.029 s end to end |
+
+This exercises a prompt near the 64K limit and reuse beyond the 20,480-cell GPU KV cache. It is a retrieval and
+stability check, not a broad model-quality evaluation. For the same 2,137-token needle prompt, chunk 128 processed
+at 63.9 tokens/s and chunk 256 at 96.2 tokens/s; both retrieved the code. These are single-run measurements.
+The earlier 40.3 tokens/s long-prompt result used a different build and prompt length and is not a controlled
+throughput comparison.
+
+The local `run-unsloth-ud-q2_k_xl.bat` now uses this 64K configuration through `engine/strata-low-vram.exe`, built
+with CUDA 13.4.92 for this card. The original executable remains available, and the previous JSON is saved as
+`strata-unsloth-ud-q2_k_xl.before-memory.json`. Setup may regenerate the normal JSON; these are local settings,
+not new setup defaults.
+
+### 128K startup check after the allocation changes
+
+With the new build, 128K started with 244 MiB free, 16 GPU expert slots and 34.75 GiB of RAM experts. It used
+the same settings above except `--max-context 131072 --prefill 64 --vram-reserve-mib 400`. A fresh 2,137-token
+needle test passed: prefill took 50.934 s (42.0 tokens/s), and nine output tokens took 0.691 s (13.0 tokens/s).
+The engine still reports low headroom at this level. A full 128K prompt has not been tested, so this does not
+establish long-prompt stability at 128K.
+
+The optional local `run-unsloth-ud-q2_k_xl-128k.bat` uses `strata-unsloth-ud-q2_k_xl-128k.json`. Close the 64K
+server before starting it; both use port 8080. The normal launcher stays at the faster, long-prompt-tested 64K.
 
 ## Try it
 

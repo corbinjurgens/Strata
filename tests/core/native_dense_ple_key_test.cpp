@@ -7,11 +7,13 @@
 //   2. A quantized key row (the Q2_0 / UD-Q4_K_XL packs: a shape-only row) + a Q8_0 GGUF key: unchanged - the key
 //      stays skipped and is served natively.
 //   3. index_code_bits on a missing row and a missing index.
+//   4. Mixed-format native arena slices, failed-load rollback, packed-Q8 copies and layer-stage ownership.
 // Synthetic files at small dimensions; needs a CUDA device for the arena (exits 77 without one).
 #include "gguf_fixture.hpp"
 
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -97,6 +99,105 @@ void load(const fs::path& pack, const std::string& shard, Loaded& l) {
     if (!l.wt.load(pack.string(), l.arena, pool ? pool : 256, l.err, &l.skip)) return;
     l.ok = l.dense.load(shards, l.wt, l.err, true);
 }
+
+// Mixed formats, partial row groups and non-256-byte payload sizes exercise
+// interior arena pointers. The larger Q8 matrix also exercises STRATA_Q8_PACKED=1.
+void arena_test(const fs::path& root) {
+    namespace kernels = strata::kernels;
+    const std::vector<fixture::Tensor> tensors{
+        {"blk.0.attn_qkv.weight", {256, 5}, 13, 11},
+        {"blk.1.attn_q.weight", {256, 7}, 14, 12},
+        {"blk.1.attn_k.weight", {640, 3}, 8, 13},
+        {"blk.2.ffn_gate_shexp.weight", {1024, 2048}, 8, 14},
+        {KEY, {256, 3}, 8, 15},
+    };
+    const auto pack = root / "arena-pack";
+    fs::create_directories(pack);
+    std::ofstream idx(pack / "index.txt", std::ios::binary);
+    idx << "# align 256 pool 256 tensors " << tensors.size() << "\n";
+    std::set<std::string> skip;
+    for (const auto& t : tensors) {
+        idx << t.name << " 0 0 0 0 0 0 " << t.shape[0] << " " << t.shape[1]
+            << " 8 0 32 0 0 0 0 0 0 0\n";
+        skip.insert(t.name);
+    }
+    idx.close();
+    std::ofstream(pack / "dense.bin", std::ios::binary).put('\0');
+    auto first_meta = arch_keys();
+    const auto first_split = fixture::split_keys(0, 2, tensors.size());
+    first_meta.insert(first_meta.end(), first_split.begin(), first_split.end());
+    const auto second_meta = fixture::split_keys(1, 2, tensors.size());
+    const auto first = root / "arena-1.gguf", second = root / "arena-2.gguf", bad = root / "arena-bad.gguf";
+    fixture::write(first, first_meta, {tensors[0], tensors[1], tensors[2]});
+    fixture::write(second, second_meta, {tensors[3], tensors[4]});
+    auto wrong = tensors[4];
+    wrong.shape[0] *= 2;
+    fixture::write(bad, second_meta, {tensors[3], wrong});
+
+    Loaded l;
+    if (cudaMalloc(&l.arena, 256) != cudaSuccess) { check(false, "allocate canonical test arena"); return; }
+    const bool table_ok = l.wt.load(pack.string(), l.arena, 256, l.err, &skip);
+    check(table_ok, "load mixed-format shape table " + l.err);
+    if (!table_ok) return;
+    check(!l.dense.load({first.string(), bad.string()}, l.wt, l.err, true), "later incompatible shard is rejected");
+    bool untouched = l.dense.tensor_count() == 0 && l.dense.weight_bytes() == 0;
+    for (const auto& t : tensors) untouched = untouched && !l.wt.find(t.name)->native_data;
+    check(untouched, "failed load leaves every native reference and counter untouched");
+    l.err.clear();
+    const bool ok = l.dense.load({first.string(), second.string()}, l.wt, l.err, true);
+    check(ok, "same object and table load successfully after failure " + l.err);
+    if (!ok) return;
+    check(l.dense.tensor_count() == tensors.size(), "packed copies do not inflate the native tensor count");
+    const auto* base = static_cast<const unsigned char*>(l.wt.find(tensors[0].name)->native_data);
+    size_t at = 0, payload = 0;
+    bool same = true, aligned = true, slices = true, packed_same = true;
+    const bool packed_on = kernels::native_q8_0_packed_enabled();
+    for (const auto& t : tensors) {
+        const auto* ref = l.wt.find(t.name);
+        const size_t bytes = kernels::native_mmvq_weight_bytes(t.type, (int) t.shape[0], (int) t.shape[1]);
+        std::vector<unsigned char> back(bytes), expected(bytes);
+        for (size_t i = 0; i < bytes; ++i) expected[i] = fixture::pattern(t.seed, i);
+        same = same && cudaMemcpy(back.data(), ref->native_data, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+               back == expected;
+        aligned = aligned && reinterpret_cast<uintptr_t>(ref->native_data) % 256 == 0;
+        slices = slices && ref->native_data == base + at;
+        at += (bytes + 255) & ~(size_t) 255;
+        payload += bytes;
+        if (packed_on && t.type == 8 && t.name != KEY &&
+            kernels::native_q8_0_packed_eligible((int) t.shape[0], (int) t.shape[1])) {
+            std::vector<unsigned char> packed(bytes);
+            kernels::native_q8_0_pack_host(expected.data(), packed.data(), (int) t.shape[0], (int) t.shape[1]);
+            packed_same = packed_same && cudaMemcpy(back.data(), base + at, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                          back == packed;
+            at += (bytes + 255) & ~(size_t) 255;
+        }
+    }
+    check(same, "all native weight bytes survive arena loading unchanged");
+    check(aligned && slices, "mixed matrices occupy nonoverlapping 256-byte-aligned slices");
+    check(packed_same, "optional packed-Q8 slices retain the exact packed bytes");
+    check(l.dense.weight_bytes() == payload, "weight_bytes retains its original payload accounting");
+    bool shared = true;
+    for (const auto& t : tensors) shared = shared && l.wt.find(t.name)->native_q8_1 == base + at;
+    check(shared, "shared Q8_1 scratch follows every weight slice in the same allocation");
+    const void* original = l.wt.find(tensors[0].name)->native_data;
+    check(!l.dense.load({first.string(), second.string()}, l.wt, l.err, true) &&
+              l.wt.find(tensors[0].name)->native_data == original, "second successful load is rejected without mutation");
+
+    // A stage must count and upload only its requested layers. The original
+    // allocation stays live, so accidental global ownership would corrupt it.
+    Loaded stage;
+    if (cudaMalloc(&stage.arena, 256) != cudaSuccess) { check(false, "allocate split test arena"); return; }
+    const bool stage_table = stage.wt.load(pack.string(), stage.arena, 256, stage.err, &skip);
+    const bool stage_ok = stage_table && stage.dense.load({first.string(), second.string()}, stage.wt, stage.err,
+                                                         true, 1, 2);
+    check(stage_ok, "load a separate layer stage from the same shards " + stage.err);
+    if (stage_ok) {
+        check(stage.dense.tensor_count() == 3 && !stage.wt.find(tensors[0].name)->native_data &&
+                  !stage.wt.find(tensors[3].name)->native_data, "stage excludes layers outside its interval");
+        check(stage.wt.find(tensors[1].name)->native_data != l.wt.find(tensors[1].name)->native_data,
+              "separate stage owns its own allocation");
+    }
+}
 }  // namespace
 
 int main() {
@@ -163,6 +264,9 @@ int main() {
         check(NativeDense::keep_unquantized_ple_key((tmp.path / "none").string(), skip, err) && skip.size() == 1,
               "no key in the skip set: the index is not read");
     }
+
+    std::printf("4. aligned native arena and failed-load rollback\n");
+    arena_test(tmp.path);
 
     std::printf(g_fail ? "native_dense_ple_key_test: %d FAILED\n" : "native_dense_ple_key_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
