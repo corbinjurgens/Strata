@@ -1,0 +1,35 @@
+# One entry per line, relative to the repository root, then two spaces, '#',
+# and why the reader needs it. The reason becomes the pack's context index.
+#
+#   path/to/file.php  # the handler the question is about
+#   path/to/dir  # every file under it, .gitignore honoured
+#   $WASABI_VAULT/path/to/note.md  # outside the repository: absolute, ~ or $VAR;
+#                                  # read when pack.sh runs, never a copy
+#   diff:master...HEAD  # the change under discussion
+#   show:<sha>  # one commit, message and patch
+#
+# Lines starting with '#' and blank lines are ignored.
+docs/UNSLOTH_Q2.md  # actual downloaded formats, compatibility checks and measured 6 GB runtime results
+src/prefill/prefill.cpp  # prompt scratch sizing, carving, relayout, owned versus borrowed buffers and kernel dispatch
+include/strata/prefill/prefill.hpp  # prefill sizing API, state and ownership contract
+src/prefill/gemm.cu  # dense dequantization workspace, row slicing and GEMM dispatch cost
+include/strata/prefill/gemm.hpp  # dense workspace API and precision contract
+src/prefill/moe_mmq.cu  # quantized expert eligibility and actual fallback conditions
+include/strata/prefill/moe_mmq.hpp  # MMQ plan and dispatch interfaces used by prefill
+src/core/layer.cpp  # layer scratch, HC consumers and streamed KV allocation including residency floor
+include/strata/core/layer.hpp  # layer buffer ownership and configuration fields needed to interpret allocations
+src/core/native_head.cpp  # output-head GPU allocation and mapped host embedding precedent
+include/strata/core/native_head.hpp  # head weight pointer exposure and lifetime contract
+src/core/native_dense.cpp  # native projection allocation and canonical tensor skip set
+include/strata/core/native_dense.hpp  # native dense ownership and supported projection interface
+src/core/weights.cpp  # packed arena sizing and loading must agree for true HC memory reclamation
+include/strata/core/weights.hpp  # weight references, skip sets and arena ownership
+src/core/layout.cpp  # graph tensor and hyper-connection layout interpretation
+include/strata/core/layout.hpp  # model dimensions and tensor layout schema
+src/core/session.cpp  # session allocation lifetimes, shared buffers and context-related state
+include/strata/core/session.hpp  # session configuration and shared buffer interfaces
+src/kernels/cuda/kv_stream.cu  # resident block resolution, union bounds, miss list and eviction mechanics
+include/strata/kernels/kv_stream.hpp  # KV streaming capacity and ordering contract
+include/strata/core/pinned.hpp  # host pinning interfaces and memory ownership context
+include/strata/kernels/fused_gr.hpp  # HC execution interface and BF16 versus Q8 argument requirements
+src/kernels/cuda/dequant_bf16.cu  # Q8 reconstruction primitive and BF16 rounding for compact HC storage
