@@ -125,6 +125,24 @@ At 128K, the same Q4 KV, 20,480 resident cells and small-prompt-buffer settings 
 65 MiB short at minimum cache sizing. The tested configuration was restored to 64K. More context needs further
 memory savings or a larger GPU. No explicit reserve override was used.
 
+### Retry after restarting Windows
+
+A restart on the same day did not remove the 128K cache-sizing failure: CUDA still reported 0.43 GiB free at
+that stage and a 65 MiB shortfall, despite `nvidia-smi` showing more idle VRAM before launch.
+
+96K started after reducing prompt chunks and the verifier window. MTP remained off; suffix drafting was also
+disabled so it would not expand `--spec 2` to a larger window:
+
+```text
+--max-context 98304 --kv q4_0 --kv-resident 20480 --prefill 16 --no-prefill-borrow --spec 2 --suffix-draft 0 --expert-cache auto --resident-budget-gib 39
+```
+
+The engine kept 36.97 GiB of experts in RAM and used a two-token verifier with 44.6 MiB of device buffers.
+It reported **0 MiB of VRAM free** after loading. A 94-token conversation-history/arithmetic request returned
+the correct codename and product, generating 44 tokens at 14.3 tokens/s; prefill was 17.4 tokens/s.
+The saved local configuration was left at 96K. This verifies startup and a short response only: a full 96K
+prompt has not been tested, and the lack of VRAM headroom makes this a fragile experimental setting.
+
 ## Try it
 
 For files already downloaded, in a Windows command prompt:
