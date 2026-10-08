@@ -152,15 +152,15 @@ MODELS = {
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
     # The pinned UD-Q2_K_XL uses IQ2_XS/IQ3_XXS gate/up and IQ4_NL down, not Q2_K tensors. Its formats already
-    # have native kernels; the complete model still needs runtime validation (docs/UNSLOTH_Q2.md).
-    "UD-Q2_K_XL": {"about": "Unsloth Dynamic, EXPERIMENTAL: smaller experts; full-model runtime and quality "
-                            "not yet validated, including on 6 GB GPUs",
+    # have native kernels; limited full-model tests and 6 GB settings are in docs/UNSLOTH_Q2.md.
+    "UD-Q2_K_XL": {"about": "Unsloth Dynamic, EXPERIMENTAL: smaller experts; limited runtime testing; "
+                            "6 GB GPUs need manual settings (docs/UNSLOTH_Q2.md)",
                    "download_gb": 78.9, "ram_gb": 48, "arena_gb": 46.0849152, "families": ("unsloth",),
                    "budget": True, "experimental": True, "nvidia_only": True, "vision": False,
                    "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 40),
-                   "experimental_note": "UD-Q2_K_XL is EXPERIMENTAL (docs/UNSLOTH_Q2.md): its tensor formats have "
-                                        "engine support, but full-model startup, speed and quality have not been "
-                                        "validated. A smaller download does not guarantee it fits your GPU."},
+                   "experimental_note": "UD-Q2_K_XL is EXPERIMENTAL (docs/UNSLOTH_Q2.md): full-model smoke tests "
+                                        "pass on an RTX 4050 with manual memory settings; setup's defaults do not "
+                                        "fit that 6 GB card. Quality and general hardware support remain unvalidated."},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).

@@ -1,8 +1,8 @@
 # Unsloth UD-Q2_K_XL (experimental)
 
-Setup offers `UD-Q2_K_XL` as an experimental choice. The tensor headers have been inspected and the formats have
-existing engine paths, but full-model startup, generated output, speed and quality have not been validated.
-In particular, this is not yet a verified way to run Unsloth on a 6 GB GPU. Setup requires engine 0.1.40 or newer
+Setup offers `UD-Q2_K_XL` as an experimental choice. Full-model smoke tests pass on an RTX 4050 Laptop 6 GB
+with the manual memory settings below; setup's default configuration does not fit that card. These are limited
+runtime checks, not a quality benchmark or a guarantee on other PCs. Setup requires engine 0.1.40 or newer
 for this experiment. Images are disabled; AMD use is unvalidated.
 
 ## Files and formats
@@ -69,26 +69,80 @@ mmvq_multi_parity
 native_head_embed_test
 ```
 
-These small fixtures establish format compatibility for the paths tested. Full-model generation, prefill,
-memory use and performance still require the actual files.
+These small fixtures establish format compatibility for the paths tested. The full-model checks below use
+the actual downloaded files.
+
+## Full-model checks on a 6 GB GPU
+
+On 2026-10-08, the pinned files passed SHA-256 verification through Hugging Face snapshot symlinks at revision
+`766911a6b7369840a91dbcd95f9f997acaab6cd6`. Their hashes match the older pinned revision above. The packer retained
+the GGUF files in place, including the experts split across shards in layer 19. It produced a 1.38 GiB weight arena
+and the normal tokenizer and native-expert index.
+
+Hardware: RTX 4050 Laptop 6 GB, i7-13700H, 64 GB RAM, Windows, NVIDIA driver 616.92, release engine 0.1.40.
+Windows had no page file. The requested 40 GiB expert RAM budget was clamped to 36.64 GiB by the engine's commit
+headroom check; 6.3 GiB of experts remained in the file tier, which could use the OS file cache.
+
+At 8K, the default draft model and FP16 KV configuration was 897 MiB short of the minimum expert cache.
+Removing `--mtp` and using int8 KV reduced the shortage to 307 MiB. Using `--prefill 64 --no-prefill-borrow`
+then allowed startup: a one-slot GPU expert cache and 206 MiB of VRAM free after loading. This uses the existing
+engine; no new kernels or weight conversions were needed beyond setup's normal `--compat-bf16` pack.
+
+The 8K smoke tests passed exact text reproduction, recall from conversation history, arithmetic (`17 * 23 = 391`),
+and a Python function preserving order while removing duplicates. Responses generated at 13.1-15.2 tokens/s;
+the 150-token coding answer ran at 13.7 tokens/s. These short requests do not establish broader answer quality.
+
+For this 8K trial, the generated config's `args` used the following memory settings, with the `--mtp PATH` pair
+removed (keep `--spec 4`; serving native packs requires at least 2):
+
+```text
+--max-context 8192 --kv int8 --prefill 64 --no-prefill-borrow --expert-cache auto --resident-budget-gib 40
+```
+
+At context 8192, setup does not write a `--kv` argument even if requested: add it directly to the config for this
+trial. The separate prompt buffers reduce the minimum cache requirement but process prompts in small chunks.
+Normal starts use the saved config; running setup again can restore its larger defaults.
+
+For 64K, int8 KV with 20,480 resident cells was still 65 MiB short at cache sizing. Switching to `q4_0` allowed
+startup and a correct short answer, with only 16 MiB reported free after loading. The draft model remained off:
+
+```text
+--max-context 65536 --kv q4_0 --kv-resident 20480 --prefill 64 --no-prefill-borrow --expert-cache auto --resident-budget-gib 39
+```
+
+The engine kept 36.30 GiB of experts in RAM after its commit headroom check. The KV resident limit is a GPU cache
+size, not a limit on the context the model can access. Q4 KV uses less memory and changes precision; see the
+[KV measurements](DETAILS.md#speed-measured). This card has very little VRAM margin, so these settings remain an
+experiment rather than a general recommendation for 6 GB GPUs.
+
+A retrieval test with `tools/needle_bench.py --lengths 40k --depths 50` passed: the model returned exactly
+`meadow-copper-504` from a 40,285-token document, with zero reused prompt tokens. Fresh prefill took 999.903 seconds
+(40.3 tokens/s); the nine-token answer took 0.684 seconds (13.2 tokens/s). End-to-end time was 1,000.7 seconds,
+about 16 minutes 41 seconds. The engine reported 113 MiB of KV reads from RAM. This checks one prompt at one
+needle depth; it does not establish recall quality across arbitrary long documents or a full 64K prompt.
+
+At 128K, the same Q4 KV, 20,480 resident cells and small-prompt-buffer settings failed startup: the engine reported
+65 MiB short at minimum cache sizing. The tested configuration was restored to 64K. More context needs further
+memory savings or a larger GPU. No explicit reserve override was used.
 
 ## Try it
 
 For files already downloaded, in a Windows command prompt:
 
 ```bat
-START-HERE.bat --setup --family unsloth --model UD-Q2_K_XL --gguf-dir "D:\Models\UD-Q2_K_XL" --context 8192 --draft-vocab en
+START-HERE.bat --setup --family unsloth --model UD-Q2_K_XL --gguf-dir "D:\Models\UD-Q2_K_XL" --context 8192 --draft-vocab en --no-start
 ```
 
-Replace the folder with the one containing the shards. Omit `--gguf-dir` to let setup download them, or add
-`--no-start` to prepare the files and config without loading the model. Linux uses `./setup.sh` with the same flags.
+Replace the folder with the one containing the shards. Omit `--gguf-dir` to let setup download them. `--no-start`
+prepares the files and config without loading the model. On a 6 GB GPU, apply the manual settings above to
+`strata-unsloth-ud-q2_k_xl.json` before starting `run-unsloth-ud-q2_k_xl.bat`. Linux uses `./setup.sh` with the same
+flags and a `.sh` start script.
 
 Setup applies the existing Unsloth RAM budget: system RAM less 24 GiB, capped by the experts' size, with a streamed
 context cache deducted. On a 64 GB PC this gives 40 GiB at 8K context and 38 GiB at 128K with int8 KV streaming.
 The remainder of the experts is read from the model files. This RAM calculation does not establish GPU fit:
 the fixed weights, draft layer, context, prompt buffers and GPU expert cache must also fit.
 
-Until a full-model run is verified, there are no speed, quality or supported-context measurements for this choice.
-Start the validation at 8K to separate loading failures from context memory pressure. After coherent short answers
-and a multi-turn conversation work, try 64K and 128K separately and check both startup and a long prompt. A configured
+Start validation at 8K to separate loading failures from context memory pressure. After coherent short answers and
+a multi-turn conversation work, try larger contexts separately and check both startup and a long prompt. A configured
 context limit alone does not establish that a prompt of that length fits or runs at a usable speed.

@@ -121,7 +121,8 @@ START-HERE.bat --setup --family swift --model IQ2_XS
 
 **Unsloth's UD-Q2_K_XL** is an experimental setup choice: a 78.9 GB download with 46.1 GB of routed experts.
 Its headers use IQ2_XS/IQ3_XXS gate/up and IQ4_NL down, which have existing engine paths; there are no Q2_K tensors
-in the pinned files. Full-model startup, speed and quality remain unvalidated, including on 6 GB GPUs.
+in the pinned files. Full-model smoke tests pass on an RTX 4050 Laptop 6 GB with manual memory settings;
+setup's default settings do not fit that card. Quality and general hardware support remain unvalidated.
 Setup uses the Unsloth RAM budget, requires engine 0.1.40 or newer and leaves images off.
 Files, limitations and the command for an existing download: [UD-Q2_K_XL](UNSLOTH_Q2.md).
 
