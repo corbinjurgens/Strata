@@ -10,8 +10,9 @@ class WeightTable;
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
 // blocks once, then attach them to the matching canonical WeightRef. Unsupported
-// types retain their canonical paths. Owns one Q8_1 scratch vector shared by all
-// these projections, so use one ordered session stream and keep this object
+// types retain their canonical paths. Native matrices and their shared Q8_1
+// scratch occupy one aligned device allocation, avoiding per-matrix page tails.
+// These projections share scratch, so use one ordered session stream and keep this object
 // alive until all graphs that reference it have been destroyed and synchronized.
 class NativeDense {
 public:
@@ -35,12 +36,13 @@ public:
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
     static bool keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
-    size_t tensor_count() const { return weights_.size() - packed_keys_.size(); }
+    size_t tensor_count() const { return tensor_count_; }
 
 private:
-    std::vector<void*> weights_;
+    void* arena_ = nullptr;
+    std::vector<void*> weights_;   // optional HC experiment allocations
     std::vector<const void*> packed_keys_;   // GGUF-layout pointers registered with STRATA_Q8_PACKED=1
-    void* scratch_ = nullptr;
+    size_t tensor_count_ = 0;
     uint64_t bytes_ = 0;
 };
 } // namespace strata::core

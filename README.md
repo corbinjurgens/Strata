@@ -2,6 +2,12 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+**Custom branch:** experimental Unsloth `UD-Q2_K_XL` setup support and reduced GPU allocation overhead,
+based on upstream `v0.1.40.1` (`82f46a8`). See [the setup instructions and measured results](docs/UNSLOTH_Q2.md)
+for the RTX 4050 Laptop 6 GB / 64 GB RAM trials. Use setup's **`--build`** option to compile this branch's engine;
+the upstream release binary does not contain these allocation changes. The source improvements are shared,
+while the documented laptop settings need retuning on other PCs. This branch does not incorporate newer upstream changes.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
