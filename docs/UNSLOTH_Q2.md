@@ -328,13 +328,16 @@ context limit alone does not establish that a prompt of that length fits or runs
 **131072-token context capacity by default**. It detects RAM, available physical memory, Windows available
 commit and GPU VRAM, then reports its allocation requests and reserved allowances. It enables the compact
 recent-file cache from this branch. This is an explained startup policy, not a guarantee of optimal speed or
-of fit for every workload. The new laptop policy has offline simulated-hardware coverage; it has not been
-runtime tested on the RTX 4050. The historical laptop measurements above used their stated manual settings.
+of fit for every workload. Neither PC has passed full-model acceptance of the combined automatic policy.
+The historical laptop and desktop measurements used their stated manual settings.
 
-The helper builds `engine/strata-unsloth-portable.exe` and writes `engine/BUILD-unsloth-portable.json`,
-`strata-unsloth-portable-128k.json` and `run-unsloth-portable-128k.bat`. These names are separate from the
-working desktop launcher and rollback engines described below. Generate the configuration on each PC;
-copying a desktop JSON would carry that machine's paths and budgets to the laptop.
+The helper defaults to `engine/strata-unsloth-portable.exe`, `engine/BUILD-unsloth-portable.json`,
+`strata-unsloth-portable-128k.json` and `run-unsloth-portable-128k.bat`. That executable is also the historically
+selected desktop engine below, so its name does not establish isolation. For this candidate, use
+`engine/strata-shared-memory-safety.exe`, its matching `engine/BUILD-shared-memory-safety.json` receipt and
+`strata-unsloth-shared-memory-safety-128k.json`. Check the executable paths in locally selected configs before
+building; if this candidate path is selected, choose an unused numeric suffix before the extension. Generate
+the configuration on each PC; copying a desktop JSON would carry its paths and budgets to the laptop.
 
 ### Reproduce from source and existing model files
 
@@ -352,11 +355,10 @@ receipt hashes the actual selected files, rather than treating that version labe
 With those prerequisites ready, run from the checkout:
 
 ```bat
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --build-engine
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --plan --gguf-dir "D:\Models\UD-Q2_K_XL"
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --prepare --gguf-dir "D:\Models\UD-Q2_K_XL"
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --check-ready
-run-unsloth-portable-128k.bat
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --build-engine --engine engine/strata-shared-memory-safety.exe
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --plan --engine engine/strata-shared-memory-safety.exe --config strata-unsloth-shared-memory-safety-128k.json --gguf-dir "D:\Models\UD-Q2_K_XL"
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --prepare --engine engine/strata-shared-memory-safety.exe --config strata-unsloth-shared-memory-safety-128k.json --gguf-dir "D:\Models\UD-Q2_K_XL"
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --check-ready --config strata-unsloth-shared-memory-safety-128k.json
 ```
 
 Replace the model folder with the existing three-shard folder. Omit `--gguf-dir` to discover a complete
@@ -380,8 +382,10 @@ new random key and defaults to `127.0.0.1:8080`. Keys are saved only in the igno
 printed. Existing keyed host/port settings are preserved; readiness refuses an unkeyed non-loopback host.
 
 `--plan`, `--prepare`, `--write-config` and `--check-ready` do not start a server. The generated launcher
-uses `--launch --config strata-unsloth-portable-128k.json`; that is the explicit launch step. Close an
-existing Strata server before starting another profile. For another experiment, pass a distinct `--config`
+for these candidate commands is `run-unsloth-shared-memory-safety-128k.bat`; it uses
+`--launch --config strata-unsloth-shared-memory-safety-128k.json`. Running it is the separate full-model launch
+step, after offline preparation. Close an existing Strata server before starting another profile.
+For another experiment, pass a distinct `--config`
 filename consistently. `--context` affects a new profile only, accepts 8192/ 32768/65536/131072, and is never
 reduced automatically. Existing configurations are preserved during preparation.
 
@@ -407,14 +411,25 @@ desktop, streamed KV storage for 13 layers at the selected context/precision, an
 8 GiB on systems with at least 48 GiB RAM or 4 GiB below that. The Windows commit calculation also reserves
 GPU memory less the configured VRAM reserve; this GPU allowance is not subtracted again from physical RAM.
 If available-memory telemetry is missing, the helper discloses its fallback estimate of 65% of total RAM.
-These are policy allowances, not measured worst-case memory requirements.
+Missing Windows commit telemetry falls back to the physical pool for planning. These fallbacks are labelled
+unverified: read-only planning and preparation remain available, but cannot establish launch feasibility.
+These are policy allowances, not measured worst-case memory requirements. The laptop's 8 GiB headroom applies
+to system RAM; its 400 MiB GPU reserve is separate and has not been validated for normal external-monitor use.
+Everyday laptop acceptance keeps the external monitor connected and normal applications open, and samples
+actual free VRAM rather than assuming all 6 GB is available.
 
 The pinned profile-cache request is 70% of that pool, rounded down to whole GiB and capped at 30 GiB on the
 larger-RAM machine or 12 GiB below 48 GiB RAM. The remainder requests compact recent-cache storage, capped at
 16384 MiB. Under severe pressure the helper requests a small positive 0.25 GiB pinned budget and can reduce
 the recent cache to zero; it reports the low-memory condition. The engine still clamps requests at startup.
-Both caches allocate according to their own runtime rules; protected live entries may exceed recent
-retention, and budgets do not continuously resize after launch.
+Profile requests are ceilings subject to allocation checks. Recent retention is a lazy target: protected
+live entries and temporary replacement storage may exceed it. Neither cache continuously resizes its budget
+after launch, and a startup headroom floor does not reserve memory against later allocations or other apps.
+
+After resampling, a launch with both host-cache requests still automatic requires current available physical
+memory, available Windows commit on Windows, and at least 0.25 GiB in the computed expert pool. A measured zero
+is insufficient capacity, rather than unknown telemetry. Linux does not require Windows commit. Rejection
+preserves the saved config and does not start the server. The below-2-GiB warning alone does not reject a plan.
 
 The launcher samples hardware and memory again before each start. The saved `memory_policy` records which
 values are automatic. Manual changes to its managed arguments/environment become persistent overrides;
@@ -424,6 +439,32 @@ deliberate new-profile overrides even when they equal the current automatic choi
 `--resident-budget-gib`, `--file-cache-mib` or `--resident-headroom-gib` during creation. Oversized explicit
 requests remain explicit and are reported; this does not bypass engine safety clamps. Remove `memory_policy`
 only when a completely static configuration is intended.
+
+An explicit override or removal of either `--resident-budget-gib` or `STRATA_FILE_CACHE_MIB` retains the manual
+launch path and its warnings, including across repeated refreshes. Profile requests, when present, must be
+finite and positive; recent MiB must be a nonnegative integer; host headroom and VRAM reserve must be finite
+and nonnegative. Zero recent retention and zero headroom remain valid. The same validation applies to new
+CLI overrides and edited policy configs before publication or launch.
+
+Each managed memory-policy argument must appear at most once, including context, KV and boolean switches.
+Duplicate managed arguments are rejected before config publication or server startup; the helper preserves
+the saved bytes so the ambiguous argument list can be corrected explicitly.
+
+Numeric strings use ASCII decimal or scientific syntax; separators such as underscores and non-ASCII
+digits are rejected. Recent MiB must be a complete integer with no trailing whitespace and cannot exceed
+17592186044415 MiB, the engine's byte-counter limit. Larger ordinary requests within that range remain
+explicit and subject to allocation checks.
+
+The engine reads `--vram-reserve-mib` with an integer-prefix parser: `1e3` means 1 MiB and `1024.5` means
+1024 MiB. The helper preserves those manual argument spellings, uses the effective integer in its commit
+allowance, and reports any requested/effective difference. An effective prefix above 2147483647 MiB is
+rejected before launch to avoid signed-integer overflow. Removing the argument retains the conservative
+zero-reserve allowance used by the planner.
+
+`tools/benchmark_compact_cache.py` consumes the saved effective settings without refreshing the portable
+policy. For comparisons, refresh and save the effective config once, then freeze and record those settings
+alongside actual residency. `--plan` previews a refresh without saving it. Historical benchmark results do
+not validate a later automatic policy.
 
 New profiles set `fit_max_tokens=true` and `open_browser=false`. Output-budget fitting shortens a client's
 requested output allowance to the remaining context; it does not truncate the prompt or increase capacity.

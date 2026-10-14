@@ -117,6 +117,14 @@ class MemoryProfiles(unittest.TestCase):
         self.assertEqual(plan["recent_mib"], 0)
         self.assertTrue(plan["over_budget"])
 
+    def test_finite_oversized_profile_request_does_not_overflow_recent_accounting(self):
+        plan = prep.memory_plan(32, 16, 131072, available_gib=27, commit_available_gib=45,
+                                overrides={"args": {"--resident-budget-gib": "1e308"}})
+        self.assertEqual(value(plan["args"], "--resident-budget-gib"), "1e308")
+        self.assertEqual(plan["pinned_gib"], 1e308)
+        self.assertEqual(plan["recent_mib"], 0)
+        self.assertTrue(plan["over_budget"])
+
     def test_explicit_kv_format_changes_the_ram_allowance(self):
         plan = prep.memory_plan(63.7, 6, 131072, available_gib=58, commit_available_gib=70,
                                 overrides={"args": {"--kv": "int8"}})
@@ -138,6 +146,87 @@ class MemoryProfiles(unittest.TestCase):
         self.assertEqual(plan["expert_pool_gib"], 3.32421875)
         self.assertEqual(plan["pinned_gib"], 2)
 
+    def test_shared_planning_rejects_invalid_numeric_policy_inputs(self):
+        for group, name, invalid in (
+                ("args", "--resident-budget-gib", ("nan", "inf", "-inf", "0", "-1", "", False)),
+                ("args", "--vram-reserve-mib", ("nan", "inf", "-inf", "-1", "", False)),
+                ("env", "STRATA_RESIDENT_HEADROOM_GIB", ("nan", "inf", "-inf", "-1", "", False)),
+                ("env", "STRATA_FILE_CACHE_MIB", ("nan", "inf", "-1", "1.5", 1.5, "", False))):
+            for invalid_value in invalid:
+                with self.subTest(name=name, value=invalid_value), self.assertRaisesRegex(ValueError, name):
+                    prep.memory_plan(32, 16, 131072, overrides={group: {name: invalid_value}})
+
+    def test_shared_planning_rejects_python_only_numeric_spellings(self):
+        for group, name, invalid in (
+                ("args", "--resident-budget-gib", ("1_0", "١٠", "10\u00a0", "0x10", "10GiB")),
+                ("args", "--vram-reserve-mib", ("1_024", "١٠٢٤", "1024\u00a0", "0x400")),
+                ("env", "STRATA_RESIDENT_HEADROOM_GIB", ("1_0", "١٠", "10\u00a0", "0x10")),
+                ("env", "STRATA_FILE_CACHE_MIB", ("1_024", "١٠٢٤", "1024 ", "1024\n", "\u00a01024"))):
+            for invalid_value in invalid:
+                with self.subTest(name=name, value=invalid_value), self.assertRaisesRegex(ValueError, name):
+                    prep.memory_plan(32, 16, 131072, overrides={group: {name: invalid_value}})
+
+    def test_c_compatible_decimal_and_integer_whitespace_is_preserved(self):
+        plan = prep.memory_plan(32, 16, 131072, available_gib=27, commit_available_gib=45,
+                                overrides={"args": {"--resident-budget-gib": " \t+1.2e1 \r\n"},
+                                           "env": {"STRATA_RESIDENT_HEADROOM_GIB": " \t4.e0 \r\n",
+                                                   "STRATA_FILE_CACHE_MIB": " \t+0001024"}})
+        self.assertEqual(plan["pinned_gib"], 12)
+        self.assertEqual(plan["headroom_gib"], 4)
+        self.assertEqual(plan["recent_mib"], 1024)
+        self.assertEqual(value(plan["args"], "--resident-budget-gib"), " \t+1.2e1 \r\n")
+        self.assertEqual(plan["env"]["STRATA_FILE_CACHE_MIB"], " \t+0001024")
+
+    def test_recent_mib_engine_range_accepts_the_maximum_and_rejects_overflow(self):
+        for recent in (17592186044415, "17592186044415"):
+            with self.subTest(recent=recent):
+                plan = prep.memory_plan(32, 16, 131072, available_gib=27, commit_available_gib=45,
+                                        overrides={"env": {"STRATA_FILE_CACHE_MIB": recent}})
+                self.assertEqual(plan["recent_mib"], 17592186044415)
+                self.assertEqual(plan["env"]["STRATA_FILE_CACHE_MIB"], recent)
+                self.assertEqual(plan["pinned_gib"], 0.25)
+                self.assertTrue(plan["over_budget"])
+        for recent in (17592186044416, "17592186044416", 10**312, "1" + "0" * 312):
+            with self.subTest(recent=recent), self.assertRaisesRegex(ValueError, "STRATA_FILE_CACHE_MIB.*17592186044415"):
+                prep.memory_plan(32, 16, 131072, overrides={"env": {"STRATA_FILE_CACHE_MIB": recent}})
+
+    def test_effective_vram_reserve_rejects_signed_int_prefix_overflow(self):
+        for reserve in ("2147483647", "+2147483647.9"):
+            with self.subTest(reserve=reserve):
+                plan = prep.memory_plan(32, 16, 131072, overrides={"args": {"--vram-reserve-mib": reserve}})
+                self.assertEqual(plan["vram_reserve_mib"], 2147483647)
+                self.assertEqual(value(plan["args"], "--vram-reserve-mib"), reserve)
+        for reserve in ("2147483648", "2147483648e-3"):
+            with self.subTest(reserve=reserve), self.assertRaisesRegex(ValueError, "effective integer prefix"):
+                prep.memory_plan(32, 16, 131072, overrides={"args": {"--vram-reserve-mib": reserve}})
+
+    def test_zero_recent_headroom_and_reserve_are_valid(self):
+        plan = prep.memory_plan(32, 16, 131072, available_gib=27, commit_available_gib=45,
+                                overrides={"args": {"--resident-budget-gib": "100", "--vram-reserve-mib": "0"},
+                                           "env": {"STRATA_FILE_CACHE_MIB": 0, "STRATA_RESIDENT_HEADROOM_GIB": "0"}})
+        self.assertEqual(plan["pinned_gib"], 100)
+        self.assertEqual(plan["recent_mib"], 0)
+        self.assertEqual(plan["headroom_gib"], 0)
+        self.assertEqual(value(plan["args"], "--vram-reserve-mib"), "0")
+        self.assertTrue(plan["over_budget"])
+        self.assertFalse(plan["automatic_host_cache"])
+
+    def test_windows_commit_requirement_is_explicit_even_with_the_same_fallback_pool(self):
+        windows = prep.memory_plan(32, 16, 131072, available_gib=27, windows_commit=True)
+        linux = prep.memory_plan(32, 16, 131072, available_gib=27, windows_commit=False)
+        self.assertEqual(windows["expert_pool_gib"], linux["expert_pool_gib"])
+        self.assertTrue(windows["windows_commit"])
+        self.assertFalse(linux["windows_commit"])
+
+    def test_flag_queries_reject_duplicate_managed_values_and_switches(self):
+        for flag in ("--expert-cache", "--max-context", "--kv", "--kv-resident", "--spec",
+                     "--suffix-draft", "--lookup-chain", "--resident-budget-gib", "--prefill",
+                     "--vram-reserve-mib", "--no-prefill-borrow"):
+            for first, second in (("first", "last"), ("same", "same")):
+                args = [flag, flag] if flag == "--no-prefill-borrow" else [flag, first, flag, second]
+                with self.subTest(flag=flag, values=(first, second)), self.assertRaisesRegex(ValueError, f"Duplicate managed flag {flag}"):
+                    prep.flag_value(args, flag)
+
 
 class PortableProfiles(unittest.TestCase):
     def setUp(self):
@@ -158,6 +247,17 @@ class PortableProfiles(unittest.TestCase):
 
     def make_config(self, overrides=None):
         return prep.config_for(self.root / "source", self.root / "pack", 131072, None, overrides=overrides)
+
+    def assert_launch_rejected(self, cfg, message):
+        original = json.dumps(cfg, indent=4).encode()
+        self.config.write_bytes(original)
+        with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                patch.object(prep.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, message):
+                prep.launch(self.config)
+        publish.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), original)
 
     def test_new_profile_uses_distinct_artifacts_auth_fit_and_no_browser(self):
         cfg = self.make_config()
@@ -234,10 +334,15 @@ class PortableProfiles(unittest.TestCase):
     def test_removed_automatic_settings_remain_removed(self):
         cfg = self.make_config()
         cfg["env"].pop("STRATA_FILE_CACHE_MIB")
+        cfg["env"].pop("STRATA_RESIDENT_HEADROOM_GIB")
         prep.set_flag(cfg["args"], "--resident-budget-gib", None)
-        refreshed = prep.refreshed_config(cfg)
-        self.assertNotIn("STRATA_FILE_CACHE_MIB", refreshed["env"])
-        self.assertNotIn("--resident-budget-gib", refreshed["args"])
+        prep.set_flag(cfg["args"], "--vram-reserve-mib", None)
+        for _ in range(2):
+            cfg = prep.refreshed_config(cfg)
+            self.assertNotIn("STRATA_FILE_CACHE_MIB", cfg["env"])
+            self.assertNotIn("STRATA_RESIDENT_HEADROOM_GIB", cfg["env"])
+            self.assertNotIn("--resident-budget-gib", cfg["args"])
+            self.assertNotIn("--vram-reserve-mib", cfg["args"])
 
     def test_failed_launcher_publish_rolls_back_new_config(self):
         real_replace = prep.os.replace
@@ -322,6 +427,23 @@ class PortableProfiles(unittest.TestCase):
             prep.launch(self.config)
         self.assertEqual(run.call_args.kwargs["env"]["STRATA_API_KEY"], "explicit-env-key")
 
+    def test_legacy_profile_without_policy_remains_static_without_memory_telemetry(self):
+        cfg = self.make_config()
+        cfg.pop("memory_policy")
+        cfg["args"] += ["--vram-reserve-mib", "1e3"]
+        original = prep.json_bytes(cfg)
+        self.config.write_bytes(original)
+        prep.detected_memory.reset_mock()
+        prep.detected_memory.side_effect = ValueError("telemetry unavailable")
+        with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                patch.object(prep.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertEqual(prep.launch(self.config), 0)
+        prep.detected_memory.assert_not_called()
+        publish.assert_not_called()
+        run.assert_called_once()
+        self.assertEqual(self.config.read_bytes(), original)
+
     def test_launch_readiness_failure_neither_saves_nor_starts_server(self):
         self.config.write_bytes(prep.json_bytes(self.make_config()))
         original = self.config.read_bytes()
@@ -331,6 +453,196 @@ class PortableProfiles(unittest.TestCase):
                 prep.launch(self.config)
         run.assert_not_called()
         self.assertEqual(self.config.read_bytes(), original)
+
+    def test_launch_rejects_zero_and_subminimum_automatic_pools(self):
+        cfg = self.make_config()
+        for available, commit in ((0, 45), (27, 0), (8.9248046875, 45)):
+            with self.subTest(available=available, commit=commit):
+                prep.detected_memory.return_value.update(available_gib=available, commit_available_gib=commit)
+                self.assert_launch_rejected(cfg, "at least 0.25 GiB")
+
+    def test_launch_admits_exact_minimum_and_small_positive_pools(self):
+        cfg = self.make_config()
+        cfg.update(host="0.0.0.0", port=8182)
+        for available, pool, recent in ((8.92578125, 0.25, "0"), (9.26171875, 0.5859375, "344")):
+            with self.subTest(available=available):
+                prep.detected_memory.return_value["available_gib"] = available
+                self.config.write_bytes(prep.json_bytes(cfg))
+                with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    run.return_value.returncode = 0
+                    self.assertEqual(prep.launch(self.config), 0)
+                run.assert_called_once()
+                saved = json.loads(self.config.read_text())
+                self.assertEqual(saved["memory_policy"]["sample"]["expert_pool_gib"], pool)
+                self.assertTrue(saved["memory_policy"]["sample"]["low_memory"])
+                self.assertEqual(value(saved["args"], "--resident-budget-gib"), "0.25")
+                self.assertEqual(saved["env"]["STRATA_FILE_CACHE_MIB"], recent)
+                self.assertEqual(value(saved["args"], "--max-context"), "131072")
+                self.assertEqual((saved["api_key"], saved["host"], saved["port"]), (cfg["api_key"], "0.0.0.0", 8182))
+
+    def test_launch_rejects_missing_required_memory_telemetry(self):
+        cfg = self.make_config()
+        for available, commit, windows, message in (
+                (None, 45, True, "physical-memory telemetry"),
+                (27, None, True, "Windows commit telemetry"),
+                (None, None, False, "physical-memory telemetry")):
+            with self.subTest(windows=windows, available=available, commit=commit):
+                prep.detected_memory.return_value.update(available_gib=available, commit_available_gib=commit,
+                                                        windows_commit=windows)
+                self.assert_launch_rejected(cfg, message)
+
+    def test_linux_launch_does_not_require_windows_commit(self):
+        cfg = self.make_config()
+        prep.detected_memory.return_value.update(commit_available_gib=None, windows_commit=False)
+        self.config.write_bytes(prep.json_bytes(cfg))
+        with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            run.return_value.returncode = 0
+            self.assertEqual(prep.launch(self.config), 0)
+        run.assert_called_once()
+        sample = json.loads(self.config.read_text())["memory_policy"]["sample"]
+        self.assertFalse(sample["windows_commit"])
+        self.assertIsNone(sample["commit_available_gib"])
+        self.assertEqual(sample["expert_pool_gib"], 18.32421875)
+
+    def test_invalid_saved_values_fail_before_publication_or_server(self):
+        for group, name, invalid in (
+                ("args", "--resident-budget-gib", ("0", "-1", "nan", "inf")),
+                ("args", "--vram-reserve-mib", ("-1", "nan", "inf")),
+                ("env", "STRATA_RESIDENT_HEADROOM_GIB", ("-1", "nan", "inf")),
+                ("env", "STRATA_FILE_CACHE_MIB", ("-1", "1.5", 1.5))):
+            for invalid_value in invalid:
+                with self.subTest(name=name, value=invalid_value):
+                    cfg = self.make_config()
+                    if group == "args":
+                        prep.set_flag(cfg["args"], name, invalid_value)
+                    else:
+                        cfg["env"][name] = invalid_value
+                    self.assert_launch_rejected(cfg, name)
+
+    def test_incompatible_saved_numeric_spellings_and_ranges_never_publish_or_start_server(self):
+        for group, name, invalid in (
+                ("args", "--resident-budget-gib", ("1_0", "١٠", "10\u00a0")),
+                ("args", "--vram-reserve-mib", ("1_024", "١٠٢٤", "2147483648", "2147483648e-3")),
+                ("env", "STRATA_RESIDENT_HEADROOM_GIB", ("1_0", "١٠", "10\u00a0")),
+                ("env", "STRATA_FILE_CACHE_MIB", ("1_024", "١٠٢٤", "1024 ", "\u00a01024", 2**44, 10**312))):
+            for invalid_value in invalid:
+                with self.subTest(name=name, value=invalid_value):
+                    cfg = self.make_config()
+                    if group == "args":
+                        prep.set_flag(cfg["args"], name, invalid_value)
+                    else:
+                        cfg["env"][name] = invalid_value
+                    self.assert_launch_rejected(cfg, name)
+
+    def test_scientific_and_fractional_vram_reserve_preserve_refresh_identity_and_report_effective_value(self):
+        for raw, requested, effective in (("1e3", 1000, 1), ("1.75", 1.75, 1),
+                                          (".5", 0.5, 0), (" \t+1024.75 \r", 1024.75, 1024)):
+            with self.subTest(raw=raw):
+                cfg = self.make_config({"args": {"--vram-reserve-mib": raw}})
+                for available in (17, 27):
+                    prep.detected_memory.return_value["available_gib"] = available
+                    cfg = prep.refreshed_config(cfg)
+                    self.assertEqual(value(cfg["args"], "--vram-reserve-mib"), raw)
+                    self.assertEqual(cfg["memory_policy"]["overrides"]["args"]["--vram-reserve-mib"], raw)
+                    sample = cfg["memory_policy"]["sample"]
+                    self.assertEqual(sample["vram_reserve_requested_mib"], requested)
+                    self.assertEqual(sample["vram_reserve_mib"], effective)
+                    self.assertEqual(sample["gpu_commit_gib"], 15.99 - effective / 1024)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    prep.report_memory(sample, cfg)
+                self.assertIn(f"VRAM reserve request {raw!r} MiB", output.getvalue())
+                self.assertIn(f"engine effective {effective} MiB", output.getvalue())
+
+    def test_automatic_admission_uses_the_engine_integer_prefix_for_scientific_and_fractional_reserve(self):
+        prep.setup.gpu_info.return_value["vram_gb"] = 16
+        prep.detected_memory.return_value.update(ram_gib=32, available_gib=27, commit_available_gib=24.75)
+        for raw in ("1e3", "1.75"):
+            with self.subTest(raw=raw):
+                cfg = self.make_config({"args": {"--vram-reserve-mib": raw}})
+                sample = cfg["memory_policy"]["sample"]
+                self.assertTrue(sample["automatic_host_cache"])
+                self.assertEqual(sample["vram_reserve_mib"], 1)
+                self.assertEqual(sample["expert_pool_gib"], 0.0751953125)
+                self.assert_launch_rejected(cfg, "at least 0.25 GiB")
+
+    def test_duplicate_saved_managed_flags_never_publish_or_start_server(self):
+        prep.setup.gpu_info.return_value["vram_gb"] = 16
+        prep.detected_memory.return_value.update(ram_gib=32, available_gib=27, commit_available_gib=24.75)
+        for flag, duplicate in (("--expert-cache", "1"), ("--max-context", "8192"), ("--kv", "fp16"),
+                                ("--kv-resident", "1024"), ("--spec", "3"), ("--suffix-draft", "1"),
+                                ("--lookup-chain", "1"), ("--resident-budget-gib", "20"), ("--prefill", "64"),
+                                ("--vram-reserve-mib", "1e3"), ("--no-prefill-borrow", None)):
+            with self.subTest(flag=flag):
+                cfg = self.make_config({"args": {"--vram-reserve-mib": "1024"}})
+                self.assertEqual(cfg["memory_policy"]["sample"]["expert_pool_gib"], 1.07421875)
+                if duplicate is None:
+                    cfg["args"] += [flag, flag]
+                else:
+                    cfg["args"] += [flag, duplicate]
+                self.assert_launch_rejected(cfg, f"Duplicate managed flag {flag}")
+
+    def test_duplicate_generated_policy_flags_never_publish_or_start_server(self):
+        cfg = self.make_config({"args": {"--vram-reserve-mib": "1024"}})
+        cfg["memory_policy"]["generated_args"] += ["--vram-reserve-mib", "1e3"]
+        self.assert_launch_rejected(cfg, "Duplicate managed flag --vram-reserve-mib")
+
+    def test_manual_and_removed_cache_overrides_survive_repeated_refresh_and_launch(self):
+        for group, name, override in (("args", "--resident-budget-gib", "100"),
+                                      ("env", "STRATA_FILE_CACHE_MIB", "20000"),
+                                      ("args", "--resident-budget-gib", None),
+                                      ("env", "STRATA_FILE_CACHE_MIB", None)):
+            with self.subTest(name=name, override=override):
+                prep.detected_memory.return_value.update(available_gib=27, commit_available_gib=45)
+                cfg = self.make_config()
+                if group == "args":
+                    prep.set_flag(cfg["args"], name, override)
+                elif override is None:
+                    cfg["env"].pop(name)
+                else:
+                    cfg["env"][name] = override
+                for available in (0, None):
+                    prep.detected_memory.return_value.update(available_gib=available, commit_available_gib=None)
+                    cfg = prep.refreshed_config(cfg)
+                    self.assertIn(name, cfg["memory_policy"]["overrides"][group])
+                    self.assertEqual(cfg["memory_policy"]["overrides"][group][name], override)
+                self.config.write_bytes(prep.json_bytes(cfg))
+                with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    run.return_value.returncode = 0
+                    self.assertEqual(prep.launch(self.config), 0)
+                run.assert_called_once()
+                saved = json.loads(self.config.read_text())
+                actual = prep.flag_value(saved["args"], name) if group == "args" else saved["env"].get(name)
+                self.assertEqual(actual, override)
+                self.assertEqual(saved["memory_policy"]["overrides"][group][name], override)
+                self.assertFalse(saved["memory_policy"]["sample"]["automatic_host_cache"])
+
+    def test_noncache_overrides_do_not_bypass_automatic_admission(self):
+        cfg = self.make_config({"args": {"--vram-reserve-mib": "0"},
+                                "env": {"STRATA_RESIDENT_HEADROOM_GIB": "0"}})
+        prep.detected_memory.return_value["available_gib"] = 0
+        self.assert_launch_rejected(cfg, "at least 0.25 GiB")
+
+    def test_preparation_and_read_only_plan_allow_unverified_telemetry(self):
+        prep.detected_memory.return_value.update(available_gib=None, commit_available_gib=None)
+        pack = self.root / "packs" / prep.TAG
+        for name in ("native_experts.txt", "tokenizer/vocab.json"):
+            path = pack / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture")
+        output = io.StringIO()
+        with patch.object(prep, "verify_sources"), patch.object(prep, "check_ready"), \
+                patch.object(prep.subprocess, "run") as run, contextlib.redirect_stdout(output):
+            self.assertEqual(prep.main(["--prepare", "--config", str(self.config), "--gguf-dir", str(self.root)]), 0)
+            original = self.config.read_bytes()
+            self.assertEqual(prep.main(["--plan", "--config", str(self.config)]), 0)
+        run.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertIn("Unverified plan", output.getvalue())
+        self.assertIn("Windows commit telemetry unavailable", output.getvalue())
 
     def test_launch_does_not_overwrite_a_concurrent_user_edit(self):
         self.config.write_bytes(prep.json_bytes(self.make_config()))
