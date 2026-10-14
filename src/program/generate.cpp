@@ -19,6 +19,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_cache_retry.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -3990,19 +3991,33 @@ int main(int argc, char** argv) {
         // free figure read again; while it is short of the reserve the cache is reopened smaller.
         // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
-        int failed = 0;
         int zero_reads = 0;
-        for (int attempt = 0;; ++attempt) {
-            bool ok = false;
-            if (fake_fails > 0) {
-                --fake_fails;
-                err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
-            } else {
-                ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
-                    : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
-            }
-            if (!ok) {
+        const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + auto_cache_late_bytes;
+        const auto retry = strata::core::retry_expert_cache(auto_cache, want, err,
+            [&](std::string& why) -> bool {
+                if (fake_fails > 0) {
+                    --fake_fails;
+                    why = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
+                    return false;
+                }
+                return sized_slots.empty()
+                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, why)
+                    : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, why);
+            },
+            [&](std::string& why) -> bool {
+                const cudaError_t status = cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+                if (status == cudaSuccess) return true;
+                why = std::string("expert cache auto: cudaMemset failed: ") + cudaGetErrorString(status);
+                return false;
+            },
+            [&](std::string& why) -> bool {
+                const cudaError_t status = cudaDeviceSynchronize();
+                if (status == cudaSuccess) return true;
+                why = std::string("expert cache auto: cudaDeviceSynchronize failed: ") + cudaGetErrorString(status);
+                return false;
+            },
+            [&]() -> int64_t { return (int64_t) strata::core::device_free_bytes(); },
+            [&]() -> bool {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
                 // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
                 // cache then tries three quarters of the size, a few times, instead of stopping the engine.
@@ -4014,39 +4029,36 @@ int main(int argc, char** argv) {
                     std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
                                   (double) ms.ullAvailPageFile / 1073741824.0);
 #endif
-                if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
-                    ++failed;
-                    std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
-                                 commit, o.expert_cache);
-                    continue;
-                }
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                if (!shrink_to(cache_bytes() / 4 * 3)) return false;
+                std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
+                             commit, o.expert_cache);
+                return true;
+            },
+            [&](int64_t free_b, int64_t reserve) -> bool {
+                // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
+                // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
+                int64_t give = reserve - free_b + (64ll << 20);
+                if (free_b < (16ll << 20))
+                    give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
+                const int64_t keep_bytes = xcache.bytes() - give;
+                std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB, "
+                                     "later buffers %lld MiB); shrinking the expert cache\n",
+                             (long long) (free_b >> 20), o.vram_reserve_mib, (long long) (auto_cache_late_bytes >> 20));
+                xcache.close();
+                return shrink_to(keep_bytes);
+            });
+        if (retry.status == strata::core::ExpertCacheRetryStatus::allocation_failed ||
+            retry.status == strata::core::ExpertCacheRetryStatus::validation_failed) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
 #if defined(_WIN32)
+            if (retry.status == strata::core::ExpertCacheRetryStatus::allocation_failed)
                 std::fprintf(stderr, "strata generate: on Windows the graphics card's memory also needs room in the page "
                                      "file: set it to \"System managed\" (System > About > Advanced system settings > "
                                      "Performance > Advanced > Virtual memory), or lower --expert-cache\n");
 #endif
-                return 1;
-            }
-            if (!auto_cache || attempt - failed >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
-            cudaDeviceSynchronize();
-            size_t free_b = 0, total_b = 0;
-            free_b = strata::core::device_free_bytes(); (void) total_b;
-            const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + auto_cache_late_bytes;
-            if ((int64_t) free_b >= want - (64ll << 20)) break;
-            // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
-            // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
-            int64_t give = want - (int64_t) free_b + (64ll << 20);
-            if (free_b < ((size_t) 16 << 20))
-                give = std::max<int64_t>(give, ++zero_reads <= 2 ? 1ll << 30 : xcache.bytes() / 4);
-            const int64_t keep_bytes = xcache.bytes() - give;
-            std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB, "
-                                 "later buffers %lld MiB); shrinking the expert cache\n",
-                         (long long) (free_b >> 20), o.vram_reserve_mib, (long long) (auto_cache_late_bytes >> 20));
-            xcache.close();
-            if (!shrink_to(keep_bytes)) break;
+            return 1;
         }
+        const int failed = retry.allocation_retries;
         if (failed > 0 && o.expert_cache > 0)
             std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
                                  "page file lets it use more of the free VRAM\n",

@@ -220,6 +220,16 @@ if(STRATA_WERROR)
     $<$<COMPILE_LANGUAGE:HIP>:-Werror>)
 endif()
 
+# Startup retry control has no GPU dependency and remains testable without a model or toolkit.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_cache_retry_test.cpp")
+  enable_testing()
+  add_executable(expert_cache_retry_test tests/core/expert_cache_retry_test.cpp)
+  target_include_directories(expert_cache_retry_test PRIVATE include)
+  target_link_libraries(expert_cache_retry_test PRIVATE strata_warnings)
+  add_test(NAME expert_cache_retry_test COMMAND expert_cache_retry_test)
+  set_tests_properties(expert_cache_retry_test PROPERTIES TIMEOUT 30)
+endif()
+
 # ---- strata_artifact -------------------------------------------------------
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
 # scalar dequantizers hold no state worth hiding, and a header-only boundary cannot introduce a
