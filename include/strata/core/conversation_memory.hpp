@@ -6,7 +6,8 @@
 
 namespace strata::core {
 
-// Host physical memory, not swap/commit or a container/job memory reservation.
+// Available host physical memory, capped by available commit on Windows.
+// This is not a container/job memory reservation.
 // Unknown telemetry is deliberately distinct from a measured zero.
 std::optional<uint64_t> conversation_available_memory();
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);

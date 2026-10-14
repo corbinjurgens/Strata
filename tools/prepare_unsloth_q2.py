@@ -86,7 +86,9 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
     headroom = float(4 if headroom_value is None else headroom_value)
     later = 0.5 if small_gpu else 1.0
     fixed = 2.0
-    reserve_mib = float(arg_overrides.get("--vram-reserve-mib", 448 if small_gpu else 1024) or 0)
+    # Match the measured laptop GPU settings: 448 MiB at 64K, 400 MiB at 128K.
+    default_reserve_mib = (400 if context > 65536 else 448) if small_gpu else 1024
+    reserve_mib = float(arg_overrides.get("--vram-reserve-mib", default_reserve_mib) or 0)
     gpu_commit = max(0, vram - reserve_mib / 1024) if windows_commit else 0
     fallback = available_gib is None
     available = min(ram, available_gib if available_gib is not None else ram * 0.65)
@@ -108,17 +110,17 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         recent_mib = int(env_overrides["STRATA_FILE_CACHE_MIB"] or 0)
     args = ["--expert-cache", "auto", "--max-context", str(context), "--kv", kv,
             "--spec", "2", "--suffix-draft", "0", "--lookup-chain", "0",
-            "--resident-budget-gib", f"{budget:g}"]
+            "--resident-budget-gib", f"{budget:g}", "--vram-reserve-mib", f"{reserve_mib:g}"]
     env = {"STRATA_RESIDENT_HEADROOM_GIB": f"{headroom:g}", "STRATA_FILE_CACHE_MIB": str(recent_mib),
            "STRATA_FILE_CACHE_COMPACT": "1"}
     if small_gpu:
         chunk = 64 if context < 65536 else 256
         if context > 65536:
             chunk = 64
-        args += ["--prefill", str(chunk), "--no-prefill-borrow", "--vram-reserve-mib", "448"]
+        args += ["--prefill", str(chunk), "--no-prefill-borrow"]
         env["STRATA_OWNED_PRICE"] = "exact"
     else:
-        args += ["--prefill", "auto", "--vram-reserve-mib", "1024"]
+        args += ["--prefill", "auto"]
     if streamed:
         args += ["--kv-resident", str(resident_cells)]
     for flag, value in arg_overrides.items():

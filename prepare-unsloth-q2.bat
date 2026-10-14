@@ -6,6 +6,6 @@ cd /d "%~dp0"
 if errorlevel 1 (
     echo Preparation did not complete. Read the message above.
 ) else (
-    echo Prepared. Run run-unsloth-ud-q2_k_xl.bat when you are ready to test.
+    echo Prepared. Run the launcher printed above when you are ready to test.
 )
 pause

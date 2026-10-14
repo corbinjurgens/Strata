@@ -245,11 +245,44 @@ One unmeasured next trial is `--resident-budget-gib 30` with `STRATA_RESIDENT_HE
 `env` object, retaining the working context/GPU settings. This would reserve more RAM for applications at the
 cost of more expert reads from the SSD. These proposed settings have not been applied or benchmarked.
 
+## Combined branch and upstream fixes, 2026-10-14
+
+`codex/unsloth-low-vram` incorporates the desktop's `codex/unsloth-file-cache` work (`411ee540`) alongside the
+laptop's allocation changes. Use this combined branch on either PC. Its hardware-aware helper selects a local
+profile; the desktop's separately trained placement remains an explicit experiment rather than a hardware default.
+
+The branch selectively adapts upstream's [batched prompt reads](https://github.com/Niko1221/Strata/commit/0b030b96fc6a13a3f815ec25f4d6491f47745b1c)
+and Windows commit checks from [its memory fix](https://github.com/Niko1221/Strata/commit/5728828a8498a4581f51a61f5a64805174648c0f).
+`STRATA_STAGER_BATCH=8` lets the prompt stager group consecutive jobs through the existing direct reader.
+The branch keeps the default at one job because larger batches retain more per-worker RAM and have not yet been
+measured with the combined policy. Prompt copies do not populate the desktop's recent decode-expert cache.
+
+Upstream also closes unused GGUF mappings automatically, but this branch retains the desktop's tested opt-in
+`STRATA_FILE_DIRECT_UNMAP` behavior and buffered positional fallback. Its earlier desktop trial did not improve
+performance. The combined reader uses one mapping lifetime and file-offset representation for both paths.
+
+Conversation parking and session save/restore now consider the smaller of physical RAM and available Windows
+commit. A startup diagnostic reports commit headroom and warns when it cannot cover the conversation cache,
+a 2 GiB checkpoint/staging allowance and 4 GiB headroom. This warning is not a global memory cap and does not
+reserve that space for other applications. The expert RAM budget still needs to leave room for the desktop.
+
+Upstream `v0.1.44.1` (`296b59d2`) still excludes UD-Q2_K_XL from setup and does not contain this branch's native
+weight arena or compact prompt buffers. A full merge also brings inference-default and kernel changes, so those
+are left for separate validation. In particular, no route-tail skipping or HC requantization is enabled here.
+
+The combined source built on the RTX 4050 laptop with CUDA 13.4.92 / MSVC 19.43. On 2026-10-14, 270 offline
+Python tests and eight focused CTests passed, covering setup, hardware budgets, explicit overrides, cache I/O,
+native weights/head/embedding and prompt allocations. The cache rotation fixture also passed exact-byte checks
+for pinned, rotated and pageable storage. Split-GGUF batch tests cover direct reads, retired mappings, buffered
+fallback, injected read failures and reopening. A preparation dry run detected the laptop and preserved its
+authenticated LAN settings. No full model was loaded; combined-policy performance, live prompt batching and
+desktop runtime validation remain outstanding. Existing laptop launchers continue to select their working engine.
+
 ## Original manual setup
 
-The earlier laptop setup used the custom branch based on upstream `v0.1.40.1` (`82f46a8`), with this clone command.
-The [hardware-aware helper below](#hardware-aware-preparation-for-both-pcs) describes new local profiles from the
-current source; the older `codex/unsloth-low-vram` branch alone does not include the newer engine/helper changes.
+This custom branch uses the tested upstream `v0.1.40.1` source baseline (`82f46a8`) with the selective backports
+described above. The [hardware-aware helper below](#hardware-aware-preparation-for-both-pcs) prepares a separate
+automatic profile. The earlier manual method remains available. For a separate installation, clone the branch:
 
 ```text
 git clone --branch codex/unsloth-low-vram --single-branch https://github.com/corbinjurgens/Strata.git
@@ -360,7 +393,7 @@ At 131072 context, the default GPU choices are:
 | --- | --- | --- |
 | KV storage / GPU resident cells | q4_0 / 20480 | int8 / 32768 |
 | Prefill chunks | 64, separate buffers (`--no-prefill-borrow`) | auto, normal borrowing |
-| Explicit VRAM reserve | 448 MiB | 1024 MiB |
+| Explicit VRAM reserve | 400 MiB at 128K; 448 MiB at 64K or below | 1024 MiB |
 | Owned-buffer pricing | `STRATA_OWNED_PRICE=exact` | normal pricing |
 | MTP, suffix and lookup drafting | off; verifier window 2 | off; verifier window 2 |
 

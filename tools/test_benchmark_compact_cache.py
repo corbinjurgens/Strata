@@ -17,7 +17,7 @@ from tools import benchmark_compact_cache as bench
 
 class HelperTests(unittest.TestCase):
     def test_snapshot_replacement_survives_a_temporary_reader_lock(self):
-        with tempfile.TemporaryDirectory(dir=bench.SCRATCH) as folder:
+        with tempfile.TemporaryDirectory() as folder:
             pending, destination = Path(folder) / "pending.json", Path(folder) / "result.json"
             pending.write_text('{"state":"new"}')
             destination.write_text('{"state":"old"}')
@@ -38,7 +38,7 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
 
     def test_persistent_snapshot_denial_keeps_prior_data_and_reports_failure(self):
-        with tempfile.TemporaryDirectory(dir=bench.SCRATCH) as folder:
+        with tempfile.TemporaryDirectory() as folder:
             pending, destination = Path(folder) / "pending.json", Path(folder) / "result.json"
             pending.write_text("new")
             destination.write_text("old")
@@ -138,7 +138,7 @@ class HelperTests(unittest.TestCase):
 
     def test_prompt_counter_uses_complete_chat_template_and_thinking_disabled(self):
         from serve import server, frontend
-        with tempfile.TemporaryDirectory(dir=bench.SCRATCH) as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "vocab.json").write_text('{"second": 1, "first": 0}')
             (root / "merges.txt").write_text("first second\n")
@@ -192,7 +192,7 @@ class HelperTests(unittest.TestCase):
             save.assert_called_once_with()
 
     def test_working_tree_identity_detects_dirty_source_bytes(self):
-        with tempfile.TemporaryDirectory(dir=bench.SCRATCH) as folder:
+        with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "src").mkdir()
             source = root / "src/cache.cpp"

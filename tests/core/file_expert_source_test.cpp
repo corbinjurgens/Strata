@@ -289,6 +289,22 @@ void test_direct_mapping_retirement() {
     auto matches = [&](const uint8_t* p, int l, int e) {
         return p && !std::memcmp(p, truth[l].data() + e * fm[l].bytes, (size_t) fm[l].bytes);
     };
+    const int32_t batch_layers[] = {1, 0, 1, 0, 1, 0, 1};
+    const int32_t batch_experts[] = {2, 2, 0, 0, 1, 1, 2};   // all experts, mixed sizes and a repeated blob
+    std::vector<std::vector<uint8_t>> batch_copy;
+    std::vector<uint8_t*> batch_dst;
+    for (int l : batch_layers) batch_copy.emplace_back((size_t) fm[l].bytes);
+    for (auto& copy : batch_copy) batch_dst.push_back(copy.data());
+    auto check_batch = [&] {
+        require(source.copy_blobs(batch_layers, batch_experts, batch_dst.data(), batch_dst.size()),
+                "split-role batch copy failed");
+        for (size_t i = 0; i < batch_copy.size(); ++i)
+            require(matches(batch_copy[i].data(), batch_layers[i], batch_experts[i]), "split-role batch bytes differ");
+        require(source.copy_blobs(nullptr, nullptr, nullptr, 0), "empty batch failed");
+        const int32_t invalid[] = {0, (int32_t) layers};
+        require(!source.copy_blobs(invalid, batch_experts, batch_dst.data(), 2), "batch accepted an invalid layer");
+    };
+    check_batch();
     const auto* live = source.blob(0, 0);
     require(matches(live, 0, 0), "mapped split-role fixture differs");
     set_env("STRATA_UNBUFFERED_LOAD", "1");
@@ -296,6 +312,7 @@ void test_direct_mapping_retirement() {
     const bool direct = source.set_unbuffered(0, why);
     set_env("STRATA_UNBUFFERED_LOAD", nullptr);
     require(direct, "retirement fixture could not enable unbuffered reads: " + why);
+    check_batch();
     source.set_file_cache_bytes(3 * 2176000ull, true);
     Access::set_busy(source, 0, true);
     require(!source.retire_direct_mappings(err) && source.mapped_view_bytes() == mapped,
@@ -315,6 +332,7 @@ void test_direct_mapping_retirement() {
     require(matches(live, 0, 0) && source.blob(0, 0) == live, "retirement changed a live staging pointer");
     require(source.retire_direct_mappings(err), "retirement is not idempotent");
     require(source.recheck_unbuffered(why), "retired source switched to absent mappings");
+    check_batch();   // base_ is null after retirement, but positional direct reads remain valid
     const int64_t batch[3] = {0, 1, 2};
     source.prefetch(1, batch, 3);
     for (int e = 0; e < 3; ++e) require(matches(source.blob(1, e), 1, e), "retired batch changed expert bytes");
@@ -331,6 +349,7 @@ void test_direct_mapping_retirement() {
     require(source.copy_blob(0, 2, copy.data()) && matches(copy.data(), 0, 2), "positional fallback bytes differ");
     require(source.fetch_stats().get(FM::buffered_read_bytes) - fallback_before.get(FM::buffered_read_bytes) == 1868800,
             "buffered fallback read an unexpected byte count");
+    check_batch();   // a failed direct batch must use the same buffered positional fallback as copy_blob
     std::vector<uint8_t> a((size_t) fm[0].bytes), b((size_t) fm[1].bytes);
     bool ok_a = false, ok_b = false;
     std::thread ta([&] { ok_a = source.copy_blob(0, 1, a.data()); });
@@ -339,11 +358,13 @@ void test_direct_mapping_retirement() {
     require(ok_a && ok_b && matches(a.data(), 0, 1) && matches(b.data(), 1, 2),
             "concurrent positional fallbacks shared a file position or buffer");
     const auto fallback_handle = Access::exchange_handle(source, 0, INVALID_HANDLE_VALUE, true);
+    const bool failed_batch = source.copy_blobs(batch_layers, batch_experts, batch_dst.data(), batch_dst.size());
     const bool failed_copy = source.copy_blob(0, 1, a.data());
     const auto* failed_blob = source.blob(0, 1); // not previously cached: publish must invalidate this failed fill
     Access::exchange_handle(source, 0, fallback_handle, true);
     Access::exchange_handle(source, 0, direct_handle, false);
-    require(!failed_copy && failed_blob == nullptr, "double I/O failure published partial expert bytes");
+    require(!failed_batch && !failed_copy && failed_blob == nullptr, "double I/O failure published partial expert bytes");
+    check_batch();
     require(matches(source.blob(0, 1), 0, 1), "failed fill poisoned a later valid lookup");
     require(source.mapped_view_bytes() == 0, "fallback recreated whole-file mappings");
     source.close();
@@ -351,6 +372,7 @@ void test_direct_mapping_retirement() {
             "close retained retired source state");
     require(source.open(dir.path.string(), layers, experts, err) && source.mapped_view_bytes() == mapped &&
             !source.direct_mappings_retired() && matches(source.blob(0, 1), 0, 1), "reopen retained experimental state");
+    check_batch();
     std::cout << "direct mapping retirement: split/mixed bytes, live buffers, fallback/open/I/O faults, concurrency, reset PASS\n";
 #else
     std::cout << "direct mapping retirement: Windows-only experiment, not exercised on this platform\n";
@@ -592,6 +614,17 @@ void test_unbuffered_reads() {
     }
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+    const int32_t batch_layers[] = {1, 0, 1, 0};
+    const int32_t batch_experts[] = {2, 0, 0, 2};
+    std::vector<std::vector<uint8_t>> copies(4, std::vector<uint8_t>((size_t) BLOB));
+    uint8_t* destinations[] = {copies[0].data(), copies[1].data(), copies[2].data(), copies[3].data()};
+    auto check_batch = [&] {
+        require(source.copy_blobs(batch_layers, batch_experts, destinations, 4), "canonical batch copy failed");
+        for (size_t i = 0; i < copies.size(); ++i)
+            require(std::memcmp(copies[i].data(), bytes.data() + batch_layers[i] * layer_bytes + batch_experts[i] * BLOB,
+                                (size_t) BLOB) == 0, "canonical batch copied the wrong bytes");
+    };
+    check_batch();
     set_env("STRATA_UNBUFFERED_LOAD", "1");
     std::string why;
     const bool unbuffered = source.set_unbuffered(0, why);
@@ -623,7 +656,10 @@ void test_unbuffered_reads() {
                 std::memcmp(copy.data(), bytes.data() + (size_t) (2 * BLOB), (size_t) BLOB) == 0,
             "an unbuffered copy_blob differs from the file");
     require(source.direct_fallbacks() == 0, "an unbuffered read fell back to the mapping");
+    check_batch();
     source.close();
+    require(source.open(dir.path.string(), layers, experts, err), "could not reopen the batch fixture: " + err);
+    check_batch();
 }
 
 void test_fetch_profiling() {
@@ -999,6 +1035,19 @@ void test_rotating_source(bool rotate, bool pin) {
     require(src.exchange_rotation() == (rotate && pin), "rotation activation/fallback wrong");
     require(src.reserve_exchanges(1, err), "smaller capacity rejected");
     if (rotate && pin) require(!src.reserve_exchanges(3, err), "live arena growth accepted");
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    std::string why;
+    const bool direct = src.set_unbuffered(0, why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    if (!direct) std::cout << "rotation batch uses mapped reads (" << why << ")\n";
+    std::vector<std::vector<uint8_t>> batch_copy(5, std::vector<uint8_t>(bytes));
+    uint8_t* batch_dst[] = {batch_copy[0].data(), batch_copy[1].data(), batch_copy[2].data(),
+                          batch_copy[3].data(), batch_copy[4].data()};
+    const int32_t batch_layers[] = {0, 0, 0, 0, 0}, batch_experts[] = {0, 1, 2, 3, 4};
+    auto check_batch = [&] {
+        require(src.copy_blobs(batch_layers, batch_experts, batch_dst, 5), "rotation batch copy failed");
+        require(batch_copy == truth, "batch lost a staged, rotated or file-backed expert");
+    };
     int incoming[2] = {0, 1}, outgoing[2] = {2, 3};
     std::vector<uint8_t> actual(bytes);
     double commit_ms = 0;
@@ -1016,6 +1065,7 @@ void test_rotating_source(bool rotate, bool pin) {
         }
         require(!src.stage_exchange(0, incoming[0], outgoing[0], 0), "duplicate stage accepted");
         require(!src.stage_exchange(0, incoming[0], 5, 0), "invalid expert accepted");
+        check_batch();
         const auto t0 = std::chrono::steady_clock::now();
         require(src.commit_exchanges() == 2, "commit count wrong");
         commit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1038,6 +1088,7 @@ void test_rotating_source(bool rotate, bool pin) {
             std::swap(incoming[q], outgoing[q]);
         }
         require(!src.has_resident(0, 4) && src.copy_blob(0, 4, actual.data()) && actual == truth[4], "file fallback changed");
+        check_batch();
     }
     require(src.exchanges() == 64, "exchange accounting wrong");
     require(src.rotated_exchanges() == ((rotate && pin) ? 64u : 0u), "rotation accounting wrong");

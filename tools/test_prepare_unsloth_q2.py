@@ -66,6 +66,15 @@ class MemoryProfiles(unittest.TestCase):
         self.assertAlmostEqual(plan["kv_ram_gib"], 1.67578125)
         self.assertEqual(plan["later_startup_gib"], 1)
 
+    def test_small_gpu_reserve_matches_context_and_commit_budget(self):
+        for context, reserve in ((8192, 448), (32768, 448), (65536, 448), (131072, 400)):
+            with self.subTest(context=context):
+                plan = prep.memory_plan(63.7, 6, context, available_gib=58, commit_available_gib=40)
+                self.assertEqual(value(plan["args"], "--vram-reserve-mib"), str(reserve))
+                self.assertEqual(plan["gpu_commit_gib"], 6 - reserve / 1024)
+                self.assertAlmostEqual(plan["expert_pool_gib"],
+                                       40 - 8 - 0.5 - 2 - plan["kv_ram_gib"] - (6 - reserve / 1024))
+
     def test_tight_commit_reduces_both_caches_without_changing_context(self):
         plan = prep.memory_plan(30.88, 15.99, 131072, available_gib=27, commit_available_gib=28)
         self.assertEqual(plan["pinned_gib"], 3)
@@ -209,7 +218,18 @@ class PortableProfiles(unittest.TestCase):
         self.assertEqual(value(refreshed["args"], "--kv"), "q4_0")
         self.assertEqual(value(refreshed["args"], "--max-context"), "131072")
         self.assertEqual(value(refreshed["args"], "--prefill"), "64")
+        self.assertEqual(value(refreshed["args"], "--vram-reserve-mib"), "400")
         self.assertIn("--no-prefill-borrow", refreshed["args"])
+
+    def test_laptop_refresh_preserves_explicit_vram_reserve(self):
+        cfg = self.make_config({"args": {"--vram-reserve-mib": "448"}})
+        prep.detected_memory.return_value = {"ram_gib": 63.7, "available_gib": 58,
+                                            "commit_available_gib": 40, "windows_commit": True}
+        prep.setup.gpu_info.return_value = {"vram_gb": 6, "index": 0, "arch": "89"}
+        refreshed = prep.refreshed_config(cfg)
+        self.assertEqual(value(refreshed["args"], "--vram-reserve-mib"), "448")
+        self.assertEqual(refreshed["memory_policy"]["sample"]["gpu_commit_gib"], 6 - 448 / 1024)
+        self.assertEqual(value(prep.refreshed_config(refreshed)["args"], "--vram-reserve-mib"), "448")
 
     def test_removed_automatic_settings_remain_removed(self):
         cfg = self.make_config()

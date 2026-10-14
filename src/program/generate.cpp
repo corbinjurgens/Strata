@@ -724,7 +724,7 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
+                 "  --conversation-cache-min-free-mib N  --serve: available RAM/Windows commit floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -5613,6 +5613,25 @@ int main(int argc, char** argv) {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
+#if defined(_WIN32)
+        // Upstream #1607: commit can run out before physical RAM. This is a startup warning, not a global cap;
+        // conversation parking and session save/restore also check available commit at admission time.
+        {
+            MEMORYSTATUSEX cs{};
+            cs.dwLength = sizeof cs;
+            if (GlobalMemoryStatusEx(&cs)) {
+                const uint64_t planned = (o.prompt_cache > 0 ? (uint64_t) o.conversation_cache_mib << 20 : 0) +
+                                         (2ull << 30); // allowance for checkpoints and prompt staging
+                std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)\n",
+                             (double) cs.ullAvailPageFile / 1073741824.0, (double) cs.ullTotalPageFile / 1073741824.0);
+                if (!strata::core::conversation_memory_admit((uint64_t) cs.ullAvailPageFile, planned, 4ull << 30))
+                    std::fprintf(stderr, "strata serve: WARNING: the remaining Windows commit cannot cover %.1f GiB "
+                                         "for the conversation cache/checkpoint/staging allowance plus 4 GiB headroom; "
+                                         "reduce --resident-budget-gib or --conversation-cache-mib, or free memory\n",
+                                 (double) planned / 1073741824.0);
+            }
+        }
+#endif
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
