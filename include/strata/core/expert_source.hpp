@@ -26,6 +26,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -49,6 +50,8 @@ class RemoteExperts;
 struct LoadStats;
 
 namespace detail {
+
+struct FileExpertSourceTestAccess;
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
 inline constexpr uint64_t kNoCacheComplement = ~uint64_t{0};
@@ -166,6 +169,8 @@ public:
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
+    /// Copy a run of blobs; file sources can batch the reads. The default calls copy_blob for each destination.
+    virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
     /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;
@@ -536,6 +541,43 @@ public:
     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
+    /// Optional recent-file cache in the existing assembly buffers. Startup only; allocates lazily and returns
+    /// the retention target (rounded to largest-blob slots unless compact). Compact buffers use each layer's
+    /// exact size. Live/in-flight buffers obey the original lifetime rules and may exceed the target. Zero keeps
+    /// the original staging policy. Caller budgets the extra host RAM; this does not resize live buffers.
+    uint64_t set_file_cache_bytes(uint64_t bytes, bool compact = false);
+    struct FileCacheStats {
+        uint64_t target_bytes = 0, allocated_bytes = 0;
+        size_t buffers = 0;
+        bool compact = false;
+    };
+    /// Locked diagnostic snapshot: actual buffer capacities, including live overflow and oversized reused slots.
+    FileCacheStats file_cache_stats();
+    /// Opt-in fetch diagnostics. Enable/disable only when no readers are running; close() resets everything.
+    /// Nanoseconds are summed over threads, not elapsed request time. Caller, claim, fill and read totals are
+    /// inclusive of their subregions; do not add them together. Mapped-copy time includes unobservable page faults.
+    /// Claims count both prefetch reservations and later blob lookups; hits include busy_hits. Allocation time
+    /// includes metadata growth; allocation counts/bytes count successful blob allocations. Evictions count keys
+    /// removed on safe replacement/reclamation, not failed fills. fill_ns is the inclusive fill_many duration.
+    /// read_ns is direct-read time; buffered_read_ns is the retired-view fallback. Both contribute to OS
+    /// submit/wait/request/byte counters. Fallback writes into the caller's buffer and needs no assembly copy.
+    enum class FetchMetric : size_t {
+        caller_ns, claim_ns, lookup_ns, scan_ns, allocation_ns, eviction_ns, lock_wait_ns, fill_wait_ns,
+        fill_ns, publish_ns, read_ns, read_plan_ns, read_submit_ns, read_wait_ns, direct_copy_ns, mapped_copy_ns,
+        prefetch_hint_ns, claims, hits, busy_hits, misses, scan_slots, allocations, allocation_bytes, evictions,
+        read_batches, read_requests, submitted_bytes, completed_bytes, direct_copy_bytes, mapped_copy_bytes,
+        buffered_read_ns, buffered_read_bytes, count
+    };
+    struct FetchStats {
+        std::array<uint64_t, (size_t) FetchMetric::count> values{};
+        uint64_t get(FetchMetric metric) const { return values[(size_t) metric]; }
+    };
+    void set_fetch_profiling(bool enabled) { fetch_profiling_ = enabled; }
+    bool fetch_profiling() const { return fetch_profiling_; }
+    /// For request deltas, snapshot after prefill and after decode. Concurrent snapshots are approximate; no reset
+    /// is needed between requests. submitted/completed bytes are OS request bytes (alignment/gaps included), not
+    /// physical disk traffic; copy_bytes are useful expert bytes, counted after each successful copy.
+    FetchStats fetch_stats() const;
     /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and
     /// the kernel's asynchronous reads) instead of
     /// through the mapped files - the GGUF in place, or a pack's experts.bin - when the file cache could not keep them
@@ -548,6 +590,13 @@ public:
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);
     bool unbuffered() const { return !direct_.empty(); }
+    /// Windows GGUF/direct-I/O experiment. Startup only, after all initial copies/rechecks and before readers.
+    /// Validated offsets and bounded buffered positional fallback survive retirement; no stage buffers move.
+    /// Unsupported modes fail before changing mappings. An OS unmap failure is reported; the source remains
+    /// usable through direct/fallback reads and close() still owns any view the OS refused to release.
+    bool retire_direct_mappings(std::string& err);
+    bool direct_mappings_retired() const { return direct_mappings_retired_; }
+    uint64_t mapped_view_bytes() const;
     /// Every expert's bytes (n_layers x n_expert blobs).
     uint64_t expert_bytes() const;
     /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
@@ -566,6 +615,7 @@ public:
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
@@ -578,7 +628,7 @@ public:
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
-    /// #286: blobs an unbuffered read could not deliver, read through the mapping instead (0 when all went direct).
+    /// #286: blobs an unbuffered read could not deliver, retried through mapped or buffered positional fallback.
     int64_t direct_fallbacks() const { return direct_fallbacks_.load(std::memory_order_relaxed); }
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
@@ -586,6 +636,7 @@ public:
     int64_t reads() const override { return reads_; }
 
 private:
+    friend struct detail::FileExpertSourceTestAccess;
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
@@ -602,9 +653,21 @@ private:
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
     bool open_direct(std::string& why);
+    bool read_buffered(int64_t layer, int64_t expert, uint8_t* dst) const;
+    std::atomic<uint64_t>* fetch_counter(FetchMetric metric) const {
+        return fetch_profiling_ ? &fetch_counts_[(size_t) metric] : nullptr;
+    }
+    void fetch_add(FetchMetric metric, uint64_t value = 1) const {
+        if (fetch_profiling_) fetch_counts_[(size_t) metric].fetch_add(value, std::memory_order_relaxed);
+    }
+    bool fetch_profiling_ = false;
+    mutable std::array<std::atomic<uint64_t>, (size_t) FetchMetric::count> fetch_counts_{};
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    std::vector<void*> buffered_;             ///< Windows positional fallback, opened without reading payloads
+    bool direct_mappings_retired_ = false;
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
+    std::vector<uint64_t> role_offset_;       ///< validated absolute file offsets, independent of mapped addresses
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty(); }
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
@@ -629,6 +692,7 @@ private:
     static constexpr uint64_t kStageAge = 3;
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[]>> stage_buf_;
+    std::vector<uint64_t> stage_capacity_;
     std::vector<int64_t> stage_key_;
     std::vector<uint64_t> stage_epoch_, stage_used_;
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
@@ -640,6 +704,9 @@ private:
     mutable std::atomic<int64_t> direct_fallbacks_{0};
     std::unordered_map<int64_t, size_t> stage_of_;
     uint64_t stage_blob_ = 0;
+    size_t stage_cache_slots_ = 0;
+    uint64_t stage_cache_bytes_ = 0, stage_allocated_bytes_ = 0;
+    bool stage_compact_ = false;
     uint64_t stage_seq_ = 0;
     uint64_t epoch_ = 0;
     int64_t last_layer_ = -1;

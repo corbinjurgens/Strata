@@ -1,0 +1,17 @@
+{
+  "status": "failed",
+  "config": "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-fast-128k.json",
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-file-cache.exe",
+  "exe_sha256": "204674c9ba60a8b8f4e0e5096c5e3004de06cb1a7dcdbed634bbf440f2d983f2",
+  "timing_diagnostic": false,
+  "expected_max_context": 131072,
+  "rows": [],
+  "requests": [],
+  "error": "Memory/process monitor failed: RuntimeError",
+  "memory": {
+    "samples": 0,
+    "min_available_gib": null,
+    "max_pagefile_used_gib": 0.0,
+    "stop_reason": "Memory/process monitor failed: RuntimeError"
+  }
+}

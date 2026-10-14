@@ -1,0 +1,72 @@
+[
+  {
+    "test": "retrieval-129024",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "field-cedar-284\nmarble-finch-693\ncove-lantern-517"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 129023,
+      "completion_tokens": 27,
+      "total_tokens": 129050,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 129023,
+      "prompt_ms": 984488.8,
+      "prompt_per_token_ms": 7.63,
+      "prompt_per_second": 131.1,
+      "predicted_n": 27,
+      "predicted_ms": 5507.6,
+      "predicted_per_token_ms": 203.985,
+      "predicted_per_second": 4.9,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 990.279,
+    "first_token_s": null,
+    "expected": [
+      "field-cedar-284",
+      "marble-finch-693",
+      "cove-lantern-517"
+    ],
+    "local_prompt_tokens": 129023
+  },
+  {
+    "test": "reuse-129024",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "cove-lantern-517 391"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 129087,
+      "completion_tokens": 14,
+      "total_tokens": 129101,
+      "prompt_tokens_details": {
+        "cached_tokens": 129049
+      }
+    },
+    "timings": {
+      "cache_n": 129049,
+      "prompt_n": 38,
+      "prompt_ms": 5168.2,
+      "prompt_per_token_ms": 136.005,
+      "prompt_per_second": 7.4,
+      "predicted_n": 14,
+      "predicted_ms": 2006.4,
+      "predicted_per_token_ms": 143.314,
+      "predicted_per_second": 7.0,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 7.457,
+    "first_token_s": null
+  }
+]

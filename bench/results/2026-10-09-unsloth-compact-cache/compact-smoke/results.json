@@ -1,0 +1,544 @@
+{
+  "status": "failed",
+  "config": "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-compact-128k.json",
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-compact.exe",
+  "exe_sha256": "46f22bebde5517a880c7e3605095dc5df72f1c10219f53ea5197943ac3404082",
+  "timing_diagnostic": false,
+  "expected_max_context": 131072,
+  "smoke_only": true,
+  "rows": [],
+  "requests": [
+    {
+      "label": "warmup",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain what a database transaction does in a few sentences."
+        }
+      ],
+      "max_tokens": 64,
+      "response": {
+        "id": "chatcmpl-b2368373d4a14c05a09f3acb",
+        "object": "chat.completion",
+        "created": 1791569551,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "A database transaction groups a series of database operations into a single logical unit of work, ensuring that either all operations succeed together or none are applied at all. This mechanism guarantees data integrity and consistency by adhering to the ACID properties (Atomicity, Consistency, Isolation, and Durability), preventing partial updates that"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "total_tokens": 88,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 24,
+          "prompt_ms": 5795.4,
+          "prompt_per_token_ms": 241.475,
+          "prompt_per_second": 4.1,
+          "predicted_n": 64,
+          "predicted_ms": 7769.1,
+          "predicted_per_token_ms": 121.392,
+          "predicted_per_second": 8.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 13.582
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791569551.1899405,
+        "duration_s": 13.6,
+        "finish": "length",
+        "prompt_tokens": 24,
+        "reused": 0,
+        "output_tokens": 64,
+        "prompt_total": 24,
+        "prompt_read": 24,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 64,
+        "prompt_ms": 5795.4,
+        "decode_ms": 7769.1,
+        "decode_tok_s": 8.2,
+        "hit_rate": 0.691,
+        "pcie_share": 0.067,
+        "ram_blobs": 6285,
+        "file_blobs": 6103,
+        "file_mb": 3484.7,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "smoke",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with exactly cedar-spark-173 and nothing else."
+        }
+      ],
+      "max_tokens": 128,
+      "response": {
+        "choices": [
+          {
+            "message": {
+              "role": "assistant",
+              "content": "cedar-spark-173"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 26,
+          "completion_tokens": 9,
+          "total_tokens": 35,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 26,
+          "prompt_ms": 5735.1,
+          "prompt_per_token_ms": 220.581,
+          "prompt_per_second": 4.5,
+          "predicted_n": 9,
+          "predicted_ms": 2486.8,
+          "predicted_per_token_ms": 276.311,
+          "predicted_per_second": 3.6,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "first_token_s": 5.856806800002232,
+        "wall_seconds": 8.234
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791569564.7751865,
+        "duration_s": 8.2,
+        "finish": "stop",
+        "prompt_tokens": 26,
+        "reused": 0,
+        "output_tokens": 9,
+        "prompt_total": 26,
+        "prompt_read": 26,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 9,
+        "prompt_ms": 5735.1,
+        "decode_ms": 2486.8,
+        "decode_tok_s": 3.6,
+        "hit_rate": 0.317,
+        "pcie_share": 0.084,
+        "ram_blobs": 1008,
+        "file_blobs": 2248,
+        "file_mb": 1285.4,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "smoke",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 times 23? Reply with only the integer."
+        }
+      ],
+      "max_tokens": 128,
+      "response": {
+        "id": "chatcmpl-fc5d2ed1dd55431b91a949bc",
+        "object": "chat.completion",
+        "created": 1791569573,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "391"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 28,
+          "completion_tokens": 4,
+          "total_tokens": 32,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 28,
+          "prompt_ms": 5287.1,
+          "prompt_per_token_ms": 188.825,
+          "prompt_per_second": 5.3,
+          "predicted_n": 4,
+          "predicted_ms": 939.8,
+          "predicted_per_token_ms": 234.95,
+          "predicted_per_second": 4.3,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 6.229
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791569573.0485423,
+        "duration_s": 6.2,
+        "finish": "stop",
+        "prompt_tokens": 28,
+        "reused": 0,
+        "output_tokens": 4,
+        "prompt_total": 28,
+        "prompt_read": 28,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 4,
+        "prompt_ms": 5287.1,
+        "decode_ms": 939.8,
+        "decode_tok_s": 4.3,
+        "hit_rate": 0.319,
+        "pcie_share": 0.088,
+        "ram_blobs": 488,
+        "file_blobs": 969,
+        "file_mb": 484.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "smoke",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Remember the project code maple-ridge-826. Reply OK."
+        }
+      ],
+      "max_tokens": 128,
+      "response": {
+        "id": "chatcmpl-6eb733db80d948b29fc5c426",
+        "object": "chat.completion",
+        "created": 1791569579,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "OK"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 27,
+          "completion_tokens": 2,
+          "total_tokens": 29,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 27,
+          "prompt_ms": 4734.3,
+          "prompt_per_token_ms": 175.344,
+          "prompt_per_second": 5.7,
+          "predicted_n": 2,
+          "predicted_ms": 194.5,
+          "predicted_per_token_ms": 97.25,
+          "predicted_per_second": 10.3,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 4.931
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791569579.286922,
+        "duration_s": 4.9,
+        "finish": "stop",
+        "prompt_tokens": 27,
+        "reused": 0,
+        "output_tokens": 2,
+        "prompt_total": 27,
+        "prompt_read": 27,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 2,
+        "prompt_ms": 4734.3,
+        "decode_ms": 194.5,
+        "decode_tok_s": 10.3,
+        "hit_rate": 0.679,
+        "pcie_share": 0.059,
+        "ram_blobs": 138,
+        "file_blobs": 209,
+        "file_mb": 99.0,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "smoke",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Remember the project code maple-ridge-826. Reply OK."
+        },
+        {
+          "role": "assistant",
+          "content": "OK"
+        },
+        {
+          "role": "user",
+          "content": "What project code did I give you? Reply only with the code."
+        }
+      ],
+      "max_tokens": 128,
+      "response": {
+        "id": "chatcmpl-e9df5fb301914577a488f54b",
+        "object": "chat.completion",
+        "created": 1791569584,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "maple-ridge-826"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 56,
+          "completion_tokens": 9,
+          "total_tokens": 65,
+          "prompt_tokens_details": {
+            "cached_tokens": 28
+          }
+        },
+        "timings": {
+          "cache_n": 28,
+          "prompt_n": 28,
+          "prompt_ms": 2885.3,
+          "prompt_per_token_ms": 103.046,
+          "prompt_per_second": 9.7,
+          "predicted_n": 9,
+          "predicted_ms": 1979.2,
+          "predicted_per_token_ms": 219.911,
+          "predicted_per_second": 4.5,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 4.876
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791569584.2368994,
+        "duration_s": 4.9,
+        "finish": "stop",
+        "prompt_tokens": 56,
+        "reused": 28,
+        "output_tokens": 9,
+        "prompt_total": 56,
+        "prompt_read": 28,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 9,
+        "prompt_ms": 2885.3,
+        "decode_ms": 1979.2,
+        "decode_tok_s": 4.5,
+        "hit_rate": 0.479,
+        "pcie_share": 0.077,
+        "ram_blobs": 949,
+        "file_blobs": 1748,
+        "file_mb": 1071.4,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "smoke",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write only a Python function named unique_in_order(items) that removes duplicate integers, preserving their first occurrence. Return a list. No imports."
+        }
+      ],
+      "max_tokens": 256,
+      "response": {
+        "id": "chatcmpl-a56038d3c8894932868564a0",
+        "object": "chat.completion",
+        "created": 1791569589,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "```python\ndef unique_in_order(items):\n    seen = set()\n    result = []\n    for item in items:\n        if item not in seen:\n            seen.add(item)\n            result.append(item)\n    return result\n```"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 40,
+          "completion_tokens": 54,
+          "total_tokens": 94,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 40,
+          "prompt_ms": 5771.9,
+          "prompt_per_token_ms": 144.297,
+          "prompt_per_second": 6.9,
+          "predicted_n": 54,
+          "predicted_ms": 30428.6,
+          "predicted_per_token_ms": 563.493,
+          "predicted_per_second": 1.8,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 36.216
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791569589.1607983,
+        "duration_s": 36.2,
+        "finish": "stop",
+        "prompt_tokens": 40,
+        "reused": 0,
+        "output_tokens": 54,
+        "prompt_total": 40,
+        "prompt_read": 40,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 54,
+        "prompt_ms": 5771.9,
+        "decode_ms": 30428.6,
+        "decode_tok_s": 1.8,
+        "hit_rate": 0.521,
+        "pcie_share": 0.04,
+        "ram_blobs": 2689,
+        "file_blobs": 11515,
+        "file_mb": 6902.3,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "smoke",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use lookup_order to retrieve order 17."
+        }
+      ],
+      "max_tokens": 256,
+      "error": "[WinError 10054] An existing connection was forcibly closed by the remote host"
+    }
+  ],
+  "health": {
+    "status": "ok",
+    "max_context": 131072,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "images": false,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "engine": {
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "max_context": 131072,
+    "images": false,
+    "version": "0.1.40",
+    "context": 131072,
+    "kv": "int8",
+    "kv_resident": 32768,
+    "expert_slots": 4990,
+    "expert_cache_mib": 8922,
+    "expert_slots_primary": 4990,
+    "expert_cache_primary_mib": 8922,
+    "spec": 2,
+    "mtp_max": 0,
+    "lookup": 0,
+    "vram_free_mib": 1132,
+    "cvec": 0,
+    "arena_mib": 8190,
+    "pool_workers": 7,
+    "pcie_frac": "0.55",
+    "spec_min_p": "0.00",
+    "conversation_cache_mib": 0,
+    "conversation_cache_slots": 4,
+    "conversation_cache_min_free_mib": 2560,
+    "tail_role_token": -1,
+    "vram_elastic": 0,
+    "engine": "0.1.40"
+  },
+  "memory": {
+    "samples": 152,
+    "min_available_gib": 2.5714645385742188,
+    "max_pagefile_used_gib": 0.2833137512207031,
+    "pagefile_available": true,
+    "pagefile_unavailable_reason": null,
+    "stop_reason": null
+  },
+  "warmup": {
+    "id": "chatcmpl-b2368373d4a14c05a09f3acb",
+    "object": "chat.completion",
+    "created": 1791569551,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "A database transaction groups a series of database operations into a single logical unit of work, ensuring that either all operations succeed together or none are applied at all. This mechanism guarantees data integrity and consistency by adhering to the ACID properties (Atomicity, Consistency, Isolation, and Durability), preventing partial updates that"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 24,
+      "completion_tokens": 64,
+      "total_tokens": 88,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 24,
+      "prompt_ms": 5795.4,
+      "prompt_per_token_ms": 241.475,
+      "prompt_per_second": 4.1,
+      "predicted_n": 64,
+      "predicted_ms": 7769.1,
+      "predicted_per_token_ms": 121.392,
+      "predicted_per_second": 8.2,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 13.582
+  },
+  "summary": null,
+  "error": "[WinError 10054] An existing connection was forcibly closed by the remote host"
+}

@@ -724,7 +724,7 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
+                 "  --conversation-cache-min-free-mib N  --serve: available RAM/Windows commit floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -5539,6 +5539,65 @@ int main(int argc, char** argv) {
         }
 #endif
     }
+    // Opt-in cache for recent experts outside the profile-ranked RAM/GPU tiers. Set it after the RAM arena is
+    // allocated so its capacity is limited by remaining physical RAM and Windows commit, with 4 GiB headroom.
+    bool file_cache_compact = false;
+    if (const char* v = std::getenv("STRATA_FILE_CACHE_COMPACT"); v != nullptr && v[0] != '\0') {
+        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
+            std::fprintf(stderr, "strata generate: STRATA_FILE_CACHE_COMPACT must be 0 or 1\n");
+            return 2;
+        }
+        file_cache_compact = v[0] == '1';
+    }
+    if (const char* v = std::getenv("STRATA_FILE_CACHE_MIB"); v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long mib = std::strtoull(v, &end, 10);
+        if (v[0] == '-' || end == v || *end != '\0' || errno == ERANGE || mib > (UINT64_MAX >> 20)) {
+            std::fprintf(stderr, "strata generate: STRATA_FILE_CACHE_MIB must be a nonnegative integer\n");
+            return 2;
+        }
+        strata::core::detail::HostMemory mem;
+        uint64_t target = 0;
+        if (strata::core::detail::host_available_memory(mem))
+            target = strata::core::detail::clamp_resident_budget((uint64_t) mib << 20, mem.available, mem.commit, 4ull << 30);
+        const uint64_t actual = src.set_file_cache_bytes(target, file_cache_compact);
+        std::fprintf(stderr, "strata generate: recent file expert cache %.1f MiB (requested %llu MiB; %s buffers, lazy, 4 GiB headroom)\n",
+                     (double) actual / (1ull << 20), mib,
+                     file_cache_compact && actual > 0 ? "compact" : "largest-blob");
+    }
+    if (const char* v = std::getenv("STRATA_FILE_DIRECT_UNMAP"); v != nullptr && v[0] != '\0') {
+        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
+            std::fprintf(stderr, "strata generate: STRATA_FILE_DIRECT_UNMAP must be 0 or 1\n");
+            return 2;
+        }
+        if (v[0] == '1') {
+            if (o.ple_io != "direct") {
+                std::fprintf(stderr, "strata generate: STRATA_FILE_DIRECT_UNMAP requires --ple-io direct; "
+                             "mapped PLE keeps a GGUF view alive\n");
+                return 2;
+            }
+            const uint64_t before = src.mapped_view_bytes();
+            if (!src.retire_direct_mappings(err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "strata generate: experimental direct GGUF mapping retirement: "
+                         "%llu -> %llu mapped bytes; buffered positional fallback ready (no payload read)\n",
+                         (unsigned long long) before, (unsigned long long) src.mapped_view_bytes());
+        }
+    }
+    if (const char* v = std::getenv("STRATA_FETCH_PROFILE"); v != nullptr && v[0] != '\0') {
+        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
+            std::fprintf(stderr, "strata generate: STRATA_FETCH_PROFILE must be 0 or 1\n");
+            return 2;
+        }
+        src.set_fetch_profiling(v[0] == '1');
+        if (src.fetch_profiling())
+            std::fprintf(stderr, "strata generate: fetch profiling enabled; serve decode deltas sum thread service time; "
+                         "caller/claim/fill/publish/read totals include subregions (do not add); mapped copies include "
+                         "page faults; OS read bytes include alignment/gaps, not physical disk traffic\n");
+    }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
@@ -5554,6 +5613,25 @@ int main(int argc, char** argv) {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
+#if defined(_WIN32)
+        // Upstream #1607: commit can run out before physical RAM. This is a startup warning, not a global cap;
+        // conversation parking and session save/restore also check available commit at admission time.
+        {
+            MEMORYSTATUSEX cs{};
+            cs.dwLength = sizeof cs;
+            if (GlobalMemoryStatusEx(&cs)) {
+                const uint64_t planned = (o.prompt_cache > 0 ? (uint64_t) o.conversation_cache_mib << 20 : 0) +
+                                         (2ull << 30); // allowance for checkpoints and prompt staging
+                std::fprintf(stderr, "strata serve: Windows commit: %.1f GiB left of a %.1f GiB limit (RAM + page file)\n",
+                             (double) cs.ullAvailPageFile / 1073741824.0, (double) cs.ullTotalPageFile / 1073741824.0);
+                if (!strata::core::conversation_memory_admit((uint64_t) cs.ullAvailPageFile, planned, 4ull << 30))
+                    std::fprintf(stderr, "strata serve: WARNING: the remaining Windows commit cannot cover %.1f GiB "
+                                         "for the conversation cache/checkpoint/staging allowance plus 4 GiB headroom; "
+                                         "reduce --resident-budget-gib or --conversation-cache-mib, or free memory\n",
+                                 (double) planned / 1073741824.0);
+            }
+        }
+#endif
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -9047,6 +9125,7 @@ int main(int argc, char** argv) {
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
+            const auto fetch0 = src.fetch_profiling() ? src.fetch_stats() : strata::core::FileExpertSource::FetchStats{};
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
             if (cancelled) finish = "cancel";
@@ -9785,6 +9864,27 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (src.fetch_profiling()) {
+                using FM = strata::core::FileExpertSource::FetchMetric;
+                static constexpr const char* names[] = {
+                    "caller_ns", "claim_ns", "lookup_ns", "scan_ns", "allocation_ns", "eviction_ns", "lock_wait_ns",
+                    "fill_wait_ns", "fill_ns", "publish_ns", "read_ns", "read_plan_ns", "read_submit_ns", "read_wait_ns",
+                    "direct_copy_ns", "mapped_copy_ns", "prefetch_hint_ns", "claims", "hits", "busy_hits", "misses",
+                    "scan_slots", "allocations", "allocation_bytes", "evictions", "read_batches", "read_requests",
+                    "submitted_bytes", "completed_bytes", "direct_copy_bytes", "mapped_copy_bytes",
+                    "buffered_read_ns", "buffered_read_bytes"
+                };
+                static_assert(sizeof(names) / sizeof(names[0]) == (size_t) FM::count);
+                const auto fetch1 = src.fetch_stats();
+                std::fprintf(stderr, "strata fetch profile decode: tokens=%lld decode_wall_ms=%.3f summed_thread_deltas=1",
+                             (long long) produced_n, decode_ms);
+                for (size_t i = 0; i < fetch1.values.size(); ++i)
+                    std::fprintf(stderr, " %s=%llu", names[i], (unsigned long long) (fetch1.values[i] - fetch0.values[i]));
+                const auto cache = src.file_cache_stats();
+                std::fprintf(stderr, " cache_target_bytes=%llu cache_allocated_bytes=%llu cache_buffers=%zu\n",
+                             (unsigned long long) cache.target_bytes, (unsigned long long) cache.allocated_bytes,
+                             cache.buffers);
+            }
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());

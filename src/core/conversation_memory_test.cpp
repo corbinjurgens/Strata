@@ -49,18 +49,25 @@ int main() {
                                    std::numeric_limits<uint64_t>::max(), 0), "maximal exact bound");
     check(!conversation_memory_admit(std::numeric_limits<uint64_t>::max(),
                                     std::numeric_limits<uint64_t>::max(), 1), "maximal sum overflow rejected");
+    // A snapshot may fit in free RAM but leave too little Windows commit for the floor.
+    // Use deterministic available-memory samples; do not create pressure on the test machine.
+    constexpr uint64_t gib = 1ULL << 30;
+    check(conversation_memory_admit(16 * gib, 2 * gib, 4 * gib), "RAM alone would admit the snapshot");
+    check(!conversation_memory_admit(5 * gib, 2 * gib, 4 * gib), "commit-limited sample rejects the snapshot");
+    check(conversation_memory_admit(6 * gib, 2 * gib, 4 * gib), "commit-limited exact fit preserves the floor");
+    check(!conversation_memory_admit(0, 0, 4 * gib), "exhausted commit rejects a post-capture floor check");
     // Test the real provider without assuming any particular amount of free RAM.
     const auto available = conversation_available_memory();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
 #if defined(_WIN32)
     // Unknown must fail closed in production, but must not let a broken Windows provider pass this test.
-    // Compare with total physical memory, not a second available reading: other processes can allocate
+    // Compare with total limits, not a second available reading: other processes can allocate
     // between calls. No pressure allocation or fixed free-memory assumption is needed.
-    MEMORYSTATUSEX physical{};
-    physical.dwLength = sizeof physical;
-    check(GlobalMemoryStatusEx(&physical) != 0, "Windows physical-memory API is available");
-    check(available.has_value() && *available <= physical.ullTotalPhys,
-          "Windows provider returns a known, physically bounded sample");
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    check(GlobalMemoryStatusEx(&status) != 0, "Windows memory-status API is available");
+    check(available.has_value() && *available <= status.ullTotalPhys && *available <= status.ullTotalPageFile,
+          "Windows provider returns a known sample bounded by physical memory and commit");
 #endif
     std::printf("conversation_memory_test: %d checks passed\n", checks);
 }

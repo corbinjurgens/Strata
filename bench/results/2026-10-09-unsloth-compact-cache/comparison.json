@@ -1,0 +1,35 @@
+{
+  "baseline": "baseline-normal-4",
+  "baseline_summary": {
+    "completion_tokens": 960,
+    "predicted_ms": 89844.9,
+    "tokens_per_second": 10.685080622272384
+  },
+  "compact_runs": [
+    {
+      "run": "compact-normal",
+      "status_at_collection": "failed",
+      "summary": {
+        "completion_tokens": 960,
+        "predicted_ms": 81889.4,
+        "tokens_per_second": 11.723129000823063
+      },
+      "all_six_choices_equal_to_baseline": true,
+      "logical_decode_file_mb": 39606.0,
+      "speed_change_percent": 9.714932579796653
+    },
+    {
+      "run": "compact-normal-2",
+      "status_at_collection": "running",
+      "summary": {
+        "completion_tokens": 960,
+        "predicted_ms": 81232.3,
+        "tokens_per_second": 11.817959112323546
+      },
+      "all_six_choices_equal_to_baseline": true,
+      "logical_decode_file_mb": 39606.0,
+      "speed_change_percent": 10.60243277612476
+    }
+  ],
+  "scope": "Six short prompt cases per run, Codex open, normal execution, configured context 131072. Baseline first, compact twice; not alternating repeated pairs."
+}

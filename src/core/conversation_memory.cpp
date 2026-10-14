@@ -1,5 +1,6 @@
 #include "strata/core/conversation_memory.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <fstream>
 #include <limits>
@@ -37,7 +38,8 @@ std::optional<uint64_t> conversation_available_memory() {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof status;
-    if (GlobalMemoryStatusEx(&status)) return status.ullAvailPhys;
+    // An allocation can exhaust Windows commit even while physical RAM is available.
+    if (GlobalMemoryStatusEx(&status)) return std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile);
     return {};
 #elif defined(__linux__)
     std::ifstream meminfo("/proc/meminfo");

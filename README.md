@@ -2,6 +2,14 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+**Custom branch:** `codex/unsloth-low-vram` combines experimental Unsloth `UD-Q2_K_XL` support, reduced GPU
+allocation overhead and the desktop's compact recent-expert cache. The [hardware-aware preparation helper](docs/UNSLOTH_Q2.md#hardware-aware-preparation-for-both-pcs)
+selects memory settings for both the 6 GB GPU / 64 GB RAM laptop and the 16 GB GPU / 32 GB RAM desktop,
+while preserving manual overrides. Build this branch's engine with the helper or setup's **`--build`** option;
+upstream release binaries lack these changes. This remains based on `v0.1.40.1` (`82f46a8`) with selected
+upstream Windows fixes. [Measured results and limits](docs/UNSLOTH_Q2.md) distinguish the older working
+profiles from the combined policy, which still needs full-model validation on both PCs.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 

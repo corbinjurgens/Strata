@@ -1,0 +1,140 @@
+{
+  "head": "6794d901f81717ed9c5b5513c83c0eba1187f068",
+  "meaning": "Current uncommitted source and local artifacts; private config contents are excluded.",
+  "source_and_profile": [
+    {
+      "path": "CHANGELOG.md",
+      "bytes": 1876,
+      "sha256": "669a4be1da3d409a152c4f7984f20aad798ede1a46814c10edb1d284c470b13a"
+    },
+    {
+      "path": "bench/results/2026-10-09-unsloth-file-cache/benchmark.py",
+      "bytes": 7747,
+      "sha256": "1b2fde95544a24b43a0263472ad627736794cb4bf88fa52f92fa747c9d328fe0"
+    },
+    {
+      "path": "bench/results/2026-10-09-unsloth-file-cache/validation.py",
+      "bytes": 10933,
+      "sha256": "ef7c7d653602c84cc72adec9250988faa0557c097c529b9e1b97ee0cd48c3f55"
+    },
+    {
+      "path": "data/expert-profile-unsloth-desktop-20261010.bin",
+      "bytes": 196632,
+      "sha256": "3c6b35a8f063bf439f5864582e1eb7c07a9c019930a7bb365ac2bea94e217027"
+    },
+    {
+      "path": "docs/FILE_EXPERT_CACHE.md",
+      "bytes": 12661,
+      "sha256": "350d5628c27b882cc1d22809ae432f12884d932fd2a506eaa695bf7c50683fd0"
+    },
+    {
+      "path": "docs/UNSLOTH_Q2.md",
+      "bytes": 37191,
+      "sha256": "337add880a52935634c3d464b8d4f606540dd8ca83b34dc08cc383c667da3761"
+    },
+    {
+      "path": "include/strata/core/expert_source.hpp",
+      "bytes": 56193,
+      "sha256": "1e9fe03f61fce833bffe89c2511b61c193025d7cdd187a360b07850c7e2b5611"
+    },
+    {
+      "path": "setup.py",
+      "bytes": 302466,
+      "sha256": "cebe18e65c5b1d9a3fca40538d9d37f3c822bbd4866aca519ecc1b14c190abdb"
+    },
+    {
+      "path": "src/core/expert_source.cpp",
+      "bytes": 186964,
+      "sha256": "c7eb8ac167e3b86e514113453dceac2862b818795532b8cca212983fa5a8c049"
+    },
+    {
+      "path": "src/program/generate.cpp",
+      "bytes": 741400,
+      "sha256": "d7f9d443b73c85229ed6281b7afffac7c509ecb7184588c6407fdae2b88ca73c"
+    },
+    {
+      "path": "tests/core/file_expert_source_test.cpp",
+      "bytes": 58492,
+      "sha256": "67d57446fae222114c94e1e845fd9d28bbe826e2ecbd1a5e09da7ce38e46633a"
+    },
+    {
+      "path": "tools/benchmark_compact_cache.py",
+      "bytes": 38755,
+      "sha256": "870d9d191e807a8dcddac8d2a1ffe9bdf33a2aa2d1371badd5f0be73794077c6"
+    },
+    {
+      "path": "tools/benchmark_desktop_profiles.py",
+      "bytes": 3986,
+      "sha256": "f9ed85284bba700b00a0787d5ebbb7a46a6d203dd9ef808aade1a2bfb0d36d7f"
+    },
+    {
+      "path": "tools/diagnose_desktop_stalls.py",
+      "bytes": 8342,
+      "sha256": "24bde8d681607142f256e90022b38faaf3cc72de010508763e3eaf24e7a0d7e1"
+    },
+    {
+      "path": "tools/prepare_unsloth_q2.py",
+      "bytes": 33512,
+      "sha256": "99f99c89b9691db7a05791c468fd565b9533ed5d32fd79c7cbd0e416188cee15"
+    },
+    {
+      "path": "tools/test_benchmark_compact_cache.py",
+      "bytes": 48960,
+      "sha256": "f1884eff3cee3d87dfee7bb4cdcbbdd0e2e1c9ff0dc0a6ec9f9071828a5b3d12"
+    },
+    {
+      "path": "tools/test_diagnose_desktop_stalls.py",
+      "bytes": 4428,
+      "sha256": "4ed155cfab16efd19eca40573f9c02fa75c4b986d98e5aa0bc5828ddfd318359"
+    },
+    {
+      "path": "tools/test_prepare_unsloth_q2.py",
+      "bytes": 34184,
+      "sha256": "166d6353a4b4cbc4d9be1ed3768e89eab57d104466d67b7d9a7bef0d96d60730"
+    },
+    {
+      "path": "tools/test_setup_config.py",
+      "bytes": 15899,
+      "sha256": "ebdfbb693e1b2fbdc47065001f394042c1951e7b735c6a32c300c2ad60ffa58c"
+    }
+  ],
+  "generated_local": [
+    {
+      "path": "strata-unsloth-desktop-trained-128k.json",
+      "bytes": 3528,
+      "sha256": "efc2d1fb128ef2a322e93aa05adfa4b4943b5ff6532edff58fd7f562b7a71c09",
+      "ignored": true
+    },
+    {
+      "path": "strata-unsloth-portable-128k.json",
+      "bytes": 3403,
+      "sha256": "46b0392e37d1f0197ea109714a10aee7f606668eb2b82eed8f71ec8d989c164e",
+      "ignored": true
+    },
+    {
+      "path": "run-unsloth-desktop-trained-128k.bat",
+      "bytes": 344,
+      "sha256": "21882beece489b9cda650573830c8ca035de99fbbc997a126594679d4b9ea78b",
+      "ignored": true
+    },
+    {
+      "path": "run-unsloth-portable-128k.bat",
+      "bytes": 330,
+      "sha256": "42533e4bcbeeb2a0e55d17c4c61a39feaa9732e3c6e1a4ce31e04e1f7a0caafa",
+      "ignored": true
+    },
+    {
+      "path": "engine/strata-unsloth-portable.exe",
+      "bytes": 46220288,
+      "sha256": "fc0ae8c0e97ad501e6c1a994ee51f571d486e1b9e4fae73da9e84a82f7f17b4b",
+      "ignored": true
+    },
+    {
+      "path": "engine/BUILD-unsloth-portable.json",
+      "bytes": 9249,
+      "sha256": "2521535ff83f4bd13b07c242d7e098d0956ab6a94ba49a7f13332bef889bc9bf",
+      "ignored": true
+    }
+  ],
+  "laptop_runtime_tested": false
+}

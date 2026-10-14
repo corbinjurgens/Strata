@@ -1,0 +1,17 @@
+{
+  "source": "local",
+  "version": "0.1.40",
+  "commit": "6794d901f81717ed9c5b5513c83c0eba1187f068",
+  "src": "7bbba6fb17309d70",
+  "archs": [
+    89
+  ],
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-fetch-profile.exe",
+  "sha256": "d215ac687b55bff03896463eaa27f32f7ff94acf64b7dbc9576535e0700828dd",
+  "experimental": true,
+  "source_sha256": {
+    "src/core/expert_source.cpp": "1887b00ef3567e21fb5181a28059ab3181c6d89ee6a07054fbfe4591d4272d62",
+    "include/strata/core/expert_source.hpp": "863cdc3c04edc5933a6d85c1fbd8551108bfe064a1fa8ca5bc95da0e1cfc3244",
+    "src/program/generate.cpp": "cf7b008d8ccb5b8b62a7a6d347778c9bd257a870820ff934770b6eaf47c17697"
+  }
+}

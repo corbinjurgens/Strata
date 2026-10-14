@@ -1,0 +1,72 @@
+{
+  "status": "complete",
+  "binding": "0.0.0.0:8080",
+  "lan_ip": "192.168.11.49",
+  "key_matches_existing_desktop": true,
+  "started_unix": 1791609332.046757,
+  "checks": [
+    {
+      "host": "127.0.0.1",
+      "credential": "saved",
+      "status": 200,
+      "expected": 200,
+      "passed": true
+    },
+    {
+      "host": "127.0.0.1",
+      "credential": "missing",
+      "status": 401,
+      "expected": 401,
+      "passed": true
+    },
+    {
+      "host": "127.0.0.1",
+      "credential": "wrong",
+      "status": 401,
+      "expected": 401,
+      "passed": true
+    },
+    {
+      "host": "192.168.11.49",
+      "credential": "saved",
+      "status": 200,
+      "expected": 200,
+      "passed": true
+    },
+    {
+      "host": "192.168.11.49",
+      "credential": "missing",
+      "status": 401,
+      "expected": 401,
+      "passed": true
+    },
+    {
+      "host": "192.168.11.49",
+      "credential": "wrong",
+      "status": 401,
+      "expected": 401,
+      "passed": true
+    }
+  ],
+  "scope": "Actual BAT on this PC; LAN-IP requests originate on this PC. Remote-device firewall path untested.",
+  "memory": {
+    "samples": 76,
+    "min_available_gib": 4.954242706298828,
+    "max_pagefile_used_gib": 0.24624252319335938,
+    "pagefile_available": true,
+    "pagefile_unavailable_reason": null,
+    "stop_reason": null
+  },
+  "context": 131072,
+  "owned_all_interface_listener": true,
+  "arithmetic": {
+    "answer": "391",
+    "expected": "391",
+    "passed": true
+  },
+  "saved_network_auth_fit_no_browser_preserved": true,
+  "rollback_config_unchanged": true,
+  "owned_process_cleanup_completed": true,
+  "config_sha256": "efc2d1fb128ef2a322e93aa05adfa4b4943b5ff6532edff58fd7f562b7a71c09",
+  "finished_unix": 1791609409.5929282
+}

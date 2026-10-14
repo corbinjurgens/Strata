@@ -1,0 +1,3448 @@
+{
+  "status": "failed",
+  "config": "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-desktop-128k.json",
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-compact.exe",
+  "exe_sha256": "46f22bebde5517a880c7e3605095dc5df72f1c10219f53ea5197943ac3404082",
+  "timing_diagnostic": false,
+  "decode_timing": false,
+  "fetch_timing": false,
+  "expected_max_context": 131072,
+  "smoke_only": false,
+  "validation_only": false,
+  "rows": [
+    {
+      "round": 0,
+      "case": 0,
+      "prompt": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation.",
+      "response": {
+        "id": "chatcmpl-33460de953ae49a3af6b33d3",
+        "object": "chat.completion",
+        "created": 1791603410,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Hash Tables: Collisions, Resizing, and Lookup \u2014 A Detailed Technical Explanation\n\n## 1. Core Concept\n\nA hash table is a data structure that maps **keys** to **values** using a **hash function**. The goal is **O(1) average-case** time complexity for insertion, deletion, and lookup.\n\n```\nKey \u2192 Hash Function \u2192 Index \u2192 Bucket (Array Slot) \u2192 Value(s)\n```\n\nThe underlying structure is typically a **dynamic array** (called the *bucket array* or *table*) of size `m`, where each slot is a *bucket*.\n\n---\n\n## 2. The Hash Function\n\nA good hash function must:\n- **Deterministically** map a key to an integer in `[0, m-1"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 43,
+          "completion_tokens": 160,
+          "total_tokens": 203,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 43,
+          "prompt_ms": 2206.7,
+          "prompt_per_token_ms": 51.319,
+          "prompt_per_second": 19.5,
+          "predicted_n": 160,
+          "predicted_ms": 8377.6,
+          "predicted_per_token_ms": 52.36,
+          "predicted_per_second": 19.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 10.586
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603410.5696356,
+        "duration_s": 10.6,
+        "finish": "length",
+        "prompt_tokens": 43,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 43,
+        "prompt_read": 43,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 2206.7,
+        "decode_ms": 8377.6,
+        "decode_tok_s": 19.1,
+        "hit_rate": 0.816,
+        "pcie_share": 0.059,
+        "ram_blobs": 13995,
+        "file_blobs": 6569,
+        "file_mb": 3211.9,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 0,
+      "case": 1,
+      "prompt": "Explain how to design reliable retries for a background job queue, including idempotency and exponential backoff.",
+      "response": {
+        "id": "chatcmpl-76d2cabdc6824747b7591127",
+        "object": "chat.completion",
+        "created": 1791603421,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Designing a reliable background job queue requires balancing **reliability** (ensuring jobs eventually complete) with **efficiency** (avoiding wasted resources and system overload). The two pillars of this design are **Idempotency** and **Exponential Backoff**.\n\nHere is a comprehensive guide to designing such a system.\n\n---\n\n### 1. Core Concept: Why Retries Are Needed\nBackground jobs fail for transient reasons:\n- Network timeouts\n- Database deadlocks\n- Third-party API rate limits\n- Temporary service outages\n\nWithout retries, these transient failures become permanent errors. With naive retries, you risk overwhelming the system or processing the same job multiple times.\n\n---\n\n### 2. Idempotency: The Safety Net\n**Idempot"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 46,
+          "completion_tokens": 160,
+          "total_tokens": 206,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 46,
+          "prompt_ms": 4262.7,
+          "prompt_per_token_ms": 92.667,
+          "prompt_per_second": 10.8,
+          "predicted_n": 160,
+          "predicted_ms": 7225.6,
+          "predicted_per_token_ms": 45.16,
+          "predicted_per_second": 22.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 11.49
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603421.179301,
+        "duration_s": 11.5,
+        "finish": "length",
+        "prompt_tokens": 46,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 46,
+        "prompt_read": 46,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 4262.7,
+        "decode_ms": 7225.6,
+        "decode_tok_s": 22.1,
+        "hit_rate": 0.828,
+        "pcie_share": 0.056,
+        "ram_blobs": 13131,
+        "file_blobs": 6222,
+        "file_mb": 2614.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 0,
+      "case": 2,
+      "prompt": "Explain how database composite indexes affect filtering, sorting, and write performance, with concrete examples.",
+      "response": {
+        "id": "chatcmpl-29f176f3f2be481ca1ca98da",
+        "object": "chat.completion",
+        "created": 1791603432,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Composite Indexes: Filtering, Sorting, and Write Performance\n\n## What Is a Composite Index?\n\nA composite index (also called a multi-column index) is an index on **multiple columns** of a table. The order of columns matters critically.\n\n```sql\nCREATE INDEX idx_name ON employees (department_id, hire_date, salary);\n```\n\nThis creates a B-tree index where entries are sorted first by `department_id`, then by `hire_date` within each department, then by `salary` within each `(department_id, hire_date)` pair.\n\n---\n\n## 1. Filtering (WHERE Clause)\n\n### The Leftmost Prefix Rule\n\nA composite index can be used for filtering **only if** the query filters on a **leftmost prefix** of the indexed"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 160,
+          "total_tokens": 202,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 42,
+          "prompt_ms": 3101.8,
+          "prompt_per_token_ms": 73.852,
+          "prompt_per_second": 13.5,
+          "predicted_n": 160,
+          "predicted_ms": 9322.7,
+          "predicted_per_token_ms": 58.267,
+          "predicted_per_second": 17.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 12.45
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603432.7222786,
+        "duration_s": 12.4,
+        "finish": "length",
+        "prompt_tokens": 42,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 42,
+        "prompt_read": 42,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 3101.8,
+        "decode_ms": 9322.7,
+        "decode_tok_s": 17.2,
+        "hit_rate": 0.812,
+        "pcie_share": 0.057,
+        "ram_blobs": 13212,
+        "file_blobs": 7687,
+        "file_mb": 3913.0,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 1,
+      "case": 0,
+      "prompt": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation.",
+      "response": {
+        "id": "chatcmpl-04a8ef2c7bb2409488ebbfa2",
+        "object": "chat.completion",
+        "created": 1791603445,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Hash Tables: Collisions, Resizing, and Lookup \u2014 A Detailed Technical Explanation\n\n## 1. Core Concept\n\nA hash table is a data structure that maps **keys** to **values** using a **hash function**. The goal is **O(1) average-case** time complexity for insertion, deletion, and lookup.\n\n```\nKey \u2192 Hash Function \u2192 Index \u2192 Bucket (Array Slot) \u2192 Value(s)\n```\n\nThe underlying structure is typically a **dynamic array** (called the *bucket array* or *table*) of size `m`, where each slot is a *bucket*.\n\n---\n\n## 2. The Hash Function\n\nA good hash function must:\n- **Deterministically** map a key to an integer in `[0, m-1"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 43,
+          "completion_tokens": 160,
+          "total_tokens": 203,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 43,
+          "prompt_ms": 4135.0,
+          "prompt_per_token_ms": 96.163,
+          "prompt_per_second": 10.4,
+          "predicted_n": 160,
+          "predicted_ms": 7340.6,
+          "predicted_per_token_ms": 45.879,
+          "predicted_per_second": 21.8,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 11.493
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603445.2219338,
+        "duration_s": 11.5,
+        "finish": "length",
+        "prompt_tokens": 43,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 43,
+        "prompt_read": 43,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 4135.0,
+        "decode_ms": 7340.6,
+        "decode_tok_s": 21.8,
+        "hit_rate": 0.842,
+        "pcie_share": 0.047,
+        "ram_blobs": 11299,
+        "file_blobs": 6342,
+        "file_mb": 3030.3,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 1,
+      "case": 1,
+      "prompt": "Explain how to design reliable retries for a background job queue, including idempotency and exponential backoff.",
+      "response": {
+        "id": "chatcmpl-eb6ebfbb99d7496186ccd104",
+        "object": "chat.completion",
+        "created": 1791603456,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Designing a reliable background job queue requires balancing **reliability** (ensuring jobs eventually complete) with **efficiency** (avoiding wasted resources on permanently failing jobs). The two pillars of this design are **Idempotency** and **Exponential Backoff**.\n\nHere is a comprehensive guide to designing such a system.\n\n---\n\n### 1. Core Concept: Why Retries Are Needed\nBackground jobs fail for transient reasons:\n- Network timeouts\n- Database deadlocks\n- Third-party API rate limits\n- Temporary service outages\n\nHowever, some failures are permanent:\n- Invalid data\n- Missing dependencies\n- Code bugs\n\nA retry strategy must distinguish between these two.\n\n---\n\n### 2. Idempotency: The Foundation of Safe Ret"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 46,
+          "completion_tokens": 160,
+          "total_tokens": 206,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 46,
+          "prompt_ms": 3911.2,
+          "prompt_per_token_ms": 85.026,
+          "prompt_per_second": 11.8,
+          "predicted_n": 160,
+          "predicted_ms": 6620.8,
+          "predicted_per_token_ms": 41.38,
+          "predicted_per_second": 24.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 10.549
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603456.775963,
+        "duration_s": 10.5,
+        "finish": "length",
+        "prompt_tokens": 46,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 46,
+        "prompt_read": 46,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 3911.2,
+        "decode_ms": 6620.8,
+        "decode_tok_s": 24.2,
+        "hit_rate": 0.83,
+        "pcie_share": 0.054,
+        "ram_blobs": 12433,
+        "file_blobs": 6609,
+        "file_mb": 2483.1,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 1,
+      "case": 2,
+      "prompt": "Explain how database composite indexes affect filtering, sorting, and write performance, with concrete examples.",
+      "response": {
+        "id": "chatcmpl-42ef9e6a19704927873613b2",
+        "object": "chat.completion",
+        "created": 1791603467,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Composite Indexes: Filtering, Sorting, and Write Performance\n\n## What Is a Composite Index?\n\nA composite index (also called a multi-column index) is a single index that contains **multiple columns** in a defined order. Think of it as a sorted list where rows are ordered first by column A, then by column B within each group of A, then by column C within each group of B, and so on.\n\n```sql\nCREATE INDEX idx_name ON employees (department, hire_date, salary);\n```\n\nThis creates a B-tree structure sorted by `(department, hire_date, salary)`.\n\n---\n\n## 1. Filtering (WHERE Clause)\n\n### The Leftmost Prefix Rule\n\nA composite index can be used for filtering **only if** the query filters"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 160,
+          "total_tokens": 202,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 42,
+          "prompt_ms": 2999.6,
+          "prompt_per_token_ms": 71.419,
+          "prompt_per_second": 14.0,
+          "predicted_n": 160,
+          "predicted_ms": 9273.3,
+          "predicted_per_token_ms": 57.958,
+          "predicted_per_second": 17.3,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 12.297
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603467.3544104,
+        "duration_s": 12.3,
+        "finish": "length",
+        "prompt_tokens": 42,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 42,
+        "prompt_read": 42,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 2999.6,
+        "decode_ms": 9273.3,
+        "decode_tok_s": 17.3,
+        "hit_rate": 0.81,
+        "pcie_share": 0.058,
+        "ram_blobs": 13407,
+        "file_blobs": 7778,
+        "file_mb": 3998.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    }
+  ],
+  "requests": [
+    {
+      "label": "warmup",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain what a database transaction does in a few sentences."
+        }
+      ],
+      "max_tokens": 64,
+      "started_unix": 1791603402.102829,
+      "response": {
+        "id": "chatcmpl-02ef0133153e44619a713c3d",
+        "object": "chat.completion",
+        "created": 1791603402,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "A database transaction groups a series of database operations into a single logical unit of work that is treated as a whole. It ensures data integrity by guaranteeing that either all operations within the transaction are completed successfully (committed) or, if any part fails, none of the changes are applied (rolled back). This mechanism maintains consistency"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "total_tokens": 88,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 24,
+          "prompt_ms": 4152.4,
+          "prompt_per_token_ms": 173.017,
+          "prompt_per_second": 5.8,
+          "predicted_n": 64,
+          "predicted_ms": 4258.6,
+          "predicted_per_token_ms": 66.541,
+          "predicted_per_second": 15.0,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 8.413
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603402.105718,
+        "duration_s": 8.4,
+        "finish": "length",
+        "prompt_tokens": 24,
+        "reused": 0,
+        "output_tokens": 64,
+        "prompt_total": 24,
+        "prompt_read": 24,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 64,
+        "prompt_ms": 4152.4,
+        "decode_ms": 4258.6,
+        "decode_tok_s": 15.0,
+        "hit_rate": 0.757,
+        "pcie_share": 0.081,
+        "ram_blobs": 7490,
+        "file_blobs": 3210,
+        "file_mb": 1724.2,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603410.524881
+    },
+    {
+      "label": "round-0-case-0",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 0."
+        },
+        {
+          "role": "user",
+          "content": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603410.5419436,
+      "response": {
+        "id": "chatcmpl-33460de953ae49a3af6b33d3",
+        "object": "chat.completion",
+        "created": 1791603410,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Hash Tables: Collisions, Resizing, and Lookup \u2014 A Detailed Technical Explanation\n\n## 1. Core Concept\n\nA hash table is a data structure that maps **keys** to **values** using a **hash function**. The goal is **O(1) average-case** time complexity for insertion, deletion, and lookup.\n\n```\nKey \u2192 Hash Function \u2192 Index \u2192 Bucket (Array Slot) \u2192 Value(s)\n```\n\nThe underlying structure is typically a **dynamic array** (called the *bucket array* or *table*) of size `m`, where each slot is a *bucket*.\n\n---\n\n## 2. The Hash Function\n\nA good hash function must:\n- **Deterministically** map a key to an integer in `[0, m-1"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 43,
+          "completion_tokens": 160,
+          "total_tokens": 203,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 43,
+          "prompt_ms": 2206.7,
+          "prompt_per_token_ms": 51.319,
+          "prompt_per_second": 19.5,
+          "predicted_n": 160,
+          "predicted_ms": 8377.6,
+          "predicted_per_token_ms": 52.36,
+          "predicted_per_second": 19.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 10.586
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603410.5696356,
+        "duration_s": 10.6,
+        "finish": "length",
+        "prompt_tokens": 43,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 43,
+        "prompt_read": 43,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 2206.7,
+        "decode_ms": 8377.6,
+        "decode_tok_s": 19.1,
+        "hit_rate": 0.816,
+        "pcie_share": 0.059,
+        "ram_blobs": 13995,
+        "file_blobs": 6569,
+        "file_mb": 3211.9,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603421.1744676
+    },
+    {
+      "label": "round-0-case-1",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 1."
+        },
+        {
+          "role": "user",
+          "content": "Explain how to design reliable retries for a background job queue, including idempotency and exponential backoff."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603421.17643,
+      "response": {
+        "id": "chatcmpl-76d2cabdc6824747b7591127",
+        "object": "chat.completion",
+        "created": 1791603421,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Designing a reliable background job queue requires balancing **reliability** (ensuring jobs eventually complete) with **efficiency** (avoiding wasted resources and system overload). The two pillars of this design are **Idempotency** and **Exponential Backoff**.\n\nHere is a comprehensive guide to designing such a system.\n\n---\n\n### 1. Core Concept: Why Retries Are Needed\nBackground jobs fail for transient reasons:\n- Network timeouts\n- Database deadlocks\n- Third-party API rate limits\n- Temporary service outages\n\nWithout retries, these transient failures become permanent errors. With naive retries, you risk overwhelming the system or processing the same job multiple times.\n\n---\n\n### 2. Idempotency: The Safety Net\n**Idempot"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 46,
+          "completion_tokens": 160,
+          "total_tokens": 206,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 46,
+          "prompt_ms": 4262.7,
+          "prompt_per_token_ms": 92.667,
+          "prompt_per_second": 10.8,
+          "predicted_n": 160,
+          "predicted_ms": 7225.6,
+          "predicted_per_token_ms": 45.16,
+          "predicted_per_second": 22.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 11.49
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603421.179301,
+        "duration_s": 11.5,
+        "finish": "length",
+        "prompt_tokens": 46,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 46,
+        "prompt_read": 46,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 4262.7,
+        "decode_ms": 7225.6,
+        "decode_tok_s": 22.1,
+        "hit_rate": 0.828,
+        "pcie_share": 0.056,
+        "ram_blobs": 13131,
+        "file_blobs": 6222,
+        "file_mb": 2614.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603432.6934435
+    },
+    {
+      "label": "round-0-case-2",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 2."
+        },
+        {
+          "role": "user",
+          "content": "Explain how database composite indexes affect filtering, sorting, and write performance, with concrete examples."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603432.6954768,
+      "response": {
+        "id": "chatcmpl-29f176f3f2be481ca1ca98da",
+        "object": "chat.completion",
+        "created": 1791603432,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Composite Indexes: Filtering, Sorting, and Write Performance\n\n## What Is a Composite Index?\n\nA composite index (also called a multi-column index) is an index on **multiple columns** of a table. The order of columns matters critically.\n\n```sql\nCREATE INDEX idx_name ON employees (department_id, hire_date, salary);\n```\n\nThis creates a B-tree index where entries are sorted first by `department_id`, then by `hire_date` within each department, then by `salary` within each `(department_id, hire_date)` pair.\n\n---\n\n## 1. Filtering (WHERE Clause)\n\n### The Leftmost Prefix Rule\n\nA composite index can be used for filtering **only if** the query filters on a **leftmost prefix** of the indexed"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 160,
+          "total_tokens": 202,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 42,
+          "prompt_ms": 3101.8,
+          "prompt_per_token_ms": 73.852,
+          "prompt_per_second": 13.5,
+          "predicted_n": 160,
+          "predicted_ms": 9322.7,
+          "predicted_per_token_ms": 58.267,
+          "predicted_per_second": 17.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 12.45
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603432.7222786,
+        "duration_s": 12.4,
+        "finish": "length",
+        "prompt_tokens": 42,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 42,
+        "prompt_read": 42,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 3101.8,
+        "decode_ms": 9322.7,
+        "decode_tok_s": 17.2,
+        "hit_rate": 0.812,
+        "pcie_share": 0.057,
+        "ram_blobs": 13212,
+        "file_blobs": 7687,
+        "file_mb": 3913.0,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603445.1792521
+    },
+    {
+      "label": "round-1-case-0",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 0."
+        },
+        {
+          "role": "user",
+          "content": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603445.1813488,
+      "response": {
+        "id": "chatcmpl-04a8ef2c7bb2409488ebbfa2",
+        "object": "chat.completion",
+        "created": 1791603445,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Hash Tables: Collisions, Resizing, and Lookup \u2014 A Detailed Technical Explanation\n\n## 1. Core Concept\n\nA hash table is a data structure that maps **keys** to **values** using a **hash function**. The goal is **O(1) average-case** time complexity for insertion, deletion, and lookup.\n\n```\nKey \u2192 Hash Function \u2192 Index \u2192 Bucket (Array Slot) \u2192 Value(s)\n```\n\nThe underlying structure is typically a **dynamic array** (called the *bucket array* or *table*) of size `m`, where each slot is a *bucket*.\n\n---\n\n## 2. The Hash Function\n\nA good hash function must:\n- **Deterministically** map a key to an integer in `[0, m-1"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 43,
+          "completion_tokens": 160,
+          "total_tokens": 203,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 43,
+          "prompt_ms": 4135.0,
+          "prompt_per_token_ms": 96.163,
+          "prompt_per_second": 10.4,
+          "predicted_n": 160,
+          "predicted_ms": 7340.6,
+          "predicted_per_token_ms": 45.879,
+          "predicted_per_second": 21.8,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 11.493
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603445.2219338,
+        "duration_s": 11.5,
+        "finish": "length",
+        "prompt_tokens": 43,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 43,
+        "prompt_read": 43,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 4135.0,
+        "decode_ms": 7340.6,
+        "decode_tok_s": 21.8,
+        "hit_rate": 0.842,
+        "pcie_share": 0.047,
+        "ram_blobs": 11299,
+        "file_blobs": 6342,
+        "file_mb": 3030.3,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603456.7325976
+    },
+    {
+      "label": "round-1-case-1",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 1."
+        },
+        {
+          "role": "user",
+          "content": "Explain how to design reliable retries for a background job queue, including idempotency and exponential backoff."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603456.7347882,
+      "response": {
+        "id": "chatcmpl-eb6ebfbb99d7496186ccd104",
+        "object": "chat.completion",
+        "created": 1791603456,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Designing a reliable background job queue requires balancing **reliability** (ensuring jobs eventually complete) with **efficiency** (avoiding wasted resources on permanently failing jobs). The two pillars of this design are **Idempotency** and **Exponential Backoff**.\n\nHere is a comprehensive guide to designing such a system.\n\n---\n\n### 1. Core Concept: Why Retries Are Needed\nBackground jobs fail for transient reasons:\n- Network timeouts\n- Database deadlocks\n- Third-party API rate limits\n- Temporary service outages\n\nHowever, some failures are permanent:\n- Invalid data\n- Missing dependencies\n- Code bugs\n\nA retry strategy must distinguish between these two.\n\n---\n\n### 2. Idempotency: The Foundation of Safe Ret"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 46,
+          "completion_tokens": 160,
+          "total_tokens": 206,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 46,
+          "prompt_ms": 3911.2,
+          "prompt_per_token_ms": 85.026,
+          "prompt_per_second": 11.8,
+          "predicted_n": 160,
+          "predicted_ms": 6620.8,
+          "predicted_per_token_ms": 41.38,
+          "predicted_per_second": 24.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 10.549
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603456.775963,
+        "duration_s": 10.5,
+        "finish": "length",
+        "prompt_tokens": 46,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 46,
+        "prompt_read": 46,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 3911.2,
+        "decode_ms": 6620.8,
+        "decode_tok_s": 24.2,
+        "hit_rate": 0.83,
+        "pcie_share": 0.054,
+        "ram_blobs": 12433,
+        "file_blobs": 6609,
+        "file_mb": 2483.1,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603467.3267014
+    },
+    {
+      "label": "round-1-case-2",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 2."
+        },
+        {
+          "role": "user",
+          "content": "Explain how database composite indexes affect filtering, sorting, and write performance, with concrete examples."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603467.329009,
+      "response": {
+        "id": "chatcmpl-42ef9e6a19704927873613b2",
+        "object": "chat.completion",
+        "created": 1791603467,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Composite Indexes: Filtering, Sorting, and Write Performance\n\n## What Is a Composite Index?\n\nA composite index (also called a multi-column index) is a single index that contains **multiple columns** in a defined order. Think of it as a sorted list where rows are ordered first by column A, then by column B within each group of A, then by column C within each group of B, and so on.\n\n```sql\nCREATE INDEX idx_name ON employees (department, hire_date, salary);\n```\n\nThis creates a B-tree structure sorted by `(department, hire_date, salary)`.\n\n---\n\n## 1. Filtering (WHERE Clause)\n\n### The Leftmost Prefix Rule\n\nA composite index can be used for filtering **only if** the query filters"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 160,
+          "total_tokens": 202,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 42,
+          "prompt_ms": 2999.6,
+          "prompt_per_token_ms": 71.419,
+          "prompt_per_second": 14.0,
+          "predicted_n": 160,
+          "predicted_ms": 9273.3,
+          "predicted_per_token_ms": 57.958,
+          "predicted_per_second": 17.3,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 12.297
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603467.3544104,
+        "duration_s": 12.3,
+        "finish": "length",
+        "prompt_tokens": 42,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 42,
+        "prompt_read": 42,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 2999.6,
+        "decode_ms": 9273.3,
+        "decode_tok_s": 17.3,
+        "hit_rate": 0.81,
+        "pcie_share": 0.058,
+        "ram_blobs": 13407,
+        "file_blobs": 7778,
+        "file_mb": 3998.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603479.6578932
+    },
+    {
+      "label": "held-out-python-aliasing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Trace this Python code and explain why the rows change together: rows = [[0]] * 3; rows[1].append(7). End with FINAL: followed by only the resulting JSON value of rows."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603479.6602514,
+      "response": {
+        "id": "chatcmpl-05eed7ed64f645d08d32d7e6",
+        "object": "chat.completion",
+        "created": 1791603479,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "To trace the execution of the provided Python code and explain the behavior, we must understand how Python handles object references and list multiplication.\n\n### Step-by-Step Trace\n\n1.  **`rows = [[0]] * 3`**\n    *   First, the inner list `[0]` is created. Let's call this object `List_A`.\n    *   The `*` operator on a list creates a new list containing references to the elements of the original list. It does **not** create deep copies of the elements.\n    *   Therefore, `[[0]] * 3` creates a new outer list containing three references to the **same** `List_A` object.\n    *   Memory representation:\n        ```\n        rows -> ["
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 55,
+          "completion_tokens": 160,
+          "total_tokens": 215,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 55,
+          "prompt_ms": 6484.8,
+          "prompt_per_token_ms": 117.905,
+          "prompt_per_second": 8.5,
+          "predicted_n": 160,
+          "predicted_ms": 39094.3,
+          "predicted_per_token_ms": 244.339,
+          "predicted_per_second": 4.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 45.603
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603479.6850991,
+        "duration_s": 45.6,
+        "finish": "length",
+        "prompt_tokens": 55,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 55,
+        "prompt_read": 55,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 6484.8,
+        "decode_ms": 39094.3,
+        "decode_tok_s": 4.1,
+        "hit_rate": 0.818,
+        "pcie_share": 0.048,
+        "ram_blobs": 11178,
+        "file_blobs": 8275,
+        "file_mb": 3719.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603525.2916775
+    },
+    {
+      "label": "held-out-python-generator",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What list does this Python code print? Explain its evaluation order briefly. values = [2, 4, 6]; stream = (x * 2 for x in values); values[1] = 9; print(list(stream)). End with FINAL: followed by only the resulting JSON list."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603525.294263,
+      "response": {
+        "id": "chatcmpl-6d7c48c5da984472935b0df7",
+        "object": "chat.completion",
+        "created": 1791603525,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "The code prints `[4, 18, 12]`.\n\n**Explanation of Evaluation Order:**\n\n1.  **Initialization**: `values` is initialized as `[2, 4, 6]`.\n2.  **Generator Creation**: `stream = (x * 2 for x in values)` creates a generator object. Crucially, generators are **lazy**. The expression `x * 2` is not evaluated immediately. The generator holds a reference to the `values` list and an internal iterator state, but it does not yet iterate through the list or compute any values.\n3.  **Mutation**: `values[1] = 9` modifies the original list. The list `values` is now `[2, 9, 6]"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 73,
+          "completion_tokens": 160,
+          "total_tokens": 233,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 73,
+          "prompt_ms": 26017.9,
+          "prompt_per_token_ms": 356.41,
+          "prompt_per_second": 2.8,
+          "predicted_n": 160,
+          "predicted_ms": 10841.5,
+          "predicted_per_token_ms": 67.759,
+          "predicted_per_second": 14.8,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 36.882
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603525.3180192,
+        "duration_s": 36.9,
+        "finish": "length",
+        "prompt_tokens": 73,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 73,
+        "prompt_read": 73,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 26017.9,
+        "decode_ms": 10841.5,
+        "decode_tok_s": 14.8,
+        "hit_rate": 0.81,
+        "pcie_share": 0.045,
+        "ram_blobs": 10485,
+        "file_blobs": 9165,
+        "file_mb": 5020.2,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603562.203005
+    },
+    {
+      "label": "held-out-dependency-schedule",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Four jobs share two identical workers. A takes 3 minutes, B takes 5, C takes 4 and must wait for A, D takes 2 and must wait for both B and C. All available jobs may start at time 0, and jobs cannot be interrupted. Explain the earliest finish time for all jobs. End with FINAL: followed by the integer number of minutes."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603562.2056763,
+      "response": {
+        "id": "chatcmpl-51854916e7184312941b3f6a",
+        "object": "chat.completion",
+        "created": 1791603562,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "To determine the earliest finish time for all jobs, we must schedule the four jobs (A, B, C, D) onto two identical workers while respecting the given dependencies and processing times.\n\n**1. Analyze Job Constraints and Durations:**\n*   **Worker Capacity:** 2 workers available at any time.\n*   **Job A:** Duration = 3 minutes. Dependencies: None.\n*   **Job B:** Duration = 5 minutes. Dependencies: None.\n*   **Job C:** Duration = 4 minutes. Dependencies: Must wait for A to finish.\n*   **Job D:** Duration = 2 minutes. Dependencies: Must wait for both B and C to finish.\n\n**2. Step-by-Step Scheduling:**\n\n*  "
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 90,
+          "completion_tokens": 160,
+          "total_tokens": 250,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 90,
+          "prompt_ms": 10998.9,
+          "prompt_per_token_ms": 122.21,
+          "prompt_per_second": 8.2,
+          "predicted_n": 160,
+          "predicted_ms": 12215.0,
+          "predicted_per_token_ms": 76.344,
+          "predicted_per_second": 13.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 23.216
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603562.209002,
+        "duration_s": 23.2,
+        "finish": "length",
+        "prompt_tokens": 90,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 90,
+        "prompt_read": 90,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 10998.9,
+        "decode_ms": 12215.0,
+        "decode_tok_s": 13.1,
+        "hit_rate": 0.774,
+        "pcie_share": 0.052,
+        "ram_blobs": 11506,
+        "file_blobs": 11480,
+        "file_mb": 5834.1,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603585.451568
+    },
+    {
+      "label": "held-out-interval-union",
+      "messages": [
+        {
+          "role": "user",
+          "content": "An integer counter increments once per integer that appears in at least one of these inclusive ranges: [3,11], [8,16], [20,23], [22,25]. Explain how overlapping ranges affect the count. End with FINAL: followed by the integer count."
+        }
+      ],
+      "max_tokens": 160,
+      "started_unix": 1791603585.4543111,
+      "response": {
+        "id": "chatcmpl-116220b6283f4b3db5601657",
+        "object": "chat.completion",
+        "created": 1791603585,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "To determine the final integer count, we need to find the number of unique integers that appear in at least one of the given inclusive ranges. This is equivalent to finding the size of the union of these sets.\n\nThe ranges are:\n1.  $A = [3, 11]$\n2.  $B = [8, 16]$\n3.  $C = [20, 23]$\n4.  $D = [22, 25]$\n\n### Step 1: Analyze Overlapping Ranges\n\nOverlapping ranges affect the count by ensuring that integers appearing in multiple ranges are only counted **once**. If we simply added the lengths of all ranges, we would double-count the integers in the intersections. To avoid"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 74,
+          "completion_tokens": 160,
+          "total_tokens": 234,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 74,
+          "prompt_ms": 9601.3,
+          "prompt_per_token_ms": 129.747,
+          "prompt_per_second": 7.7,
+          "predicted_n": 160,
+          "predicted_ms": 13124.1,
+          "predicted_per_token_ms": 82.026,
+          "predicted_per_second": 12.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 22.742
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603585.4908497,
+        "duration_s": 22.7,
+        "finish": "length",
+        "prompt_tokens": 74,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 74,
+        "prompt_read": 74,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 9601.3,
+        "decode_ms": 13124.1,
+        "decode_tok_s": 12.2,
+        "hit_rate": 0.788,
+        "pcie_share": 0.05,
+        "ram_blobs": 11149,
+        "file_blobs": 10915,
+        "file_mb": 6378.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791603608.2413614
+    }
+  ],
+  "working_tree": {
+    "meaning": "Working tree at run start, not executable build provenance.",
+    "head": "6794d901f81717ed9c5b5513c83c0eba1187f068",
+    "sha256": "9362399f3d1377d21fa9bdad3ddc886435f96f2cca47019bff5be239f93c0d71",
+    "status": "MM include/strata/core/expert_source.hpp\nMM src/core/expert_source.cpp\nMM src/program/generate.cpp\n",
+    "files": [
+      {
+        "path": "CMakeLists.txt",
+        "bytes": 97130,
+        "sha256": "d36e95c09366c901116794889baa9000635fc8b1bb944a38123142189203cde4"
+      },
+      {
+        "path": "cmake/hip_backend.cmake",
+        "bytes": 6491,
+        "sha256": "033507c478d0e8074c8459078b9d19fcbbd3cc82ebb8d24100e1c68cb6bbb6db"
+      },
+      {
+        "path": "include/strata/artifact/dequant.hpp",
+        "bytes": 14449,
+        "sha256": "084ee6d3cb5056cca5dce6a6c40b9047d01f2560b033afb35eb56c64985a69f1"
+      },
+      {
+        "path": "include/strata/artifact/gguf_reader.hpp",
+        "bytes": 21441,
+        "sha256": "fc8453a95677e797c8fb1198bfb47d715b73a53446d39a29920c372180ca5ee0"
+      },
+      {
+        "path": "include/strata/artifact/gguf_split.hpp",
+        "bytes": 2425,
+        "sha256": "6280aabf7e4b77447caa5d046d7b7389c82af08b2d02c004897d0d4826a09760"
+      },
+      {
+        "path": "include/strata/core/arch_defaults.hpp",
+        "bytes": 1668,
+        "sha256": "a867fca72e9d1d839c6f6bb48bac4340d13a59ea8818d5e6857149cad3c7faf9"
+      },
+      {
+        "path": "include/strata/core/conversation_buffer.hpp",
+        "bytes": 6741,
+        "sha256": "12f1abac2ec75cc71e8cf308a5a691923d8b617317560e009a41f713809f49d4"
+      },
+      {
+        "path": "include/strata/core/conversation_cache.hpp",
+        "bytes": 14114,
+        "sha256": "a6c2e017497d38663d391b290662e74b37aa99147e1ca7e12c02f2204f81168b"
+      },
+      {
+        "path": "include/strata/core/conversation_file.hpp",
+        "bytes": 15876,
+        "sha256": "2c6ddbb2bb1f44331297a2cf970504da67ce501180fe1513aeb59f71cef8f942"
+      },
+      {
+        "path": "include/strata/core/conversation_memory.hpp",
+        "bytes": 642,
+        "sha256": "b4c784080bfda39adb7a2fd4c64bac27a77bb7a6f4557b609e08c2afcb7f9954"
+      },
+      {
+        "path": "include/strata/core/conversation_snapshot.hpp",
+        "bytes": 9145,
+        "sha256": "c403e99ab515566e1314a3c485f8974d25bb0194a181f1e8ab804fc76ce8f665"
+      },
+      {
+        "path": "include/strata/core/coupled_draft.hpp",
+        "bytes": 5109,
+        "sha256": "9b1773764c3867599a42a48aa41444bf79441254e9250de542d5427f093f599b"
+      },
+      {
+        "path": "include/strata/core/device.hpp",
+        "bytes": 4647,
+        "sha256": "382f04df3a95349bf03dfce47402753aa2ed7e958dc6b12d0830ff1bab40d059"
+      },
+      {
+        "path": "include/strata/core/dma_batch.hpp",
+        "bytes": 5861,
+        "sha256": "9b485734a866bee6ef0c927b838905ab7770cfdc1f7a7b19b97c4dea4fbbb07a"
+      },
+      {
+        "path": "include/strata/core/emulate.hpp",
+        "bytes": 1639,
+        "sha256": "eb3df4efe89642f069420e0f68ec526b33d4cc66f9a6b26de0583492b5758a77"
+      },
+      {
+        "path": "include/strata/core/exchange_storage.hpp",
+        "bytes": 5345,
+        "sha256": "30e4c42ac268fc30af4501ee2036d040173a5fbb67de3429caddd8285f2eeaed"
+      },
+      {
+        "path": "include/strata/core/expert_cache.hpp",
+        "bytes": 17437,
+        "sha256": "ff3cd4357e397ff944bc8c814e769975ecd243b3445b050234cbb62d9260bd54"
+      },
+      {
+        "path": "include/strata/core/expert_source.hpp",
+        "bytes": 54891,
+        "sha256": "863cdc3c04edc5933a6d85c1fbd8551108bfe064a1fa8ca5bc95da0e1cfc3244"
+      },
+      {
+        "path": "include/strata/core/graph.hpp",
+        "bytes": 5749,
+        "sha256": "21fb807b9c3cbd8665b14145ca19d4d9a93fa897d378042254f4e4cb1f9060a4"
+      },
+      {
+        "path": "include/strata/core/hit_hook.hpp",
+        "bytes": 2531,
+        "sha256": "4c006f473d71a79cf03d9ce07cb246dc8b5ec10269fd335960a27733d51bc033"
+      },
+      {
+        "path": "include/strata/core/layer.hpp",
+        "bytes": 43276,
+        "sha256": "b273603e633e63f93c877b278dd7f21dd4bb2909b4e94d8f174d84b2a975bfa2"
+      },
+      {
+        "path": "include/strata/core/layout.hpp",
+        "bytes": 4392,
+        "sha256": "20afe27849aa28de7ec2f19fbf4be212240504008c643331eadbc10934821c0b"
+      },
+      {
+        "path": "include/strata/core/mtp.hpp",
+        "bytes": 17359,
+        "sha256": "66ac9203593bc33ad5d74db11617d41df4802986b7acce315b47090bd68f2282"
+      },
+      {
+        "path": "include/strata/core/native_dense.hpp",
+        "bytes": 2735,
+        "sha256": "b749409e2a9231bb4dbae7413d946113d965e32eb7930f676648afcaffcbd5c8"
+      },
+      {
+        "path": "include/strata/core/native_head.hpp",
+        "bytes": 2695,
+        "sha256": "d80052035aeba3dbbc90cf84549d8424a10335d28fb04140e2265ba7819d27dc"
+      },
+      {
+        "path": "include/strata/core/on_device.hpp",
+        "bytes": 843,
+        "sha256": "f9317a4c19eb32924462b8aa9829a97528064f6a8fcdb64a746bb13a60c773a2"
+      },
+      {
+        "path": "include/strata/core/peer_experts.hpp",
+        "bytes": 5871,
+        "sha256": "02ef10cd0b6a9c0ee8b6de3a4489e5fdabb108f0182539fd4ab49705428e7f59"
+      },
+      {
+        "path": "include/strata/core/pinned.hpp",
+        "bytes": 11633,
+        "sha256": "a6a90004da834203e2e27180cda3d55f1b0a8245cc552c161a90371c06b36e1f"
+      },
+      {
+        "path": "include/strata/core/progress.hpp",
+        "bytes": 3704,
+        "sha256": "cf0376eb23e2fd43a062c1fb40d3ac7885ef8283975051af51034f3f7182d622"
+      },
+      {
+        "path": "include/strata/core/remote_expert_opt.hpp",
+        "bytes": 2059,
+        "sha256": "76e7d8de1ab76f1130609bc84edeefcf9ca77952d4448dbd625d8a5c3b36c4df"
+      },
+      {
+        "path": "include/strata/core/remote_experts.hpp",
+        "bytes": 3814,
+        "sha256": "5760445905fdfdc0adb652be9817ea317e5b69ad7b9d5c91a3077d9efe5ba2e1"
+      },
+      {
+        "path": "include/strata/core/session.hpp",
+        "bytes": 30344,
+        "sha256": "ffe954333948aee170399252afaad2e8b2b1e81fb31ed9c4358597eba4ca2e3b"
+      },
+      {
+        "path": "include/strata/core/verify.hpp",
+        "bytes": 30988,
+        "sha256": "270d3b62bc1de066a552fa48ea42251060058b4084821125cc5a31f02edb4a6e"
+      },
+      {
+        "path": "include/strata/core/vmm.hpp",
+        "bytes": 3209,
+        "sha256": "39ebc6f9baeded618ca453171d7c9c5b45da6c97c43d965f5a66f09949920852"
+      },
+      {
+        "path": "include/strata/core/weights.hpp",
+        "bytes": 8139,
+        "sha256": "071d07c9f15d122265d7b1b90ff96125559a7d6ebbd8ec3f3a2b6e94dc17aef1"
+      },
+      {
+        "path": "include/strata/hip_compat/cublas_v2.h",
+        "bytes": 2630,
+        "sha256": "19dd502fb04a49ada7296df1f17e3bc5a3e8d5a7f689f545555750fd20c6283e"
+      },
+      {
+        "path": "include/strata/hip_compat/cuda_fp16.h",
+        "bytes": 39,
+        "sha256": "5864a3c6a57debde2e84b83702a1467a01130dd1d2cdb70d75695931ca1582cc"
+      },
+      {
+        "path": "include/strata/hip_compat/cuda_runtime.h",
+        "bytes": 6566,
+        "sha256": "e28d27acabe86c578d317b037cedd211869ad7c576ecbde81ca1f71a015a229b"
+      },
+      {
+        "path": "include/strata/hip_compat/cuda_runtime_api.h",
+        "bytes": 39,
+        "sha256": "153e9ca18085214f68b95183d5ffac1a247c305144fb217bb6c68f8a4e6e01f3"
+      },
+      {
+        "path": "include/strata/hip_compat/intrinsics.hpp",
+        "bytes": 8363,
+        "sha256": "6f01de4466473d8323abff56fe7d33b7cc7fdd00d1bb7dc2fb1c80521db67c99"
+      },
+      {
+        "path": "include/strata/hip_compat/math_constants.h",
+        "bytes": 157,
+        "sha256": "b72ba65e9a31def2f69a582f159f276dc4fdb1a984433cb2cd299a46a27f522f"
+      },
+      {
+        "path": "include/strata/kernels/bf16_bits.hpp",
+        "bytes": 2660,
+        "sha256": "813b51f17c5c264d642f4d77b3d6e5f35e7ea7310ba87b18b3a2a5bc9185198f"
+      },
+      {
+        "path": "include/strata/kernels/bf16_gemv.hpp",
+        "bytes": 4460,
+        "sha256": "97e5fac5c5b8dbd86b4e104bf4b69155424bc6d28d0a991240bd9912349f6e6f"
+      },
+      {
+        "path": "include/strata/kernels/cpu/expert.hpp",
+        "bytes": 12230,
+        "sha256": "d46e04f4b7a2d34746d31cffa561e2415afd79b5a0eef25df792be98cee0021a"
+      },
+      {
+        "path": "include/strata/kernels/cpu/expert_layout.hpp",
+        "bytes": 6565,
+        "sha256": "dbc6cf5b91367e571ad9cb3be4e4cd851159544186c859a7cd374632a8a63fcd"
+      },
+      {
+        "path": "include/strata/kernels/cpu/iq_avx2.hpp",
+        "bytes": 2774,
+        "sha256": "69724ca08cce10cd49a138f9c43c61bd25423709ef87172e899a6784137613ca"
+      },
+      {
+        "path": "include/strata/kernels/cpu/iq_avx512.hpp",
+        "bytes": 876,
+        "sha256": "ede01ee7e474f5d816d9bc6ad6b0804cabd924c69b2b3d536d40f2432410841b"
+      },
+      {
+        "path": "include/strata/kernels/cpu/kq_avx1.hpp",
+        "bytes": 1011,
+        "sha256": "af289c2fec6ec8e4946352dbbbcc25df41bb57468953589e4b5b7cfe1d0ddbda"
+      },
+      {
+        "path": "include/strata/kernels/cpu/kq_avx2.hpp",
+        "bytes": 1386,
+        "sha256": "c4cd342ba0f2ffd34f6b5ac9c254c59d0a521370de0d7650f0c28e7a390b55dd"
+      },
+      {
+        "path": "include/strata/kernels/cpu/native_expert.hpp",
+        "bytes": 2871,
+        "sha256": "711dcaf43608b7d607f05e17f81993356b6fe36f18bcfa64b1ca111e9eeab0bc"
+      },
+      {
+        "path": "include/strata/kernels/cpu/pool.hpp",
+        "bytes": 17972,
+        "sha256": "7873e0ff47007f05437518a40f3f11251473ec5f073299aad21a8baae81f351f"
+      },
+      {
+        "path": "include/strata/kernels/cvec.hpp",
+        "bytes": 3997,
+        "sha256": "9f8effb3704845cb294983af4a9737f3066f730adcf15a2894a7597b52d2b3de"
+      },
+      {
+        "path": "include/strata/kernels/dequant_bf16.hpp",
+        "bytes": 1733,
+        "sha256": "87597018553357e3df3310b262447420ba7e81f8123fe3fe18a0fec7087c9bbb"
+      },
+      {
+        "path": "include/strata/kernels/dequant_s2.hpp",
+        "bytes": 937,
+        "sha256": "d8f3aa8d610887451f177f05ada1135d52daf21b95a8c2c58686c07403c8013d"
+      },
+      {
+        "path": "include/strata/kernels/dp4a.hpp",
+        "bytes": 2448,
+        "sha256": "6f8c5d9d502f0d7bcd286a56c1bbaea2c3a55ab2f0d8cea6f0c27db45c7f8ce6"
+      },
+      {
+        "path": "include/strata/kernels/elementwise.hpp",
+        "bytes": 9740,
+        "sha256": "374e7d13d2c7b76544ff9a1367a7300343389372fa90f4b7f3a6a9216a5cdd8e"
+      },
+      {
+        "path": "include/strata/kernels/f16_bits.hpp",
+        "bytes": 5334,
+        "sha256": "0f74e6dd832da427b681c9971265a0af1a91198694fdef3654d860b98863fc8c"
+      },
+      {
+        "path": "include/strata/kernels/fused_gdn.hpp",
+        "bytes": 2197,
+        "sha256": "595205dcf531d8fb758bcd7b2d3ac4e4158bd06f20160199e592824d530e2078"
+      },
+      {
+        "path": "include/strata/kernels/fused_gr.hpp",
+        "bytes": 5070,
+        "sha256": "e8055ea3311bfc0c49ef464141713842da5fdad1e5cddf6a2f573fbf5353ab3a"
+      },
+      {
+        "path": "include/strata/kernels/gdn.hpp",
+        "bytes": 5558,
+        "sha256": "f44626e3f52813b9be289aee72f708e9ad61aa9b3a0e43037ba5ff8b358fc638"
+      },
+      {
+        "path": "include/strata/kernels/gfx_arch.hpp",
+        "bytes": 1579,
+        "sha256": "ef3e926c0b0e6efa8d17e87e2ccec573e85c63feba30acd3db137b108ef9609d"
+      },
+      {
+        "path": "include/strata/kernels/gr.hpp",
+        "bytes": 8523,
+        "sha256": "a6d4cf421b8e30d7ecc436c011fd6a8bbe8768c82cb815d9483724085efbdc5a"
+      },
+      {
+        "path": "include/strata/kernels/iq_kernels.hpp",
+        "bytes": 5405,
+        "sha256": "e3750f39de3957ff8bbd0ecc9d77d0e394f34984935f528c908d107aa62a62b3"
+      },
+      {
+        "path": "include/strata/kernels/kv_q4.hpp",
+        "bytes": 3705,
+        "sha256": "f6e35e2764934c0c4949f2651513dc9a90c5b4cf764c92916de4b0ea9a80a22d"
+      },
+      {
+        "path": "include/strata/kernels/kv_q8.hpp",
+        "bytes": 3093,
+        "sha256": "7c70db0cbc1726e244b7085a319e1f0be5c8a3a415a6b0de7db7d0cdbe70e26e"
+      },
+      {
+        "path": "include/strata/kernels/kv_stream.hpp",
+        "bytes": 7207,
+        "sha256": "24a47cb5eca790fa35b13bbeb12cf3407389c41219899789880d965cf86d8abe"
+      },
+      {
+        "path": "include/strata/kernels/mrope.hpp",
+        "bytes": 3820,
+        "sha256": "f7add5611f54af2434daa1ad711fe441e214693bd33524a12c56058807fd381c"
+      },
+      {
+        "path": "include/strata/kernels/native_flash_attn.hpp",
+        "bytes": 1990,
+        "sha256": "6cc7bb288fc263ee800f5b5329bcc8d139ddde7e31a022364850cf80b1e5f7ff"
+      },
+      {
+        "path": "include/strata/kernels/native_gdn.hpp",
+        "bytes": 1109,
+        "sha256": "2b65e1b5b689c06d099bc061d746d606dcc5b974a7bffe0820ce01e7295d1971"
+      },
+      {
+        "path": "include/strata/kernels/native_gdn_preprocess.hpp",
+        "bytes": 2004,
+        "sha256": "7533d8464b6ae8e2800e43ee3036d23f21181c2472c069d19bacf115beeafc69"
+      },
+      {
+        "path": "include/strata/kernels/native_gr_norm.hpp",
+        "bytes": 1256,
+        "sha256": "12c20abec1952f23f825eefc9e2f676e812417d46922005ce42416212caab535"
+      },
+      {
+        "path": "include/strata/kernels/native_gr_postops.hpp",
+        "bytes": 1854,
+        "sha256": "ee47d3a68e720944988bf1151c738fdc68f3696270b47e89ff1f47d404862be7"
+      },
+      {
+        "path": "include/strata/kernels/native_mmvq.hpp",
+        "bytes": 7854,
+        "sha256": "86584ee49edc27ad84989b2737eb61c8f0e5b0a477e1b1b2af36494c0b497a97"
+      },
+      {
+        "path": "include/strata/kernels/native_moe.hpp",
+        "bytes": 2137,
+        "sha256": "170dbcaf0d71c1cb1edfdc6fb8407636160218fee1db28c9aa9a74ed17207e93"
+      },
+      {
+        "path": "include/strata/kernels/native_ple_postops.hpp",
+        "bytes": 2179,
+        "sha256": "eeeec9650c6e19402dcec9c4c807ff5a62f0b64b4a3ad86e6a286489ee7af091"
+      },
+      {
+        "path": "include/strata/kernels/native_qsa.hpp",
+        "bytes": 2013,
+        "sha256": "119fd52ad31c7151c1061af997e41e0db43c7312fc644c5d156a732b8f441ea9"
+      },
+      {
+        "path": "include/strata/kernels/native_qsa_indexer.hpp",
+        "bytes": 3325,
+        "sha256": "5f29b2ebbf392bdc0419c651b515b447d57b935fce4af300bf621a72e039e2d6"
+      },
+      {
+        "path": "include/strata/kernels/native_qsa_score.hpp",
+        "bytes": 1648,
+        "sha256": "d57ba2509e97093ed2bfa3cbe73886407211a5d476a0b629ed925dd992369354"
+      },
+      {
+        "path": "include/strata/kernels/native_rope.hpp",
+        "bytes": 2048,
+        "sha256": "06e3fbbc046fe4a3dda4788943285e586d08fe0885cd97cc9c21d132d750c413"
+      },
+      {
+        "path": "include/strata/kernels/native_router.hpp",
+        "bytes": 1044,
+        "sha256": "e5e0a529c11235080ec541cdc65a1ac1c0dba8eb994cf5373609fc8985311502"
+      },
+      {
+        "path": "include/strata/kernels/ngram.hpp",
+        "bytes": 15850,
+        "sha256": "46094ecfa258c43b75e9c921379c0decd7c15b060a636bcf1d7ae0ffc8a22829"
+      },
+      {
+        "path": "include/strata/kernels/ple.hpp",
+        "bytes": 8153,
+        "sha256": "d044c70b3cc5044ee379d1d817c41c6fce7b0c0db18a1ce6274af3e62629255f"
+      },
+      {
+        "path": "include/strata/kernels/q8_1_finite.hpp",
+        "bytes": 1652,
+        "sha256": "6789c75d692ef1cf21a07d8d602e5cf35ad40657b715f8d510cf7ddad1162598"
+      },
+      {
+        "path": "include/strata/kernels/qsa.hpp",
+        "bytes": 25547,
+        "sha256": "87c02222284f842fcecb46a422b119af769c72c3914edc8da5b2ee782456dc74"
+      },
+      {
+        "path": "include/strata/kernels/qsa_decode_attn.hpp",
+        "bytes": 2651,
+        "sha256": "6fa4b817f835c43783774d5946d14938f2867d7af16abb4db0f4b75d4622a915"
+      },
+      {
+        "path": "include/strata/kernels/qsa_prompt_attn.hpp",
+        "bytes": 2226,
+        "sha256": "a535cf4bf4fd5770e8726327f5dd64145e22478b2d711441d066ad3082f79d55"
+      },
+      {
+        "path": "include/strata/kernels/qsa_select.hpp",
+        "bytes": 4568,
+        "sha256": "fbd2dea4eebe9c6b1684957f5843abbf7d36630b526c4ecc6f68bb0fbd79d517"
+      },
+      {
+        "path": "include/strata/kernels/quantize_act.hpp",
+        "bytes": 3813,
+        "sha256": "baad6fe6c691f8f5aee2d6dbbb3513eead12c754b485ee41af4618d5035772f7"
+      },
+      {
+        "path": "include/strata/kernels/rope.hpp",
+        "bytes": 3707,
+        "sha256": "bd9094c0f0f761971a6760fde2b84a5660c934ce9a654dc287c686acd284a65a"
+      },
+      {
+        "path": "include/strata/kernels/rope_scaling.hpp",
+        "bytes": 11764,
+        "sha256": "05a8dcf57c9b12a23128f22e4bef01445c3a37991df5e1ffacd01d077c46595d"
+      },
+      {
+        "path": "include/strata/kernels/router_top10.hpp",
+        "bytes": 1434,
+        "sha256": "cd0d8e91e702bfa2cfd681d4ccf4f6c4c62af2cd612d2d109e5369845ddf362d"
+      },
+      {
+        "path": "include/strata/kernels/s2_expert_grouped.hpp",
+        "bytes": 10871,
+        "sha256": "74802f312c20daa90b7fbacba4a3357c8e94c7ecdab75f402be507dd303a8193"
+      },
+      {
+        "path": "include/strata/kernels/s2_gemv.hpp",
+        "bytes": 1460,
+        "sha256": "cc146b9c652f1ee0c89be65ce179ea4cb31d4b4d32366c07f06b45644bbb8eb0"
+      },
+      {
+        "path": "include/strata/kernels/s2_gemv_q8.hpp",
+        "bytes": 1059,
+        "sha256": "5c2ccbdc5b3f3a66b9afef5bc799ae2a83bcb2103b258bb84e8d82aad06b4eb1"
+      },
+      {
+        "path": "include/strata/kernels/s_gemv.hpp",
+        "bytes": 9086,
+        "sha256": "369ab6cc010b49ac1d82bb680246e93b4c10f4f7081f56a325f6c7138ab1c3fb"
+      },
+      {
+        "path": "include/strata/kernels/sampler.hpp",
+        "bytes": 5727,
+        "sha256": "2fadb4618763906f7bb6718db199628e22522f266a52b1ab03f8c87a4e5b9a0e"
+      },
+      {
+        "path": "include/strata/kernels/shared_expert.hpp",
+        "bytes": 7147,
+        "sha256": "1aab416f17dd889456f43286d1d4ed40b9a5af2df68543fb3e3026306fab8cad"
+      },
+      {
+        "path": "include/strata/kernels/verify_kernels.hpp",
+        "bytes": 10406,
+        "sha256": "c6f2a0ac82f90108661bfb591195aca368a04c31258ded645cb987b8ba7205f0"
+      },
+      {
+        "path": "include/strata/ngram/ple_reader.hpp",
+        "bytes": 5338,
+        "sha256": "d19b99a681a533f47144293bb170913c1496b5e0c344aed097ad1418375f7498"
+      },
+      {
+        "path": "include/strata/plan/plan.hpp",
+        "bytes": 9396,
+        "sha256": "d6eca56c9d00ba3ad13e8a39ef4cb78f8a2c23fd3037e2e951167155a5b3dda5"
+      },
+      {
+        "path": "include/strata/platform/direct_file.hpp",
+        "bytes": 2391,
+        "sha256": "ae9a8999aef1769d729e5d6e4058888a14b758cbce3804b291809b1a521a4253"
+      },
+      {
+        "path": "include/strata/platform/hip_compat/cublas_v2.h",
+        "bytes": 998,
+        "sha256": "1a82bd37bdee4da2da923d768afe9a4a3c4e6d0dcb8e1b0dfbb06137e856c37f"
+      },
+      {
+        "path": "include/strata/platform/hip_compat/cuda_fp16.h",
+        "bytes": 37,
+        "sha256": "d054d07dc83186ca4d85491d2a869629add900a7608e56daac5b443a78c418de"
+      },
+      {
+        "path": "include/strata/platform/hip_compat/cuda_runtime.h",
+        "bytes": 37,
+        "sha256": "d054d07dc83186ca4d85491d2a869629add900a7608e56daac5b443a78c418de"
+      },
+      {
+        "path": "include/strata/platform/hip_compat/math_constants.h",
+        "bytes": 185,
+        "sha256": "bb6b8ab8e4de9c5f7b0f6c5d5a828107dda6785dd7730212c06cb3e6e4d8ec31"
+      },
+      {
+        "path": "include/strata/platform/hip_compat/strata_hip.h",
+        "bytes": 16583,
+        "sha256": "e8942b1011979dfd760ea8ca7c7bf11c5767ae3f084299e41f47a83ca6e748b0"
+      },
+      {
+        "path": "include/strata/platform/memory.hpp",
+        "bytes": 3047,
+        "sha256": "3bd4b462469a3bbbc8e9ff25282ab556ba8e700806106b3c4f84dcdc7992729c"
+      },
+      {
+        "path": "include/strata/prefill/gemm.hpp",
+        "bytes": 5037,
+        "sha256": "f0c30f5f73df10506be20c83aa538b06b5e10692ea82e5063249e6fe89e69bf7"
+      },
+      {
+        "path": "include/strata/prefill/kernels.hpp",
+        "bytes": 9619,
+        "sha256": "3aba3293dc0b6a0c6e9de15ed20ea0aaafd7afe910d3e3925b90e30b4c168866"
+      },
+      {
+        "path": "include/strata/prefill/moe_fused.hpp",
+        "bytes": 4033,
+        "sha256": "2809428405209d177a5ded160f62707f21eb344e85c84de8837b2b86ea938f65"
+      },
+      {
+        "path": "include/strata/prefill/moe_fused_iq.hpp",
+        "bytes": 2457,
+        "sha256": "84d0c99ace277a53deb5d091b2a0a5137fdc390f834815b43e8a5a910f42b4c8"
+      },
+      {
+        "path": "include/strata/prefill/moe_mmq.hpp",
+        "bytes": 5269,
+        "sha256": "26910a9726f6200e41bcb0e80c2066b8b81063691ada8a566060ed614d1fe95b"
+      },
+      {
+        "path": "include/strata/prefill/prefill.hpp",
+        "bytes": 12201,
+        "sha256": "4328c4a0c48779ae0bd39dcd5f4b118acde35521705ac4ffe6d4934b58c970cc"
+      },
+      {
+        "path": "include/strata/program/conv_cache.hpp",
+        "bytes": 3409,
+        "sha256": "349e1a1aa6a4e0e609d09dcbfba5c8d9e75fa81d64c2748b1b00e3216b429278"
+      },
+      {
+        "path": "include/strata/program/logits_selection.hpp",
+        "bytes": 1195,
+        "sha256": "f023d183fecb0c236dd0941988c672f6096fa92963393d4d879767838313e006"
+      },
+      {
+        "path": "include/strata/program/message_boundary.hpp",
+        "bytes": 716,
+        "sha256": "0d4a3a535adda8bc91ece894c8edafa1b20ff35f9cf30e546a5474d9fbde18d7"
+      },
+      {
+        "path": "include/strata/spec/controller.hpp",
+        "bytes": 3446,
+        "sha256": "e1c8400792ec87882646c96b22d768e2f62a5cfebf4b415798ef177ea6e60cce"
+      },
+      {
+        "path": "include/strata/spec/draft_policy.hpp",
+        "bytes": 3564,
+        "sha256": "9f91cfb418cb6ab69e1362ebd3289d77a03f25ed1130b67f1605a3158590ac44"
+      },
+      {
+        "path": "include/strata/spec/draft_source.hpp",
+        "bytes": 3275,
+        "sha256": "6955d5301aeda3a769f919a6b80d95d141f8c3656e821756bdbaf5eaebe80629"
+      },
+      {
+        "path": "include/strata/spec/suffix_drafter.hpp",
+        "bytes": 2557,
+        "sha256": "ab154719dd72b23b9e4e540bc2f923be2bbbbad343b21fcf40116966720f963f"
+      },
+      {
+        "path": "serve/__init__.py",
+        "bytes": 95,
+        "sha256": "7195d862b09ee0c290b6c28d5c1b6e7c5819212328ecbea7cd1422b4a5d4a3d6"
+      },
+      {
+        "path": "serve/chat_golden.json",
+        "bytes": 12284,
+        "sha256": "b9006c519218fcb7e5e38ba603905029f79c5c53431b3c9049466a4b0f3bd96f"
+      },
+      {
+        "path": "serve/chat_template.jinja",
+        "bytes": 9993,
+        "sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+      },
+      {
+        "path": "serve/fixtures/rcall_specimens.json",
+        "bytes": 14663,
+        "sha256": "0100d9d7a6ce543302e5cacd6b7e11a37376900b42bf06bbb4a1d3dff22891ed"
+      },
+      {
+        "path": "serve/frontend.py",
+        "bytes": 48542,
+        "sha256": "2c9dca1d85e67953c29f3279714e1323f73242e18ee004b66cfa3061441aeb5e"
+      },
+      {
+        "path": "serve/mcp.py",
+        "bytes": 31701,
+        "sha256": "659c8e3c7db7d51c939870f843b2350f3efcf2ce8f1ff4b4372db4631e39b77f"
+      },
+      {
+        "path": "serve/mcp_fake_server.py",
+        "bytes": 7426,
+        "sha256": "ecc6afa3b44461e120d6901822a1b0db96bddf59324fefe8faa8f2cad48b7157"
+      },
+      {
+        "path": "serve/responses.py",
+        "bytes": 29280,
+        "sha256": "a5922b576f94b155e821c98c2da5f118b4342ef1144511f7fe26e9891e0caef9"
+      },
+      {
+        "path": "serve/runconfig.py",
+        "bytes": 8536,
+        "sha256": "08c5ee5af5b599d11c25778725613948b8f6b8b74432aa6b645845e6d145bf31"
+      },
+      {
+        "path": "serve/server.py",
+        "bytes": 296295,
+        "sha256": "cfed32b2be52ffde372aebb8a4ab889234a9f4fb3aa4ad17dfdb6f54b833773b"
+      },
+      {
+        "path": "serve/structured.py",
+        "bytes": 8890,
+        "sha256": "c4797c9bccf969d7f8d3a31782c958cc50254dc8ffc018164861030b30458214"
+      },
+      {
+        "path": "serve/telemetry.py",
+        "bytes": 15956,
+        "sha256": "cc0d0aa9f6a31b1c6e51969ec3c15a4bbee62309bc620e8b02fbc1e3fe04ff1f"
+      },
+      {
+        "path": "serve/test_control_cancel.py",
+        "bytes": 1711,
+        "sha256": "bf685446e4aee36483a7e530eaa1b51f751ecaf62fec280832d76692a551cc51"
+      },
+      {
+        "path": "serve/test_detok.py",
+        "bytes": 11038,
+        "sha256": "45ac9f0125d6ddb626b948ca8cc2a1443fc7e3dd0b057915e5b3b77fec52064a"
+      },
+      {
+        "path": "serve/test_fatal_recovery.py",
+        "bytes": 6038,
+        "sha256": "8796f18e9027226a830f85b6fccb4e76c9a2cfb840574cc29c848d57f1cfb06e"
+      },
+      {
+        "path": "serve/test_frontend.py",
+        "bytes": 5254,
+        "sha256": "dbf03c28309004da86d376f9818b45effda8a2e244e3a6455105a4a84cae35a5"
+      },
+      {
+        "path": "serve/test_lifecycle.py",
+        "bytes": 9222,
+        "sha256": "6652d32df39c5a0fd67a0df74e6bf333afd414795b72a779613adc88039fa778"
+      },
+      {
+        "path": "serve/test_mcp.py",
+        "bytes": 22939,
+        "sha256": "4f77c5773c49098228795a79ed2faaa1f543ae6a8581c80f08dd5199a4c27d86"
+      },
+      {
+        "path": "serve/test_monitor.py",
+        "bytes": 13691,
+        "sha256": "c5d8af4b3e1877afd0a8b044688dfc7f58531cbe7081647a924edced2649eb5f"
+      },
+      {
+        "path": "serve/test_parallel.py",
+        "bytes": 21112,
+        "sha256": "3b04f16d705725c396304d924494778143cb10ad53b487d3f7f9d86e1fdf3cf2"
+      },
+      {
+        "path": "serve/test_reasoning_loop_recovery.py",
+        "bytes": 10636,
+        "sha256": "a04d608756e245aebed3072fdae6206e9679c68add0ce921d024be675dcce859"
+      },
+      {
+        "path": "serve/test_reasoning_rescue.py",
+        "bytes": 14111,
+        "sha256": "d91252b93945465bce47bd3602d0c7a4fed36639d7cb5cc08b3153ac535a1d03"
+      },
+      {
+        "path": "serve/test_reasoning_tools.py",
+        "bytes": 7880,
+        "sha256": "da7e9fa1c95542e14fcd12d7cee9ef07c3e31905da4e1d07146fe89248927e08"
+      },
+      {
+        "path": "serve/test_responses.py",
+        "bytes": 25231,
+        "sha256": "28f59fe4e7a4feac7537dfcf885606436286d7573c94df3bf1e71be310239f6e"
+      },
+      {
+        "path": "serve/test_restart_waiters.py",
+        "bytes": 8083,
+        "sha256": "ffea5ebd71ba1d4d23d1c348bf57e96c33580618c266e04e4e315e1817277b98"
+      },
+      {
+        "path": "serve/test_runconfig.py",
+        "bytes": 9111,
+        "sha256": "efa3712dd39d3367d156da606d2155cd2b1a6ec6894dc17b9210a11dde761650"
+      },
+      {
+        "path": "serve/test_security.py",
+        "bytes": 16404,
+        "sha256": "50a1497a3757d220f663112f2c4d1f2a1d6e5731a3b5a5237a0c3652421c673b"
+      },
+      {
+        "path": "serve/test_server.py",
+        "bytes": 217260,
+        "sha256": "cbd34e44318f9168e57f0b15d345d1e9ab907dde2b1bacf9bc9d54fa00134f79"
+      },
+      {
+        "path": "serve/test_slots.py",
+        "bytes": 21983,
+        "sha256": "8f4e1b3e734341611fa70330be54007ecaadff05e763570e77a3496cffbcbe12"
+      },
+      {
+        "path": "serve/test_structured.py",
+        "bytes": 12111,
+        "sha256": "6361f10e7237ffaa9cafaec114650ff23c0480fa09335914ec061ceb03a2ec01"
+      },
+      {
+        "path": "serve/test_vram.py",
+        "bytes": 6192,
+        "sha256": "40967f4970ff017ae43d58bb08c1df795fb71f3cecaea89ab4cb375c5f537ac6"
+      },
+      {
+        "path": "serve/test_winjob.py",
+        "bytes": 3632,
+        "sha256": "069d5e28845b44ee1f1b34c63de6cd68b6d722609726f72a270f51ed7f7ee1a6"
+      },
+      {
+        "path": "serve/web/app.css",
+        "bytes": 13322,
+        "sha256": "5d7add8ecaeb4ef6ad620f466fc79506e88a737327ca6cc3cf9d9de71b74fe40"
+      },
+      {
+        "path": "serve/web/app.js",
+        "bytes": 59326,
+        "sha256": "ac0ba371ba8a6fcf9c03713a867f1d1885a65def85b9601560b9170697c1d80f"
+      },
+      {
+        "path": "serve/web/components.css",
+        "bytes": 10548,
+        "sha256": "e4b4895a62193c27bbe9fd8eb651c93bd9f50bf638e073620d47886b2c2c2f8b"
+      },
+      {
+        "path": "serve/web/fonts/OFL.txt",
+        "bytes": 4389,
+        "sha256": "c676351bf8576b9aba743cd5eaa8c0e7ee0d51f805d720447b4df4ddb6a2e416"
+      },
+      {
+        "path": "serve/web/fonts/outfit-latin-ext-wght.woff2",
+        "bytes": 14808,
+        "sha256": "0f53d1c03b3918d744a843b5039001ee31695ca1e255e3914188df81beb461e9"
+      },
+      {
+        "path": "serve/web/fonts/outfit-latin-wght.woff2",
+        "bytes": 32292,
+        "sha256": "6c18d579fd87c3776be068b762cbc83fde3acb543d49eabd3ade842eb987e887"
+      },
+      {
+        "path": "serve/web/index.html",
+        "bytes": 15295,
+        "sha256": "b3fa0a578f21b6b10edac4c1f6f6fc363354f2b44e37b9c3f426b23baafb27ff"
+      },
+      {
+        "path": "serve/web/monitor.html",
+        "bytes": 9493,
+        "sha256": "1b10b786233bf4121f3dc621b168c354c339cefeb8150d79442eda71be80565f"
+      },
+      {
+        "path": "serve/web/monitor.js",
+        "bytes": 8410,
+        "sha256": "b8dfd3cef3a3cd206bd777186ed7b8cc0b926abfc66cc77f9097f81cb938106c"
+      },
+      {
+        "path": "serve/web/sprite.svg",
+        "bytes": 28544,
+        "sha256": "bbbd3a03a8cdcc8453934508010202bc492505f39aa0f696f51341b260255094"
+      },
+      {
+        "path": "serve/web/tokens.css",
+        "bytes": 3991,
+        "sha256": "73ad21bfdd4145fae697dec37c2909ecec67d610f96cb2267c29a5526ed13256"
+      },
+      {
+        "path": "serve/winjob.py",
+        "bytes": 4939,
+        "sha256": "8fff65cf850e108b84ab06c3fb44a68b947b0f4834ce5880139ada5dfb11a749"
+      },
+      {
+        "path": "src/artifact/dequant.cpp",
+        "bytes": 5732,
+        "sha256": "944edf278c6d9858ed63998976b50d2b7913385d4a832de6d76bd32cd1090f26"
+      },
+      {
+        "path": "src/artifact/gguf_reader.cpp",
+        "bytes": 3605,
+        "sha256": "90e6a1a664645075d4a946a84a498cf05cd9947ab11c4036aee577a3b8632431"
+      },
+      {
+        "path": "src/artifact/gguf_reader_test.cpp",
+        "bytes": 3705,
+        "sha256": "3fe4c7e31303e70b4428a89d25a9a147baceef3abcad792b3a1d0e847d660932"
+      },
+      {
+        "path": "src/core/arch_defaults.cpp",
+        "bytes": 3441,
+        "sha256": "b931498f28897f3816a1beca378f50968ddc193b850cf824727f8342d4927b27"
+      },
+      {
+        "path": "src/core/arch_defaults_test.cpp",
+        "bytes": 2374,
+        "sha256": "db62c9f6ae515cc952251fe9fdf9eb5bebea16503f8b26270a02d7e61567c768"
+      },
+      {
+        "path": "src/core/concurrent_main.cpp",
+        "bytes": 9958,
+        "sha256": "06d919aab9a1687d4bb0b5f9be0c69273b7af5857d81718ff50a2fd351a7c582"
+      },
+      {
+        "path": "src/core/conversation_cache_test.cpp",
+        "bytes": 18405,
+        "sha256": "a0bcfa4fd3c6cc682208f999be06370153a4553022a574d3d604849244c948de"
+      },
+      {
+        "path": "src/core/conversation_checked.hpp",
+        "bytes": 704,
+        "sha256": "8fb6f2734b3b96d3590644133ccd07f09befda6ef2243325ef8ea3f1c6a972ad"
+      },
+      {
+        "path": "src/core/conversation_file.cpp",
+        "bytes": 56551,
+        "sha256": "136afacb6896fdf788ac751da2531ffdb59505edb83e9dc9d3176099e7eeb559"
+      },
+      {
+        "path": "src/core/conversation_file_test.cpp",
+        "bytes": 43378,
+        "sha256": "7ee3204911a424397524ae1f20d4b9ac206c598581dd5c86e86e702aaca5f993"
+      },
+      {
+        "path": "src/core/conversation_memory.cpp",
+        "bytes": 1519,
+        "sha256": "2654582ed22f147a3e83073664d74ff67f3f8a550d58c30654a417e8aa5b2b2a"
+      },
+      {
+        "path": "src/core/conversation_memory_test.cpp",
+        "bytes": 3464,
+        "sha256": "24c8ccc575ecf8290eb14a06a9d8b23de58b2c708c70dd6ecc4fd5ac1591b1bf"
+      },
+      {
+        "path": "src/core/conversation_snapshot.cpp",
+        "bytes": 15845,
+        "sha256": "41c023e09357031eb548b6a6fc066605897079241af1766ff2ffd22961dc8737"
+      },
+      {
+        "path": "src/core/conversation_snapshot_test.cpp",
+        "bytes": 23819,
+        "sha256": "e0cbfd61e581f49e01efaf0208df90244c0e3f29ea30ad8d8be75bdb7439c7ee"
+      },
+      {
+        "path": "src/core/conversation_split_failure_test.cpp",
+        "bytes": 3397,
+        "sha256": "6a214fc27c99fdaf453721d108e20b29300daad7b835b17189fbcaeb3c8f62e7"
+      },
+      {
+        "path": "src/core/conversation_state.cpp",
+        "bytes": 22334,
+        "sha256": "1118b3d783b46acd0e2d49d351cf6d14ba092a125b6ab355deea82f85c27ca0f"
+      },
+      {
+        "path": "src/core/conversation_validation_test.cpp",
+        "bytes": 14930,
+        "sha256": "206a0b2e764cec8211be66bebbedee726b6814d47e990df21f2672ce39b8d9da"
+      },
+      {
+        "path": "src/core/coupled_draft_test.cpp",
+        "bytes": 6467,
+        "sha256": "d5be5618fef9255ff04499723893bc1538d7238166255de62ba7092678ab2a55"
+      },
+      {
+        "path": "src/core/device.cu",
+        "bytes": 15818,
+        "sha256": "3ebcdcdc351aa8d5c80ead514a7d0a3af8c4936305a273d7247ed66717b81e9a"
+      },
+      {
+        "path": "src/core/device_main.cpp",
+        "bytes": 6169,
+        "sha256": "60a66b6b2c05527f5cb59d6c5397370c4740205551d74d04db2202989d7f3584"
+      },
+      {
+        "path": "src/core/expert_cache.cpp",
+        "bytes": 32848,
+        "sha256": "ce70571b427331920efaca7ff7e4a111a4a155fe55f83f56d63e0f80fdae5161"
+      },
+      {
+        "path": "src/core/expert_source.cpp",
+        "bytes": 180915,
+        "sha256": "1887b00ef3567e21fb5181a28059ab3181c6d89ee6a07054fbfe4591d4272d62"
+      },
+      {
+        "path": "src/core/graph.cpp",
+        "bytes": 6576,
+        "sha256": "ac8b1de9372b6755bb5c9be30b83c76fef2f89186b0f7e5316676448f66483c3"
+      },
+      {
+        "path": "src/core/layer.cpp",
+        "bytes": 114032,
+        "sha256": "e17d92b37dfb04bc917df30bbd349550c4ef13fea10d87e1ae5496ccd4f85b68"
+      },
+      {
+        "path": "src/core/layout.cpp",
+        "bytes": 8362,
+        "sha256": "f1e166c91025710fe318c85f7fba27a721291ca2d27ececd797abafa5a5cc7eb"
+      },
+      {
+        "path": "src/core/load_main.cpp",
+        "bytes": 6675,
+        "sha256": "83ea314dd762cf37c7ea9249842bc10613f16e7ba17715ee8b2dadae320fa008"
+      },
+      {
+        "path": "src/core/mtp.cpp",
+        "bytes": 79014,
+        "sha256": "3f214dd53f23565f885f19fecd74cd3bbe4d00f22336b5940a70494396f57648"
+      },
+      {
+        "path": "src/core/native_dense.cpp",
+        "bytes": 20259,
+        "sha256": "6aff8f65e3e65c79fc15b913a0fd6a4ca199769fa58218cdf6e4cfd05f99a520"
+      },
+      {
+        "path": "src/core/native_head.cpp",
+        "bytes": 9931,
+        "sha256": "f0fc2046888bf2a9bb75f6cd7c5c6fba9de8bc6d96200b776e2cca26bd27a89b"
+      },
+      {
+        "path": "src/core/overlap_main.cpp",
+        "bytes": 8737,
+        "sha256": "d48e5d20cf224301da6ff05cfc67fedf6fe40b8c6b17a39e8a191192f03e03c4"
+      },
+      {
+        "path": "src/core/peer_experts.cpp",
+        "bytes": 15503,
+        "sha256": "c82b9764c6b5eb2fe907f3f99e427bbcb0b9168ba50ab626021e85724484f500"
+      },
+      {
+        "path": "src/core/pinned.cu",
+        "bytes": 39455,
+        "sha256": "c95210765d3d2257767b8c679e35fe82179f9afd9ddff80495813ff46810f7a7"
+      },
+      {
+        "path": "src/core/pinned_shared_test.cpp",
+        "bytes": 2096,
+        "sha256": "0dd0cfe5f3e4d48631b5d95b0ce45e4b52d3e1701cddb231986606ef59b3ec02"
+      },
+      {
+        "path": "src/core/remote_expert_opt.cu",
+        "bytes": 8752,
+        "sha256": "6e2212c17f2fdfeb09b780c73dc8faaef6979d27f04b91ba6f6d205705df1aa9"
+      },
+      {
+        "path": "src/core/remote_experts.cpp",
+        "bytes": 17082,
+        "sha256": "02e72fbcca1a6e9151a650dac2c4714f057b78cd60197a65791e7d1f38270ae5"
+      },
+      {
+        "path": "src/core/session.cpp",
+        "bytes": 50607,
+        "sha256": "b1479da93e913a0c944b1c61bb1fd623935cf68d7d02ae9ee1e32d7bb567625f"
+      },
+      {
+        "path": "src/core/verify.cpp",
+        "bytes": 160399,
+        "sha256": "938579652a136f14d4a01dc66da0035fca93863c66a89f01348b9bbf4a30c364"
+      },
+      {
+        "path": "src/core/vmm.cpp",
+        "bytes": 5480,
+        "sha256": "45d2ea73fab11f0beabe73e6c8566e379e51f630b21dd8cbbc0dc19f958b388a"
+      },
+      {
+        "path": "src/core/weights.cpp",
+        "bytes": 22938,
+        "sha256": "4915312246d4ebb21f33e533fedf8337fca09ef5a1b291cd6f26e34cae89f77e"
+      },
+      {
+        "path": "src/kernels/bf16_bits_test.cpp",
+        "bytes": 3644,
+        "sha256": "e26ebb9239946d0416e81cb212ba24618386ed3da15522c8ed1af9995b586d97"
+      },
+      {
+        "path": "src/kernels/bf16_gemv_parity.cpp",
+        "bytes": 7325,
+        "sha256": "a7c6de83f57b333865e5fefb7f790573db6de6d8a88d79c950280f56c2f5e44e"
+      },
+      {
+        "path": "src/kernels/cpu/expert.cpp",
+        "bytes": 34941,
+        "sha256": "9bcf5d889818ef3cb9619df6536e8844d151714803ac8930eada115a61b62e48"
+      },
+      {
+        "path": "src/kernels/cpu/expert_layout.cpp",
+        "bytes": 16941,
+        "sha256": "dee83ec3931f1002a314c93b2a463cf0400e0e089cd3b7931c48f7ee5fc0f43a"
+      },
+      {
+        "path": "src/kernels/cpu/expert_multi_test.cpp",
+        "bytes": 3853,
+        "sha256": "b39500f0d1084f2843cdbba4700a79b608f053a1a8625afd724174300c48fea7"
+      },
+      {
+        "path": "src/kernels/cpu/expert_parity.cpp",
+        "bytes": 8348,
+        "sha256": "75bd21e3e73d294669dd795832cb174eaecee286c75bb813f80af8d52e135031"
+      },
+      {
+        "path": "src/kernels/cpu/iq_avx2.cpp",
+        "bytes": 21307,
+        "sha256": "bbcaeacfdb185527811640254e832bf04da1ce87ca22012603a8898a27cf91bd"
+      },
+      {
+        "path": "src/kernels/cpu/iq_avx2_parity.cpp",
+        "bytes": 26145,
+        "sha256": "fb4e0b0629e749b816c4ec71da836f383330cf93aed49a11d03607937e1232d9"
+      },
+      {
+        "path": "src/kernels/cpu/iq_avx2_rows.inl",
+        "bytes": 16472,
+        "sha256": "94da07f977ef20288d65747604f9c3a7a87cba3237f36d216dbb624bddd9be23"
+      },
+      {
+        "path": "src/kernels/cpu/iq_avx512.cpp",
+        "bytes": 15360,
+        "sha256": "c57d176884fcd34ab730e4684fb560a21aa1ec2a5dde8759a1705c0344658b96"
+      },
+      {
+        "path": "src/kernels/cpu/kq_avx1.cpp",
+        "bytes": 3128,
+        "sha256": "3e7b6c1dcc4b2df972704c0d69da5703cf4adad2aff391a151c336c9ee060640"
+      },
+      {
+        "path": "src/kernels/cpu/kq_avx2.cpp",
+        "bytes": 13259,
+        "sha256": "9bdade163b90b219ab3be746818cb2e6e9bca93813f69e2cb4e8e448b633c4f1"
+      },
+      {
+        "path": "src/kernels/cpu/native_expert.cpp",
+        "bytes": 10355,
+        "sha256": "74ee06c644527081a51c141d4b2bd3fa6ca1006a10eed69e25c3bf92ab1a2c13"
+      },
+      {
+        "path": "src/kernels/cpu/pool.cpp",
+        "bytes": 38852,
+        "sha256": "c91ba11d4ee91adffe07387506e44825ef89839a8112c7802aba2959aedbef54"
+      },
+      {
+        "path": "src/kernels/cpu/pool_affinity_linux.hpp",
+        "bytes": 2549,
+        "sha256": "931848c9fb4a4bdb1ebbe9db47bff05428595231bcca65b66a5b7ec301f7cae0"
+      },
+      {
+        "path": "src/kernels/cpu/pool_affinity_linux_test.cpp",
+        "bytes": 11355,
+        "sha256": "33305144a4d15b4bd74027f42d0a7daee05aeac01053b377fe02f848f90de465"
+      },
+      {
+        "path": "src/kernels/cpu/pool_affinity_test.cpp",
+        "bytes": 7197,
+        "sha256": "579f024bb699958e592225053fe48a355c9a8d6303a2abab528c4742f5c14fa5"
+      },
+      {
+        "path": "src/kernels/cpu/pool_affinity_win.hpp",
+        "bytes": 2796,
+        "sha256": "63a3e8d6346d2887b6e139638ad74ab5ce005be20f6c0d4664c16938a84abe6f"
+      },
+      {
+        "path": "src/kernels/cpu/pool_stress.cpp",
+        "bytes": 4193,
+        "sha256": "21fdb493bc6aab804583c38a3f8befba418becb67243452d61a6fa3b8a32d88b"
+      },
+      {
+        "path": "src/kernels/cpu/pool_test.cpp",
+        "bytes": 10399,
+        "sha256": "d1f225f1b5f5e4ec2805843fc3a49cfc3a53788f15e243c76c63b02f2ed913ef"
+      },
+      {
+        "path": "src/kernels/cpu/q2_avx2.cpp",
+        "bytes": 13767,
+        "sha256": "ce92563c3706433845aaee48488ccac2d817eb69ae1a48d44ea3a3be1c093dec"
+      },
+      {
+        "path": "src/kernels/cpu/q2_avx2_rows.inl",
+        "bytes": 3195,
+        "sha256": "efc28c0975d03c276924dff7f29c26e3b6725c2718604db57e3dbe4250b8b7db"
+      },
+      {
+        "path": "src/kernels/cpu/q2_bitplane_parity.cpp",
+        "bytes": 4906,
+        "sha256": "914670576a4e4e7ad8a349133eaabdca62a9b66547267e580a37fca51bb856e8"
+      },
+      {
+        "path": "src/kernels/cpu/router_dot_parity.cpp",
+        "bytes": 3201,
+        "sha256": "1d14ce8bef7dd769bdd4ada8ba97caad67be28a86651e96b2b8a7bb219f8c19e"
+      },
+      {
+        "path": "src/kernels/cuda/bf16_gemv.cu",
+        "bytes": 7138,
+        "sha256": "1408ce4707d9d03bc3d752773401afbb1170b0cf1fc3b53fb95cab9aff652c53"
+      },
+      {
+        "path": "src/kernels/cuda/cvec.cu",
+        "bytes": 7119,
+        "sha256": "bc81bc52db8c2889756ff63bea6e3312dfa7cc3251a400e63fbbac5084e7335d"
+      },
+      {
+        "path": "src/kernels/cuda/dequant_bf16.cu",
+        "bytes": 13257,
+        "sha256": "cced4c4178dd710e25189e5d2cb56af933362a6d1ac62d8e93d640ac494ac0ab"
+      },
+      {
+        "path": "src/kernels/cuda/dequant_s2.cu",
+        "bytes": 2244,
+        "sha256": "a32870e7c7fb7deab1bb93e36ba15d6679ba3b5b2055ea0ab0b3e88c421d2f63"
+      },
+      {
+        "path": "src/kernels/cuda/elementwise.cu",
+        "bytes": 22275,
+        "sha256": "39b69fed53a204e6805550f9ed57f3ab6d93dc84ef6aff8d9332f9c015e99ed2"
+      },
+      {
+        "path": "src/kernels/cuda/fused_gdn.cu",
+        "bytes": 8343,
+        "sha256": "0b840f8583c28bb16b7e8bd7a77fbb379bc9c5d331f061a5f31f459f97236abc"
+      },
+      {
+        "path": "src/kernels/cuda/fused_gr.cu",
+        "bytes": 96423,
+        "sha256": "53cabb529587d777e56521443336164c168033afab64bdaa4506c65782657dcc"
+      },
+      {
+        "path": "src/kernels/cuda/gdn.cu",
+        "bytes": 11877,
+        "sha256": "0ed432dfd55d3d758fe0661fb7f4bc951bd57cd23adf73c2dfbe323ba1c0bbfd"
+      },
+      {
+        "path": "src/kernels/cuda/gr.cu",
+        "bytes": 27311,
+        "sha256": "452c9b6f1b49130f15eaa84c6470a346604579f973633de453faecff91d32b0c"
+      },
+      {
+        "path": "src/kernels/cuda/iq_kernels.cu",
+        "bytes": 187455,
+        "sha256": "cb1e3d381bc328289437ed5a81d0df4575e65387368ce6e61c67c7b8d97faf85"
+      },
+      {
+        "path": "src/kernels/cuda/kv_q4.cu",
+        "bytes": 12205,
+        "sha256": "e055aebc0316c219d0a005b84824d8991b23107ba264c80c7090dc1c52574427"
+      },
+      {
+        "path": "src/kernels/cuda/kv_q8.cu",
+        "bytes": 8030,
+        "sha256": "52610aee08ddf7597a921f76a02270811d967beb2c5091a089fa0e45281a7b8a"
+      },
+      {
+        "path": "src/kernels/cuda/kv_stream.cu",
+        "bytes": 12980,
+        "sha256": "1e4b9c67666b4f460898429a684f4ce7a3c8fc506538450f99da46adaccd66fc"
+      },
+      {
+        "path": "src/kernels/cuda/native_bf16.cu",
+        "bytes": 18903,
+        "sha256": "7cec51c3e6babe0a9fad3b2d317eddfc64e893223d05c460c8a2495a7f906fde"
+      },
+      {
+        "path": "src/kernels/cuda/native_flash_attn.cu",
+        "bytes": 10153,
+        "sha256": "d848cc229226e499405b50050e6baacd4ca6031087b45983065319c16b06b9bf"
+      },
+      {
+        "path": "src/kernels/cuda/native_gdn.cu",
+        "bytes": 5813,
+        "sha256": "0478b434053e080890ceed248581bbc67f4ce6b92ce29c09706180fd33bd7270"
+      },
+      {
+        "path": "src/kernels/cuda/native_gdn_preprocess.cu",
+        "bytes": 9303,
+        "sha256": "940aa60cd42e77ad7f4b5a6e2fd8177b80016975d2aaf55ed7a620f6437f27c4"
+      },
+      {
+        "path": "src/kernels/cuda/native_gr_norm.cu",
+        "bytes": 4611,
+        "sha256": "15648e96fadfa771cb68f96ef0dfe6aab9c7c4e3b91d0271d2122cd246df80b6"
+      },
+      {
+        "path": "src/kernels/cuda/native_gr_postops.cu",
+        "bytes": 6795,
+        "sha256": "9b30bb62ee11847af7ba030d3249de3924a1e8ec235c17b5f3f490fda93f67d8"
+      },
+      {
+        "path": "src/kernels/cuda/native_mmvq.cu",
+        "bytes": 102319,
+        "sha256": "c482de8c55586edb15bde392281cbd29ead3e9f02289321a58d61172859de556"
+      },
+      {
+        "path": "src/kernels/cuda/native_moe.cu",
+        "bytes": 9581,
+        "sha256": "45940b697cfde1d8032bd42ef206de548756429c0c472a61766837986224cc77"
+      },
+      {
+        "path": "src/kernels/cuda/native_ple_postops.cu",
+        "bytes": 11262,
+        "sha256": "91849f4257d6ee9c85b1dc04cb16397963eac51d725aa31575e63c8f0d0f56f4"
+      },
+      {
+        "path": "src/kernels/cuda/native_qsa.cu",
+        "bytes": 8423,
+        "sha256": "91a21d493e9896b486e106ab53b26a4df9dfebb369880842a1a9add79c7604b4"
+      },
+      {
+        "path": "src/kernels/cuda/native_qsa_indexer.cu",
+        "bytes": 18230,
+        "sha256": "36491c68a69d04f5a73608f89a845488b6770b3b0913dca8fbe653bc06c1fc43"
+      },
+      {
+        "path": "src/kernels/cuda/native_qsa_score.cu",
+        "bytes": 9615,
+        "sha256": "ca180366923d56e77f68cf7ab4999edc8222894af3e4534b010e7e6f8d156e2c"
+      },
+      {
+        "path": "src/kernels/cuda/native_rope.cu",
+        "bytes": 12716,
+        "sha256": "afd49a84a3a4f0dc8cd618329b07b44c2fb59c11212d05919e7ffc6345961768"
+      },
+      {
+        "path": "src/kernels/cuda/native_router.cu",
+        "bytes": 8112,
+        "sha256": "9ae53693e258ccaf352b5ba284421f4ce84672a868daddb46db7feeafacd7b01"
+      },
+      {
+        "path": "src/kernels/cuda/ple.cu",
+        "bytes": 21748,
+        "sha256": "ca887e5837f70ee4198a7a24329daf4f028744d443e898edb53febe7ba016382"
+      },
+      {
+        "path": "src/kernels/cuda/qsa.cu",
+        "bytes": 44124,
+        "sha256": "dc7ff0992355ec744bcdcb919f50cf8925a340438e0c5209ae917177d938295a"
+      },
+      {
+        "path": "src/kernels/cuda/qsa_decode_attn.cu",
+        "bytes": 30711,
+        "sha256": "6455ea5c20e489e87bf761e51f8fc09b96509e67e93b853cec5e1fa4b5d8a249"
+      },
+      {
+        "path": "src/kernels/cuda/qsa_prompt_attn.cu",
+        "bytes": 76340,
+        "sha256": "966a91bb55ff49b5b99eaf8e0fcb98bfab2727887b2fb5bd4a72bd2b68ce421e"
+      },
+      {
+        "path": "src/kernels/cuda/qsa_select.cu",
+        "bytes": 64916,
+        "sha256": "997023ff9c367cc5d43936371c363700313dbbeddb4a17ae0c52391bf7e5146f"
+      },
+      {
+        "path": "src/kernels/cuda/quantize_act.cu",
+        "bytes": 17199,
+        "sha256": "207d0e2ec4b0fca136d03bc6bee10b625fe01683f996eb317af1ca5a5f25eb67"
+      },
+      {
+        "path": "src/kernels/cuda/rope.cu",
+        "bytes": 7070,
+        "sha256": "8b72c00ff58b885e06561f01c3474cd9d9731c0b42abdc635fba7cef84d262ba"
+      },
+      {
+        "path": "src/kernels/cuda/router_top10.cu",
+        "bytes": 24728,
+        "sha256": "4fa8260d101ba1d5c82e9ee1ee6260ca3f8a7d8020493254682dd0e597c5e94a"
+      },
+      {
+        "path": "src/kernels/cuda/s26_tsum.cuh",
+        "bytes": 3159,
+        "sha256": "9d48c241a67096c4d57d10e0a0e7f8f20197ac91754c32889527c0550ce0a695"
+      },
+      {
+        "path": "src/kernels/cuda/s2_expert_grouped.cu",
+        "bytes": 66657,
+        "sha256": "63a9920708746ed2511a28a6a356ee48a49f75c4d2c77f35b824771a1f57d7b7"
+      },
+      {
+        "path": "src/kernels/cuda/s2_gemv.cu",
+        "bytes": 2337,
+        "sha256": "4d21a4e14e166b02652719c095b25fa7f346c3d0b3dd1009e050e793b2167b9b"
+      },
+      {
+        "path": "src/kernels/cuda/s2_gemv_fast.cu",
+        "bytes": 7297,
+        "sha256": "ff3ab5c5b0da5b25aa73f7da3a86894c93960efef3b8c71463d501c1e8adaafe"
+      },
+      {
+        "path": "src/kernels/cuda/s2_gemv_q8.cu",
+        "bytes": 4735,
+        "sha256": "c5123b1a7373acad6e62c701bac3ed04f90c1ed5702104008892125de052733d"
+      },
+      {
+        "path": "src/kernels/cuda/s2_gemv_quads.cu",
+        "bytes": 4712,
+        "sha256": "3633ad7b7006fdfc96e7b1aa06733168e2292a5b700c49ece60e121c3db4280c"
+      },
+      {
+        "path": "src/kernels/cuda/s_gemv.cu",
+        "bytes": 40810,
+        "sha256": "46c946cff34b50f252a5d4a6b2f99e0d30b78a6ad741919417566ccb43017e40"
+      },
+      {
+        "path": "src/kernels/cuda/sampler.cu",
+        "bytes": 58609,
+        "sha256": "0804c1e735be50dde1b99816553a8ec3c70f48cf0f9cade447d7080a9f048530"
+      },
+      {
+        "path": "src/kernels/cuda/shared_expert.cu",
+        "bytes": 23020,
+        "sha256": "da071b470c5caa2e00d838d3d3dc9ebf0e2080bc4a02bd103fb1340e6e8da25f"
+      },
+      {
+        "path": "src/kernels/cuda/verify_kernels.cu",
+        "bytes": 58124,
+        "sha256": "1f7a650452510af9892b9636534c8086fd80578ddee1733022e926f3285ae15c"
+      },
+      {
+        "path": "src/kernels/cvec_parity.cpp",
+        "bytes": 9581,
+        "sha256": "cadfaa08778a4db2254e714940b3cbc23e08c3b366f02c4b07a0d756717ce8e7"
+      },
+      {
+        "path": "src/kernels/decode_cluster_parity.cpp",
+        "bytes": 20624,
+        "sha256": "89957dbd82f2921663da5e97cb6051bc298661d18600098e2f088aaf8e915d95"
+      },
+      {
+        "path": "src/kernels/dequant_bf16_test.cpp",
+        "bytes": 4838,
+        "sha256": "65d9c5fad2d3e887020917aeeabe741593a2678b96b9ba49ac6071097d24273f"
+      },
+      {
+        "path": "src/kernels/dequant_s2_parity.cpp",
+        "bytes": 6745,
+        "sha256": "456935d009abf36b7d8ff3f620094ea281210e077f234b5ceba74d3634d84679"
+      },
+      {
+        "path": "src/kernels/elementwise_parity.cpp",
+        "bytes": 27090,
+        "sha256": "4e8a5efb2cade6675d8d0687e63bdc1edc1b712914834a65870e00571a571098"
+      },
+      {
+        "path": "src/kernels/fused_gr_bench.cpp",
+        "bytes": 5965,
+        "sha256": "c373745539620cd6682af5f309235b520d74444e9405e2457b2d3d46bf011588"
+      },
+      {
+        "path": "src/kernels/gdn_parity.cpp",
+        "bytes": 30140,
+        "sha256": "ff09f13f08acebcfc2bc7746d6f231444e60f4a65f7bceae34eda60216c6cff8"
+      },
+      {
+        "path": "src/kernels/gr_multi_parity.cpp",
+        "bytes": 6433,
+        "sha256": "96327cad5f493dbd5a1c7cf20892fafa2bae2cbc3e506bd3b14fef2be26c01c8"
+      },
+      {
+        "path": "src/kernels/gr_parity.cpp",
+        "bytes": 47591,
+        "sha256": "2df8544e464257b3bd8ebdad906544f0d8c7016bdc0b9abd8bd1a3c5c966d494"
+      },
+      {
+        "path": "src/kernels/iq_multi_parity.cpp",
+        "bytes": 21079,
+        "sha256": "df320364c11b04fc4e952b98eaac0fad712e2a0515c4bae89e125ce1af36f976"
+      },
+      {
+        "path": "src/kernels/iq_parity.cpp",
+        "bytes": 6507,
+        "sha256": "21bba170ff91d80d5b0f1db877af96d4c57e3b70957eb7fae27e238a39851b8a"
+      },
+      {
+        "path": "src/kernels/kv_hybrid_parity.cpp",
+        "bytes": 19463,
+        "sha256": "f315eedf6ce80ce12d9862644dee92d0bb99253e5eb2e744715627c689b3d7f3"
+      },
+      {
+        "path": "src/kernels/kv_q4_parity.cpp",
+        "bytes": 14276,
+        "sha256": "2b5dece46df2c1448735ac78e5f81c7fa1108b9d4827f5ec75190b504681af63"
+      },
+      {
+        "path": "src/kernels/kv_q8_parity.cpp",
+        "bytes": 8622,
+        "sha256": "acb2310d93f60f5638941e350d1dd29b860c9575202bf264dc03c37efe95c04f"
+      },
+      {
+        "path": "src/kernels/kv_steps_parity.cpp",
+        "bytes": 7258,
+        "sha256": "726597d93f053470f6d72340b70a52c802f109e74eb4e3393b69fe5bcb19ab2a"
+      },
+      {
+        "path": "src/kernels/kv_stream_parity.cpp",
+        "bytes": 14108,
+        "sha256": "e0ada4be116973ba7a165fa081df0be9c13f9ffa6865540913218bbe5c35ea11"
+      },
+      {
+        "path": "src/kernels/mmvq_multi_parity.cpp",
+        "bytes": 13227,
+        "sha256": "012120687ed2970c7f6be152477ee279aa4240663a08bcdc5e076998e3021b8a"
+      },
+      {
+        "path": "src/kernels/native_expert_bench.cpp",
+        "bytes": 8493,
+        "sha256": "17f5205fa82ba205b97db7bd82419b61e319561f7c3bc4fe271d88dd99094747"
+      },
+      {
+        "path": "src/kernels/native_expert_parity.cpp",
+        "bytes": 34145,
+        "sha256": "55cc087df065b93b3f7ecfd13107bf62910fe879bc4f0c640afa3e412a6ce790"
+      },
+      {
+        "path": "src/kernels/native_grouped_parity.cpp",
+        "bytes": 16855,
+        "sha256": "385205179bc18df17be942fa78bc365d8171df617c18b5f28aa615345c31b905"
+      },
+      {
+        "path": "src/kernels/native_multi_parity.cpp",
+        "bytes": 7280,
+        "sha256": "482274f66a6ac73381168cb79521e1808d598e5d249c59219456b506bb1bc17b"
+      },
+      {
+        "path": "src/kernels/ngram.cpp",
+        "bytes": 28626,
+        "sha256": "a457b8b5d90668ec1bdb87301915029ea1f3c075c99c7afc7ef1d4dbd8e6c460"
+      },
+      {
+        "path": "src/kernels/ple_fp8_parity.cpp",
+        "bytes": 4406,
+        "sha256": "cc9f2003628c6169a38464d2e65b28237311d92fa92f6b4fdbb8984d775a168e"
+      },
+      {
+        "path": "src/kernels/ple_oracle_vectors.inc",
+        "bytes": 7639,
+        "sha256": "81db49806af4a3c8d333cb00ad0353a322b61f34f62e96a1eaffe4b782611fd3"
+      },
+      {
+        "path": "src/kernels/ple_parity.cpp",
+        "bytes": 71244,
+        "sha256": "418dcaff1185bde55cf693c69f35a58727724fb39f99aa9f746ea1f2a13a4531"
+      },
+      {
+        "path": "src/kernels/ple_q5_parity.cpp",
+        "bytes": 3542,
+        "sha256": "8f8540c618dfefd05bf5b8e62dd98970d4c69b222c9725234f611e6051f2b869"
+      },
+      {
+        "path": "src/kernels/q5_projection_parity.cpp",
+        "bytes": 2838,
+        "sha256": "efc674248722919c1c2daafeaee07cc6fe104955a7b8fe58106d6e94dba202dd"
+      },
+      {
+        "path": "src/kernels/qsa_oracle_vectors.inc",
+        "bytes": 10414,
+        "sha256": "214122dd83b2b36d8945848e5d3ebd74eae5238d82ce769110881aa2775406c3"
+      },
+      {
+        "path": "src/kernels/qsa_parity.cpp",
+        "bytes": 91805,
+        "sha256": "f01051eda54857dc88a3c1aff29434b1ec0eae2811066c8b2f2d7e18489dc3ef"
+      },
+      {
+        "path": "src/kernels/qsa_prompt_attn_parity.cpp",
+        "bytes": 17652,
+        "sha256": "63d0179f96822a24b6ece7b02eac8aa3a3b673e9c30263da4b20dc47e9ee445c"
+      },
+      {
+        "path": "src/kernels/qsa_select_bench.cpp",
+        "bytes": 10011,
+        "sha256": "e905c67c69ee11d2af906ba6c229462b767da6b2b5b2edaad3d8099c1155a715"
+      },
+      {
+        "path": "src/kernels/qsa_topk_active_parity.cpp",
+        "bytes": 4502,
+        "sha256": "ad514dfaf2d773b89f25f7b209615e26c81c4c5e42d4f6472488eca231eda2d3"
+      },
+      {
+        "path": "src/kernels/qsa_topk_parity.cpp",
+        "bytes": 7828,
+        "sha256": "1223d0091cea64efbd5301e3cba5d22c665893094d18edff01f62b279150221a"
+      },
+      {
+        "path": "src/kernels/quantize_act_parity.cpp",
+        "bytes": 21905,
+        "sha256": "435da59b51f4279e1b479fffb5e705245390295639618b533311f9372a709ea8"
+      },
+      {
+        "path": "src/kernels/resident_plan_parity.cpp",
+        "bytes": 7523,
+        "sha256": "c95791c38c80e3416eff60292323327d5a4936b52d3600acc6ccb504cb076a3e"
+      },
+      {
+        "path": "src/kernels/rope_parity.cpp",
+        "bytes": 32970,
+        "sha256": "e1faa8d016de4487e15f1e9acd84d6d7aa071ee912060847a4de05c3c9f9df7c"
+      },
+      {
+        "path": "src/kernels/route_window_parity.cpp",
+        "bytes": 4347,
+        "sha256": "ad6057c9632cb66606b46f07fcdf5c247e03c88f7a7664b0d050d4b08842dc5d"
+      },
+      {
+        "path": "src/kernels/router_top10_parity.cpp",
+        "bytes": 7718,
+        "sha256": "987983c10f5035d919d26853f068ea45007296c5a3fe22df2c0bc3a694b086d9"
+      },
+      {
+        "path": "src/kernels/s2_expert_grouped_parity.cpp",
+        "bytes": 32314,
+        "sha256": "2a83a46766172baa4690fc2310a09fe6575ac1faf45d18fdf0ecb039dbdbbc55"
+      },
+      {
+        "path": "src/kernels/s2_gemv_parity.cpp",
+        "bytes": 8202,
+        "sha256": "3b7f7f5b1fdbcb24962ceb4cfc659e8660a002f538bc181fb2f791560a2fcacc"
+      },
+      {
+        "path": "src/kernels/s2_gemv_q8_parity.cpp",
+        "bytes": 9042,
+        "sha256": "33b0372c74e09a429987d154130394db47e203bca15a6d9a4fbd4f9821e02935"
+      },
+      {
+        "path": "src/kernels/s_gemv_parity.cpp",
+        "bytes": 34518,
+        "sha256": "e936521ff789e93ef7052594f41e90eb8af165394ef3a8f170aa8e0fdad876ba"
+      },
+      {
+        "path": "src/kernels/s_gemv_q8k_parity.cpp",
+        "bytes": 17733,
+        "sha256": "da527cedd708f376a2fed8ecd62859fa5e462dd853f1fab72e39a15cc07de566"
+      },
+      {
+        "path": "src/kernels/sampler_parity.cpp",
+        "bytes": 71187,
+        "sha256": "fdda0b8d83761b0272f3511a0c6ee81106b6cbd184406e95c8ba382087df2331"
+      },
+      {
+        "path": "src/kernels/shared_expert_parity.cpp",
+        "bytes": 29261,
+        "sha256": "fc6ed4bbcf0ad9902298e748aa3c580ebd63ee5d518d525b5ea55aed1d8a3b0e"
+      },
+      {
+        "path": "src/kernels/verify_parity.cpp",
+        "bytes": 5333,
+        "sha256": "22a29523ed932dbdb6b0c536444ba56f7a664e9415ef8ddbb9e0e4095a800f6b"
+      },
+      {
+        "path": "src/ngram/ple_reader.cpp",
+        "bytes": 21322,
+        "sha256": "ddec6dbcc8afd8186c724403d5aaa54b70b9fbd551fea733ce422974131ede9e"
+      },
+      {
+        "path": "src/ngram/ple_reader_test.cpp",
+        "bytes": 25809,
+        "sha256": "2f5d2fe5243888220546b7db821604b1717c8a027326c6e67087a5e6457b901d"
+      },
+      {
+        "path": "src/plan/plan_main.cpp",
+        "bytes": 3406,
+        "sha256": "8687284d95632f2908af9b9ff6680448d3e48726cecfa17211339cde36ce094a"
+      },
+      {
+        "path": "src/platform/direct_file.cpp",
+        "bytes": 12461,
+        "sha256": "be3fa0296a934b797744e365b9848fcfa6d3a48f8304defbcb30298c7140465b"
+      },
+      {
+        "path": "src/platform/memory.cpp",
+        "bytes": 6686,
+        "sha256": "83d5ee07206e13247c30513127cd69e0102df2870a700aef87e36eb28892e30b"
+      },
+      {
+        "path": "src/platform/memory_test.cpp",
+        "bytes": 3260,
+        "sha256": "61c97fc02e353f5f070918708bb7b03a1988f65c0fd5a4024ddd5e0797f0dbcc"
+      },
+      {
+        "path": "src/prefill/buffer_layout.hpp",
+        "bytes": 1556,
+        "sha256": "fa9f07b73a37b78485070501967636a811f975dea7b11d01e93fd73db56d8f16"
+      },
+      {
+        "path": "src/prefill/gdn_rec_parity.cu",
+        "bytes": 45732,
+        "sha256": "95d482c4d73bbd8caaac7131e55352933f3902d709ae633828c345b15a4a58d0"
+      },
+      {
+        "path": "src/prefill/gemm.cu",
+        "bytes": 40825,
+        "sha256": "ff771ebd98d96b4009b8ab677cd344e8119e5afa950a7d9f548313baae0bc6b7"
+      },
+      {
+        "path": "src/prefill/gemm_bf16_parity.cu",
+        "bytes": 7338,
+        "sha256": "6000971002b62f82786e8ef9e259c4bd98c7b39dc51273638453fcd6df999213"
+      },
+      {
+        "path": "src/prefill/ggml_cuda_host.cu",
+        "bytes": 5874,
+        "sha256": "6ea66ed71f8ea15c6f7bada00f8aef2b603c29bd2686ceecbc69c2bbf15dd630"
+      },
+      {
+        "path": "src/prefill/hipblaslt_tuning.hpp",
+        "bytes": 5498,
+        "sha256": "929ddb10da613a526652af7ca000775576d424caec729ebc294ebed2891518de"
+      },
+      {
+        "path": "src/prefill/kernels.cu",
+        "bytes": 94642,
+        "sha256": "8a1510fdb614ca941a1cb16abfe863b160aae8c373af684e99936275ddd2d31c"
+      },
+      {
+        "path": "src/prefill/mmq_resident_sort.hpp",
+        "bytes": 2606,
+        "sha256": "a9f3302e6fffba281134a4a1d101f671da9fe4e834c4bc2a22f6928b41bacc29"
+      },
+      {
+        "path": "src/prefill/moe_fused.cu",
+        "bytes": 36746,
+        "sha256": "08f0a5a410f6e130a3fd740e2350cb0d729141be9189a5b0eeb719d957ad9ddc"
+      },
+      {
+        "path": "src/prefill/moe_fused_iq.cu",
+        "bytes": 60118,
+        "sha256": "07bb482fe3a77bc7987dfd6aac84aa561a9e15e6963d491b4ec6c025eda1c9b7"
+      },
+      {
+        "path": "src/prefill/moe_mmq.cu",
+        "bytes": 13958,
+        "sha256": "25f63ea27cbb9c186044f55939b5d4238a7a48b9820226808afb1d61aa47ef20"
+      },
+      {
+        "path": "src/prefill/prefill.cpp",
+        "bytes": 219031,
+        "sha256": "03e60582618e631f875038d7b0f28a5b5d65999e84f23298c4ed303b4e06b24c"
+      },
+      {
+        "path": "src/prefill/wmma_gemm.cu",
+        "bytes": 37370,
+        "sha256": "5e5f2266d652971a0d0cb294b4731a8b198e6949c9c0781f89d95b0d51970672"
+      },
+      {
+        "path": "src/prefill/wmma_gemm.h",
+        "bytes": 3556,
+        "sha256": "57bd2a9caf6e179b837680b908d830d3c28c2bcab82c6f3b7d7c71f7e7cad0de"
+      },
+      {
+        "path": "src/program/conv_cache_test.cpp",
+        "bytes": 4122,
+        "sha256": "cc4f1115f93c0ed503abb7a373c3c423317ab05ae41df1d70988d52803f9aece"
+      },
+      {
+        "path": "src/program/generate.cpp",
+        "bytes": 740205,
+        "sha256": "cf7b008d8ccb5b8b62a7a6d347778c9bd257a870820ff934770b6eaf47c17697"
+      },
+      {
+        "path": "src/program/message_boundary_test.cpp",
+        "bytes": 1455,
+        "sha256": "0ea5a682eb01ad3f6407617897b428eb8bc1111ba6cd04b2f8fc6b7995799951"
+      },
+      {
+        "path": "src/spec/controller.cpp",
+        "bytes": 3479,
+        "sha256": "9ea393b4d369ddce11315032695899a51deeb697e1a7745dc397724f4db7351f"
+      },
+      {
+        "path": "src/spec/controller_test.cpp",
+        "bytes": 3947,
+        "sha256": "8c7674086900898bb67afced50e76812b5e6848f490c95526397497475a1d7b4"
+      },
+      {
+        "path": "src/spec/draft_policy.cpp",
+        "bytes": 6199,
+        "sha256": "815e3d141418791d58064e129960958f5d5a005acbc3a4475d8500a07730e25e"
+      },
+      {
+        "path": "src/spec/draft_policy_test.cpp",
+        "bytes": 4390,
+        "sha256": "bc61c48e38e72a89203bdba71fafff7d0dbf49badbe372a08e5e2d392dbd4937"
+      },
+      {
+        "path": "src/spec/draft_source.cpp",
+        "bytes": 1155,
+        "sha256": "ed2669b4dccf7a1686af56776520b237a50d6244e543078c916c19a6a4660474"
+      },
+      {
+        "path": "src/spec/suffix_drafter.cpp",
+        "bytes": 3512,
+        "sha256": "aeee3eb16627642e9e07c9765fd4946938b5c764f51304500403908d75e67325"
+      },
+      {
+        "path": "src/spec/suffix_drafter_test.cpp",
+        "bytes": 7490,
+        "sha256": "f3bcb731e7afae5350e849116d115def713507e5d1e636f90b35966ed59fe9ae"
+      }
+    ]
+  },
+  "build_metadata": {
+    "path": "C:\\Users\\Joes\\Tools\\Strata\\engine\\BUILD-unsloth-compact.json",
+    "bytes": 352,
+    "sha256": "1cbc29f4cacff03d8932992a31c2c13d831f873a88f092783da09d7ed1468d3a"
+  },
+  "effective_settings": {
+    "model_name": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "args": [
+      "--pack",
+      "C:\\Users\\Joes\\Tools\\Strata\\packs\\unsloth-ud-q2_k_xl",
+      "--native",
+      "C:\\Users\\Joes\\.cache\\huggingface\\hub\\models--unsloth--Qwen3.8-Flash-Next-GGUF\\snapshots\\766911a6b7369840a91dbcd95f9f997acaab6cd6\\UD-Q2_K_XL\\Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+      "--expert-profile",
+      "C:\\Users\\Joes\\Tools\\Strata\\data\\expert-profile.bin",
+      "--expert-cache",
+      "auto",
+      "--max-context",
+      "131072",
+      "--kv",
+      "int8",
+      "--spec",
+      "2",
+      "--suffix-draft",
+      "0",
+      "--lookup-chain",
+      "0",
+      "--resident-budget-gib",
+      "12",
+      "--prefill",
+      "auto",
+      "--vram-reserve-mib",
+      "1024",
+      "--kv-resident",
+      "32768"
+    ],
+    "env": {
+      "STRATA_RESIDENT_HEADROOM_GIB": "4",
+      "STRATA_FILE_CACHE_MIB": "16384",
+      "STRATA_FILE_CACHE_COMPACT": "1"
+    },
+    "fit_max_tokens": true,
+    "open_browser": false,
+    "expert_profile_save": null,
+    "expert_profile_save_every": null
+  },
+  "health": {
+    "status": "ok",
+    "max_context": 131072,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "images": false,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "engine": {
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "max_context": 131072,
+    "images": false,
+    "version": "0.1.40",
+    "context": 131072,
+    "kv": "int8",
+    "kv_resident": 32768,
+    "expert_slots": 5272,
+    "expert_cache_mib": 9428,
+    "expert_slots_primary": 5272,
+    "expert_cache_primary_mib": 9428,
+    "spec": 2,
+    "mtp_max": 0,
+    "lookup": 0,
+    "vram_free_mib": 761,
+    "cvec": 0,
+    "arena_mib": 12287,
+    "pool_workers": 7,
+    "pcie_frac": "0.55",
+    "spec_min_p": "0.00",
+    "conversation_cache_mib": 0,
+    "conversation_cache_slots": 4,
+    "conversation_cache_min_free_mib": 2560,
+    "tail_role_token": -1,
+    "vram_elastic": 0,
+    "engine": "0.1.40"
+  },
+  "memory": {
+    "samples": 237,
+    "min_available_gib": 2.5728759765625,
+    "max_pagefile_used_gib": 0.4198417654260993,
+    "pagefile_available": true,
+    "pagefile_unavailable_reason": null,
+    "stop_reason": null
+  },
+  "authentication": [
+    {
+      "credentials": "missing",
+      "status": 401,
+      "passed": true
+    },
+    {
+      "credentials": "wrong",
+      "status": 401,
+      "passed": true
+    }
+  ],
+  "warmup": {
+    "id": "chatcmpl-02ef0133153e44619a713c3d",
+    "object": "chat.completion",
+    "created": 1791603402,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "A database transaction groups a series of database operations into a single logical unit of work that is treated as a whole. It ensures data integrity by guaranteeing that either all operations within the transaction are completed successfully (committed) or, if any part fails, none of the changes are applied (rolled back). This mechanism maintains consistency"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 24,
+      "completion_tokens": 64,
+      "total_tokens": 88,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 24,
+      "prompt_ms": 4152.4,
+      "prompt_per_token_ms": 173.017,
+      "prompt_per_second": 5.8,
+      "predicted_n": 64,
+      "predicted_ms": 4258.6,
+      "predicted_per_token_ms": 66.541,
+      "predicted_per_second": 15.0,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 8.413
+  },
+  "summary": {
+    "completion_tokens": 960,
+    "predicted_ms": 48160.6,
+    "tokens_per_second": 19.933306478739883,
+    "prompt_ms": 20617.0,
+    "prompt_tokens": 262
+  },
+  "held_out": [
+    {
+      "case": "python-aliasing",
+      "expected": [
+        [
+          0,
+          7
+        ],
+        [
+          0,
+          7
+        ],
+        [
+          0,
+          7
+        ]
+      ],
+      "passed": false,
+      "response": {
+        "id": "chatcmpl-05eed7ed64f645d08d32d7e6",
+        "object": "chat.completion",
+        "created": 1791603479,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "To trace the execution of the provided Python code and explain the behavior, we must understand how Python handles object references and list multiplication.\n\n### Step-by-Step Trace\n\n1.  **`rows = [[0]] * 3`**\n    *   First, the inner list `[0]` is created. Let's call this object `List_A`.\n    *   The `*` operator on a list creates a new list containing references to the elements of the original list. It does **not** create deep copies of the elements.\n    *   Therefore, `[[0]] * 3` creates a new outer list containing three references to the **same** `List_A` object.\n    *   Memory representation:\n        ```\n        rows -> ["
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 55,
+          "completion_tokens": 160,
+          "total_tokens": 215,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 55,
+          "prompt_ms": 6484.8,
+          "prompt_per_token_ms": 117.905,
+          "prompt_per_second": 8.5,
+          "predicted_n": 160,
+          "predicted_ms": 39094.3,
+          "predicted_per_token_ms": 244.339,
+          "predicted_per_second": 4.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 45.603
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603479.6850991,
+        "duration_s": 45.6,
+        "finish": "length",
+        "prompt_tokens": 55,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 55,
+        "prompt_read": 55,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 6484.8,
+        "decode_ms": 39094.3,
+        "decode_tok_s": 4.1,
+        "hit_rate": 0.818,
+        "pcie_share": 0.048,
+        "ram_blobs": 11178,
+        "file_blobs": 8275,
+        "file_mb": 3719.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "case": "python-generator",
+      "expected": [
+        4,
+        18,
+        12
+      ],
+      "passed": false,
+      "response": {
+        "id": "chatcmpl-6d7c48c5da984472935b0df7",
+        "object": "chat.completion",
+        "created": 1791603525,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "The code prints `[4, 18, 12]`.\n\n**Explanation of Evaluation Order:**\n\n1.  **Initialization**: `values` is initialized as `[2, 4, 6]`.\n2.  **Generator Creation**: `stream = (x * 2 for x in values)` creates a generator object. Crucially, generators are **lazy**. The expression `x * 2` is not evaluated immediately. The generator holds a reference to the `values` list and an internal iterator state, but it does not yet iterate through the list or compute any values.\n3.  **Mutation**: `values[1] = 9` modifies the original list. The list `values` is now `[2, 9, 6]"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 73,
+          "completion_tokens": 160,
+          "total_tokens": 233,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 73,
+          "prompt_ms": 26017.9,
+          "prompt_per_token_ms": 356.41,
+          "prompt_per_second": 2.8,
+          "predicted_n": 160,
+          "predicted_ms": 10841.5,
+          "predicted_per_token_ms": 67.759,
+          "predicted_per_second": 14.8,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 36.882
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603525.3180192,
+        "duration_s": 36.9,
+        "finish": "length",
+        "prompt_tokens": 73,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 73,
+        "prompt_read": 73,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 26017.9,
+        "decode_ms": 10841.5,
+        "decode_tok_s": 14.8,
+        "hit_rate": 0.81,
+        "pcie_share": 0.045,
+        "ram_blobs": 10485,
+        "file_blobs": 9165,
+        "file_mb": 5020.2,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "case": "dependency-schedule",
+      "expected": 9,
+      "passed": false,
+      "response": {
+        "id": "chatcmpl-51854916e7184312941b3f6a",
+        "object": "chat.completion",
+        "created": 1791603562,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "To determine the earliest finish time for all jobs, we must schedule the four jobs (A, B, C, D) onto two identical workers while respecting the given dependencies and processing times.\n\n**1. Analyze Job Constraints and Durations:**\n*   **Worker Capacity:** 2 workers available at any time.\n*   **Job A:** Duration = 3 minutes. Dependencies: None.\n*   **Job B:** Duration = 5 minutes. Dependencies: None.\n*   **Job C:** Duration = 4 minutes. Dependencies: Must wait for A to finish.\n*   **Job D:** Duration = 2 minutes. Dependencies: Must wait for both B and C to finish.\n\n**2. Step-by-Step Scheduling:**\n\n*  "
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 90,
+          "completion_tokens": 160,
+          "total_tokens": 250,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 90,
+          "prompt_ms": 10998.9,
+          "prompt_per_token_ms": 122.21,
+          "prompt_per_second": 8.2,
+          "predicted_n": 160,
+          "predicted_ms": 12215.0,
+          "predicted_per_token_ms": 76.344,
+          "predicted_per_second": 13.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 23.216
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603562.209002,
+        "duration_s": 23.2,
+        "finish": "length",
+        "prompt_tokens": 90,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 90,
+        "prompt_read": 90,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 10998.9,
+        "decode_ms": 12215.0,
+        "decode_tok_s": 13.1,
+        "hit_rate": 0.774,
+        "pcie_share": 0.052,
+        "ram_blobs": 11506,
+        "file_blobs": 11480,
+        "file_mb": 5834.1,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "case": "interval-union",
+      "expected": 20,
+      "passed": false,
+      "response": {
+        "id": "chatcmpl-116220b6283f4b3db5601657",
+        "object": "chat.completion",
+        "created": 1791603585,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "To determine the final integer count, we need to find the number of unique integers that appear in at least one of the given inclusive ranges. This is equivalent to finding the size of the union of these sets.\n\nThe ranges are:\n1.  $A = [3, 11]$\n2.  $B = [8, 16]$\n3.  $C = [20, 23]$\n4.  $D = [22, 25]$\n\n### Step 1: Analyze Overlapping Ranges\n\nOverlapping ranges affect the count by ensuring that integers appearing in multiple ranges are only counted **once**. If we simply added the lengths of all ranges, we would double-count the integers in the intersections. To avoid"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 74,
+          "completion_tokens": 160,
+          "total_tokens": 234,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 74,
+          "prompt_ms": 9601.3,
+          "prompt_per_token_ms": 129.747,
+          "prompt_per_second": 7.7,
+          "predicted_n": 160,
+          "predicted_ms": 13124.1,
+          "predicted_per_token_ms": 82.026,
+          "predicted_per_second": 12.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 22.742
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791603585.4908497,
+        "duration_s": 22.7,
+        "finish": "length",
+        "prompt_tokens": 74,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 74,
+        "prompt_read": 74,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 9601.3,
+        "decode_ms": 13124.1,
+        "decode_tok_s": 12.2,
+        "hit_rate": 0.788,
+        "pcie_share": 0.05,
+        "ram_blobs": 11149,
+        "file_blobs": 10915,
+        "file_mb": 6378.6,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    }
+  ],
+  "held_out_summary": {
+    "completion_tokens": 640,
+    "predicted_ms": 75274.90000000001,
+    "tokens_per_second": 8.502170046057849,
+    "prompt_ms": 53102.9,
+    "prompt_tokens": 292
+  },
+  "held_out_passed": false,
+  "error_type": "RuntimeError",
+  "error": "Held-out validation failed; inspect saved answers and assertions."
+}

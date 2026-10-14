@@ -1,0 +1,13 @@
+{
+  "sample_interval_s": 10,
+  "samples": 130,
+  "duration_s": 1290.051,
+  "minimum_available_ram_gib": 6.646022796630859,
+  "maximum_commit_gib": 42.442893981933594,
+  "commit_limit_gib": 54.88027572631836,
+  "maximum_pagefile_used_gib": 0.1060333251953125,
+  "maximum_engine_private_commit_gib": 28.62716293334961,
+  "maximum_engine_working_set_gib": 11.446067810058594,
+  "engine_read_gib_during_monitoring": 585.7144130924717,
+  "engine_read_gib_total": 606.1075203204527
+}

@@ -1,0 +1,130 @@
+[
+  {
+    "test": "stream-exact-echo",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "cedar-spark-173"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 26,
+      "completion_tokens": 9,
+      "total_tokens": 35,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 26,
+      "prompt_ms": 5735.1,
+      "prompt_per_token_ms": 220.581,
+      "prompt_per_second": 4.5,
+      "predicted_n": 9,
+      "predicted_ms": 2486.8,
+      "predicted_per_token_ms": 276.311,
+      "predicted_per_second": 3.6,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 8.234,
+    "first_token_s": 5.856806800002232
+  },
+  {
+    "test": "arithmetic",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "391"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 28,
+      "completion_tokens": 4,
+      "total_tokens": 32,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 28,
+      "prompt_ms": 5287.1,
+      "prompt_per_token_ms": 188.825,
+      "prompt_per_second": 5.3,
+      "predicted_n": 4,
+      "predicted_ms": 939.8,
+      "predicted_per_token_ms": 234.95,
+      "predicted_per_second": 4.3,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 6.229,
+    "first_token_s": null
+  },
+  {
+    "test": "conversation-history",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "maple-ridge-826"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 56,
+      "completion_tokens": 9,
+      "total_tokens": 65,
+      "prompt_tokens_details": {
+        "cached_tokens": 28
+      }
+    },
+    "timings": {
+      "cache_n": 28,
+      "prompt_n": 28,
+      "prompt_ms": 2885.3,
+      "prompt_per_token_ms": 103.046,
+      "prompt_per_second": 9.7,
+      "predicted_n": 9,
+      "predicted_ms": 1979.2,
+      "predicted_per_token_ms": 219.911,
+      "predicted_per_second": 4.5,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 4.876,
+    "first_token_s": null
+  },
+  {
+    "test": "python-function",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "```python\ndef unique_in_order(items):\n    seen = set()\n    result = []\n    for item in items:\n        if item not in seen:\n            seen.add(item)\n            result.append(item)\n    return result\n```"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 54,
+      "total_tokens": 94,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 40,
+      "prompt_ms": 5771.9,
+      "prompt_per_token_ms": 144.297,
+      "prompt_per_second": 6.9,
+      "predicted_n": 54,
+      "predicted_ms": 30428.6,
+      "predicted_per_token_ms": 563.493,
+      "predicted_per_second": 1.8,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 36.216,
+    "first_token_s": null
+  }
+]

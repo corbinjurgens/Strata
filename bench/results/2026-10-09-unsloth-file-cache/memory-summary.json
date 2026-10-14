@@ -1,0 +1,11 @@
+{
+  "samples": 120,
+  "sample_interval_seconds": 10,
+  "coverage": "Started during candidate benchmark; includes all smoke and long-context validation",
+  "minimum_available_gib": 3.8608779907226562,
+  "peak_system_commit_gib": 46.39097213745117,
+  "system_commit_limit_gib": 54.88027572631836,
+  "peak_pagefile_used_gib": 0.12002182006835938,
+  "peak_engine_private_commit_gib": 32.03239059448242,
+  "peak_engine_working_set_gib": 14.690624237060547
+}

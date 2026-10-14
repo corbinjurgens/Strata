@@ -65,6 +65,7 @@ class CarryOver(unittest.TestCase):
         self.assertNotIn("kept from", out)
         self.assertNotIn(".bak", out)
         self.assertFalse(set(cfg) - setup.SETUP_KEYS)                     # setup writes only its own keys
+        self.assertIs(cfg["fit_max_tokens"], True)
 
     def test_setup_keys_are_rewritten(self):
         code, out, first, _ = self.run_setup()
@@ -83,6 +84,7 @@ class CarryOver(unittest.TestCase):
             mm = Path(d) / "mmproj-Q8_0.gguf"
             mm.write_bytes(b"")
             old = {"exe": "e", "args": ["--kv", "int8", "--threads", "8"], "sampling": {"temperature": 0.7},
+                   "fit_max_tokens": False,
                    "env": {"STRATA_RESIDENT_PIN": "0", "MY_VAR": "1"},
                    "vision": {"exe": "v", "mmproj": str(mm), "gpu": False, "max_tokens": 300, "min_tokens": 64}}
             p.write_text(json.dumps(old), encoding="utf-8")
@@ -95,6 +97,7 @@ class CarryOver(unittest.TestCase):
             self.assertEqual(got["vision"]["mmproj"], str(mm))            # a Q8_0 mmproj of the user's own (#625)
             self.assertEqual(got["vision"]["min_tokens"], 64)
             self.assertEqual(got["exe"], "e2")
+            self.assertIs(got["fit_max_tokens"], False)                   # an explicit opt-out survives setup
             self.assertEqual(json.loads((Path(d) / "strata-x.json.bak").read_text(encoding="utf-8")), old)
             self.assertIn("--threads", out)
             # the same again: nothing changes, so no new copy is made
@@ -111,7 +114,7 @@ class CarryOver(unittest.TestCase):
             p = Path(d) / "strata-x.json"
             p.write_text("{cut off", encoding="utf-8")
             quiet(setup.write_setup_config, p, {"exe": "e", "args": []})
-            self.assertEqual(json.loads(p.read_text(encoding="utf-8")), {"exe": "e", "args": []})
+            self.assertEqual(json.loads(p.read_text(encoding="utf-8")), {"exe": "e", "args": [], "fit_max_tokens": True})
             self.assertEqual((Path(d) / "strata-x.json.bak").read_text(encoding="utf-8"), "{cut off")
 
     def test_display_tip_and_typed_ahead_flush(self):
@@ -161,7 +164,7 @@ class CarryOver(unittest.TestCase):
             p = Path(d) / "strata-x.json"
             quiet(setup.write_setup_config, p, {"exe": "new"}, src)
             self.assertEqual(json.loads(p.read_text(encoding="utf-8")),
-                             {"exe": "new", "mcp_servers": {"a": {"command": "x"}}})
+                             {"exe": "new", "mcp_servers": {"a": {"command": "x"}}, "fit_max_tokens": True})
             self.assertFalse((Path(d) / "strata-x.json.bak").exists())   # nothing here was replaced
 
 
