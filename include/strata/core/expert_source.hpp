@@ -86,6 +86,9 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& self_cgroup = "/proc/self/cgroup",
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
+/// Convert finite nonnegative GiB to bytes, saturating at UINT64_MAX. A positive budget must not become the zero sentinel.
+uint64_t resident_gib_bytes(double gib, bool keep_positive = false);
+
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);

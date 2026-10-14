@@ -12,6 +12,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -516,8 +517,23 @@ void test_resident_exchange() {
 
 void test_resident_memory_budget() {
     using strata::core::detail::clamp_resident_budget;
+    using strata::core::detail::resident_gib_bytes;
     constexpr uint64_t GiB = 1ull << 30, margin = 256ull << 20, headroom = 4 * GiB;
     constexpr uint64_t unlimited = std::numeric_limits<uint64_t>::max();
+    require(resident_gib_bytes(0) == 0 && resident_gib_bytes(4) == 4 * GiB && resident_gib_bytes(0.25, true) == GiB / 4,
+            "ordinary GiB requests changed during byte conversion");
+    require(resident_gib_bytes(1e-20, true) == 1 && resident_gib_bytes(std::numeric_limits<double>::denorm_min(), true) == 1,
+            "a positive sub-byte budget became the zero/full-complement sentinel");
+    require(resident_gib_bytes(1.0 / GiB, true) == 1 && resident_gib_bytes(1e-20) == 0,
+            "one-byte budget or sub-byte headroom conversion changed");
+    require(resident_gib_bytes(1e308, true) == unlimited && resident_gib_bytes(1e308) == unlimited &&
+                resident_gib_bytes(17179869184.0, true) == unlimited,
+            "an oversized finite GiB request did not saturate safely");
+    require(resident_gib_bytes(std::nextafter(17179869184.0, 0.0), true) == unlimited - 2047,
+            "the representable value below the uint64 boundary was cast out of range");
+    require(clamp_resident_budget(resident_gib_bytes(1e308, true), 10 * GiB, 10 * GiB, 8 * GiB) == 2 * GiB - margin &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 10 * GiB, resident_gib_bytes(1e308)) == 0,
+            "saturated budgets or headroom bypassed allocation checks");
     // #730: RAM can hold the requested cache, but Windows cannot commit it.
     require(clamp_resident_budget(66 * GiB, 69 * GiB, 47 * GiB, headroom) == 43 * GiB - margin,
             "a RAM budget exceeded available commit capacity");

@@ -102,6 +102,14 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
     return true;
 }
 
+uint64_t resident_gib_bytes(double gib, bool keep_positive) {
+    if (!(gib > 0.0)) return 0;
+    const double bytes = gib * 1073741824.0;
+    if (bytes >= (double) std::numeric_limits<uint64_t>::max()) return std::numeric_limits<uint64_t>::max();
+    const uint64_t whole = (uint64_t) bytes;
+    return keep_positive && whole == 0 ? 1 : whole;
+}
+
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom) {
     const uint64_t available = std::min(physical, commit);
     const uint64_t room = available > headroom ? available - headroom : 0;

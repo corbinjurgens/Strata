@@ -445,6 +445,11 @@ launch path and its warnings, including across repeated refreshes. Profile reque
 finite and positive; recent MiB must be a nonnegative integer; host headroom and VRAM reserve must be finite
 and nonnegative. Zero recent retention and zero headroom remain valid. The same validation applies to new
 CLI overrides and edited policy configs before publication or launch.
+JSON null in a managed environment setting means removal: the saved environment omits that key while the
+policy retains the explicit removal across refreshes. It is never passed to the engine as the string `None`.
+The engine saturates oversized finite GiB-to-byte requests before allocation checks. A positive profile
+request below one byte keeps a one-byte budget, so it cannot select the zero/full-complement sentinel;
+such a budget can still fail allocation because no expert fits it.
 
 Each managed memory-policy argument must appear at most once, including context, KV and boolean switches.
 Duplicate managed arguments are rejected before config publication or server startup; the helper preserves

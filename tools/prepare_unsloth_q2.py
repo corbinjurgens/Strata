@@ -179,9 +179,7 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         args += ["--prefill", "auto"]
     if streamed:
         args += ["--kv-resident", str(resident_cells)]
-    for flag, value in arg_overrides.items():
-        set_flag(args, flag, value)
-    env.update(env_overrides)
+    apply_overrides({"args": args, "env": env}, overrides)
     return {"args": args, "env": env, "ram_gib": ram, "vram_gib": vram,
             "available_gib": available_gib, "commit_available_gib": commit_available_gib,
             "windows_commit": windows_commit,
@@ -497,7 +495,11 @@ def config_for(folder: Path, pack: Path, context: int, key_config: Path | None,
 def apply_overrides(cfg: dict, overrides: dict) -> None:
     for flag, value in overrides.get("args", {}).items():
         set_flag(cfg["args"], flag, value)
-    cfg["env"].update(overrides.get("env", {}))
+    for key, value in overrides.get("env", {}).items():
+        if value is None:
+            cfg["env"].pop(key, None)
+        else:
+            cfg["env"][key] = value
 
 
 def refreshed_config(cfg: dict) -> dict:
@@ -518,7 +520,8 @@ def refreshed_config(cfg: dict) -> dict:
         if flag_value(cfg["args"], flag) != flag_value(policy["generated_args"], flag):
             explicit["args"][flag] = flag_value(cfg["args"], flag)
     for key in MEMORY_ENV:
-        if cfg.get("env", {}).get(key) != policy["generated_env"].get(key):
+        if (cfg.get("env", {}).get(key) != policy["generated_env"].get(key) or
+                (key in cfg.get("env", {}) and cfg["env"][key] is None)):
             explicit["env"][key] = cfg.get("env", {}).get(key)
     gpu, memory = detected_gpu(cfg.get("gpu")), dict(detected_memory())
     plan = memory_plan(ram=memory.pop("ram_gib"), vram=gpu["vram_gb"],
@@ -531,6 +534,8 @@ def refreshed_config(cfg: dict) -> dict:
     env = cfg.setdefault("env", {})
     for key in MEMORY_ENV:
         if key in explicit.get("env", {}):
+            if explicit["env"][key] is None:
+                env.pop(key, None)
             continue
         if env.get(key) == policy["generated_env"].get(key):
             if key in plan["env"]:

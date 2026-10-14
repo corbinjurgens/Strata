@@ -1809,19 +1809,25 @@ int main(int argc, char** argv) {
             // STRATA_RESIDENT_HEADROOM_GIB=N leaves N GiB of the available RAM free instead of 4
             if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
                 o.resident_pin = false;
-            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
-                o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr) {
+                const double gib = std::atof(v);
+                if (std::isfinite(gib) && gib >= 0.0)
+                    o.resident_headroom = strata::core::detail::resident_gib_bytes(gib);
+            }
         }
         else if (a == "--resident-budget-gib") {
             const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
+            if (!std::isfinite(gib) || !(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs finite N > 0\n"); return 2; }
+            o.resident_budget = strata::core::detail::resident_gib_bytes(gib, true);
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 4ull << 30;
             if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
                 o.resident_pin = false;
-            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
-                o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+            if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr) {
+                const double headroom = std::atof(v);
+                if (std::isfinite(headroom) && headroom >= 0.0)
+                    o.resident_headroom = strata::core::detail::resident_gib_bytes(headroom);
+            }
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;

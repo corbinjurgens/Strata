@@ -1,4 +1,5 @@
 """Offline checks for distinct hardware budgets and read-only shared model verification."""
+import ast
 import hashlib
 import contextlib
 import io
@@ -145,6 +146,16 @@ class MemoryProfiles(unittest.TestCase):
         self.assertEqual(plan["gpu_commit_gib"], 16)
         self.assertEqual(plan["expert_pool_gib"], 3.32421875)
         self.assertEqual(plan["pinned_gib"], 2)
+
+    def test_explicit_environment_removals_are_omitted_from_plans(self):
+        for key in prep.MEMORY_ENV:
+            with self.subTest(key=key):
+                plan = prep.memory_plan(64, 6, 131072, available_gib=50, commit_available_gib=60,
+                                        overrides={"env": {key: None}})
+                self.assertNotIn(key, plan["env"])
+                self.assertEqual(plan["automatic_host_cache"], key != "STRATA_FILE_CACHE_MIB")
+                if key == "STRATA_RESIDENT_HEADROOM_GIB":
+                    self.assertEqual(plan["headroom_gib"], 4)
 
     def test_shared_planning_rejects_invalid_numeric_policy_inputs(self):
         for group, name, invalid in (
@@ -343,6 +354,40 @@ class PortableProfiles(unittest.TestCase):
             self.assertNotIn("STRATA_RESIDENT_HEADROOM_GIB", cfg["env"])
             self.assertNotIn("--resident-budget-gib", cfg["args"])
             self.assertNotIn("--vram-reserve-mib", cfg["args"])
+
+    def test_null_environment_removals_survive_refresh_and_launch_without_exporting_none(self):
+        server = Path(__file__).resolve().parents[1] / "serve/server.py"
+        node = next(n for n in ast.parse(server.read_text(encoding="utf-8")).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "child_env")
+        namespace = {"os": prep.os, "Path": Path, "hip_visible": lambda cfg: [], "gpu_list": lambda cfg: []}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(server), "exec"), namespace)
+        parent_env = {k: v for k, v in prep.os.environ.items() if k not in prep.MEMORY_ENV}
+        for key in prep.MEMORY_ENV:
+            for source in ("override", "saved", "old-generated-null"):
+                with self.subTest(key=key, source=source):
+                    cfg = self.make_config({"env": {key: None}} if source == "override" else None)
+                    if source != "override":
+                        cfg["env"][key] = None
+                    if source == "old-generated-null":
+                        cfg["memory_policy"]["generated_env"][key] = None
+                    for _ in range(2):
+                        cfg = prep.refreshed_config(cfg)
+                        self.assertNotIn(key, cfg["env"])
+                        self.assertNotIn(key, cfg["memory_policy"]["generated_env"])
+                        self.assertNotIn(key, cfg["memory_policy"]["sample"]["env"])
+                        self.assertIn(key, cfg["memory_policy"]["overrides"]["env"])
+                        self.assertIsNone(cfg["memory_policy"]["overrides"]["env"][key])
+                    self.config.write_bytes(prep.json_bytes(cfg))
+                    with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        run.return_value.returncode = 0
+                        self.assertEqual(prep.launch(self.config), 0)
+                    run.assert_called_once()
+                    saved = json.loads(self.config.read_text())
+                    self.assertNotIn(key, saved["env"])
+                    self.assertIsNone(saved["memory_policy"]["overrides"]["env"][key])
+                    with patch.dict(prep.os.environ, parent_env, clear=True):
+                        self.assertNotIn(key, namespace["child_env"](saved))
 
     def test_failed_launcher_publish_rolls_back_new_config(self):
         real_replace = prep.os.replace
