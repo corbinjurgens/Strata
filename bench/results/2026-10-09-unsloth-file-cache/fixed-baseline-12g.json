@@ -1,0 +1,532 @@
+{
+  "name": "fixed-baseline-12g",
+  "exe": "engine/strata-unsloth.exe",
+  "context": 131072,
+  "ram_gib": 12,
+  "cache_mib": 0,
+  "expert_cache": "4300",
+  "rows": [
+    {
+      "round": 0,
+      "case": 0,
+      "prompt": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation.",
+      "response": {
+        "id": "chatcmpl-1d68fe7a089a4e6c8375e7ad",
+        "object": "chat.completion",
+        "created": 1791530613,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Hash Tables: Collisions, Resizing, and Lookup \u2014 A Detailed Technical Explanation\n\n## 1. Core Concept\n\nA hash table is a data structure that maps **keys** to **values** using a **hash function**. The goal is **O(1) average-case** time complexity for insertion, deletion, and lookup.\n\n```\nKey \u2192 Hash Function \u2192 Index \u2192 Bucket \u2192 Value(s)\n```\n\nThe hash function converts a key into an integer index into an array (the \"bucket array\"). Since the key space is typically much larger than the bucket array size, **collisions** are inevitable.\n\n---\n\n## 2. Collision Handling\n\nA **collision** occurs when two distinct keys hash to the same index. There are two primary strategies:\n\n### "
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 43,
+          "completion_tokens": 160,
+          "total_tokens": 203,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 43,
+          "prompt_ms": 7740.6,
+          "prompt_per_token_ms": 180.014,
+          "prompt_per_second": 5.6,
+          "predicted_n": 160,
+          "predicted_ms": 19405.5,
+          "predicted_per_token_ms": 121.284,
+          "predicted_per_second": 8.2,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_s": 27.148485699999583
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791530613.4091136,
+        "duration_s": 27.1,
+        "finish": "length",
+        "prompt_tokens": 43,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 43,
+        "prompt_read": 43,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 7740.6,
+        "decode_ms": 19405.5,
+        "decode_tok_s": 8.2,
+        "hit_rate": 0.808,
+        "pcie_share": 0.063,
+        "ram_blobs": 14930,
+        "file_blobs": 6663,
+        "file_mb": 7032.1,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 0,
+      "case": 1,
+      "prompt": "Explain how to design reliable retries for a background job queue, including idempotency and exponential backoff.",
+      "response": {
+        "id": "chatcmpl-fd6c76fffa4a4da398493bfe",
+        "object": "chat.completion",
+        "created": 1791530640,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Designing a reliable background job queue requires balancing **reliability** (ensuring jobs eventually complete) with **efficiency** (avoiding wasted resources on permanently failing jobs). The two pillars of this design are **Idempotency** and **Exponential Backoff**.\n\nHere is a comprehensive guide to designing such a system.\n\n---\n\n### 1. Core Concept: Why Retries Are Needed\nBackground jobs fail for transient reasons:\n- Network timeouts\n- Database deadlocks\n- Third-party API rate limits\n- Temporary service outages\n\nWithout retries, these transient failures become permanent data inconsistencies. With naive retries, you risk overwhelming the system or processing duplicate data.\n\n---\n\n### 2. Idempotency: The Safety Net\n**Idempotency"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 46,
+          "completion_tokens": 160,
+          "total_tokens": 206,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 46,
+          "prompt_ms": 9720.5,
+          "prompt_per_token_ms": 211.315,
+          "prompt_per_second": 4.7,
+          "predicted_n": 160,
+          "predicted_ms": 16065.8,
+          "predicted_per_token_ms": 100.411,
+          "predicted_per_second": 10.0,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_s": 25.788258000000496
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791530640.5807636,
+        "duration_s": 25.8,
+        "finish": "length",
+        "prompt_tokens": 46,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 46,
+        "prompt_read": 46,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 9720.5,
+        "decode_ms": 16065.8,
+        "decode_tok_s": 10.0,
+        "hit_rate": 0.83,
+        "pcie_share": 0.057,
+        "ram_blobs": 13179,
+        "file_blobs": 5951,
+        "file_mb": 6513.8,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 0,
+      "case": 2,
+      "prompt": "Explain how database composite indexes affect filtering, sorting, and write performance, with concrete examples.",
+      "response": {
+        "id": "chatcmpl-833dd93ff4c14969b566b49e",
+        "object": "chat.completion",
+        "created": 1791530666,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Composite Indexes: Filtering, Sorting, and Write Performance\n\n## What Is a Composite Index?\n\nA composite index (also called a multi-column index) is an index on **multiple columns** of a table. The order of columns matters critically.\n\n```sql\nCREATE INDEX idx_name ON employees (department, salary, hire_date);\n```\n\nThis creates a B-tree index where entries are sorted first by `department`, then by `salary` within each department, then by `hire_date` within each `(department, salary)` pair.\n\n---\n\n## 1. Filtering (WHERE Clause)\n\n### The Leftmost Prefix Rule\n\nA composite index can be used for filtering **only if** the query filters on a **leftmost prefix** of the indexed columns.\n\n###"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 160,
+          "total_tokens": 202,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 42,
+          "prompt_ms": 7624.2,
+          "prompt_per_token_ms": 181.529,
+          "prompt_per_second": 5.5,
+          "predicted_n": 160,
+          "predicted_ms": 19690.4,
+          "predicted_per_token_ms": 123.065,
+          "predicted_per_second": 8.1,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_s": 27.330772100000104
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791530666.3984632,
+        "duration_s": 27.3,
+        "finish": "length",
+        "prompt_tokens": 42,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 42,
+        "prompt_read": 42,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 7624.2,
+        "decode_ms": 19690.4,
+        "decode_tok_s": 8.1,
+        "hit_rate": 0.806,
+        "pcie_share": 0.061,
+        "ram_blobs": 13842,
+        "file_blobs": 7714,
+        "file_mb": 8377.5,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 1,
+      "case": 0,
+      "prompt": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation.",
+      "response": {
+        "id": "chatcmpl-d1277314a2db4bd8b25051f1",
+        "object": "chat.completion",
+        "created": 1791530693,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Hash Tables: Collisions, Resizing, and Lookup \u2014 A Detailed Technical Explanation\n\n## 1. Core Concept\n\nA **hash table** (or hash map) is a data structure that implements an associative array abstract data type, mapping keys to values using a **hash function**. The goal is **O(1) average-case** time complexity for insertion, deletion, and lookup.\n\nThe fundamental operation is:\n\n```\nindex = hash(key) % table_size\n```\n\nThis maps a key to an index in an underlying array (the \"bucket array\"). However, because the hash space is typically larger than the array size, and because hash functions are not injective, **collisions** are inevitable.\n\n---\n\n## 2. Collision Handling\n\nA **collision**"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 43,
+          "completion_tokens": 160,
+          "total_tokens": 203,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 43,
+          "prompt_ms": 8467.8,
+          "prompt_per_token_ms": 196.926,
+          "prompt_per_second": 5.1,
+          "predicted_n": 160,
+          "predicted_ms": 16686.3,
+          "predicted_per_token_ms": 104.289,
+          "predicted_per_second": 9.6,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_s": 25.17029569999977
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791530693.753719,
+        "duration_s": 25.2,
+        "finish": "length",
+        "prompt_tokens": 43,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 43,
+        "prompt_read": 43,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 8467.8,
+        "decode_ms": 16686.3,
+        "decode_tok_s": 9.6,
+        "hit_rate": 0.813,
+        "pcie_share": 0.055,
+        "ram_blobs": 12931,
+        "file_blobs": 7729,
+        "file_mb": 8518.8,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 1,
+      "case": 1,
+      "prompt": "Explain how to design reliable retries for a background job queue, including idempotency and exponential backoff.",
+      "response": {
+        "id": "chatcmpl-faca1e854fc944048d22c207",
+        "object": "chat.completion",
+        "created": 1791530718,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Designing a reliable background job queue requires balancing **reliability** (ensuring jobs eventually complete) with **efficiency** (avoiding overwhelming the system with failed retries). The core pillars of this design are **Idempotency**, **Exponential Backoff**, and **Dead Letter Queues (DLQ)**.\n\nHere is a comprehensive guide to designing such a system.\n\n---\n\n### 1. Core Principle: Idempotency\n**Idempotency** means that executing the same operation multiple times has the same effect as executing it once. This is critical because network failures, timeouts, or worker crashes can cause a job to be processed more than once.\n\n#### Why it matters:\nIf a worker processes a job (e.g., \"Charge User $1"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 46,
+          "completion_tokens": 160,
+          "total_tokens": 206,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 46,
+          "prompt_ms": 8072.1,
+          "prompt_per_token_ms": 175.48,
+          "prompt_per_second": 5.7,
+          "predicted_n": 160,
+          "predicted_ms": 16167.0,
+          "predicted_per_token_ms": 101.044,
+          "predicted_per_second": 9.9,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_s": 24.24117959999967
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791530718.9267304,
+        "duration_s": 24.2,
+        "finish": "length",
+        "prompt_tokens": 46,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 46,
+        "prompt_read": 46,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 8072.1,
+        "decode_ms": 16167.0,
+        "decode_tok_s": 9.9,
+        "hit_rate": 0.805,
+        "pcie_share": 0.061,
+        "ram_blobs": 13644,
+        "file_blobs": 7842,
+        "file_mb": 8459.1,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "round": 1,
+      "case": 2,
+      "prompt": "Explain how database composite indexes affect filtering, sorting, and write performance, with concrete examples.",
+      "response": {
+        "id": "chatcmpl-06429bf21d0f4380a634a417",
+        "object": "chat.completion",
+        "created": 1791530743,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "# Composite Indexes: Filtering, Sorting, and Write Performance\n\n## What Is a Composite Index?\n\nA composite index (also called a multi-column index) is an index on **multiple columns** of a table. The order of columns matters critically.\n\n```sql\nCREATE INDEX idx_name ON employees (department_id, hire_date, salary);\n```\n\nThis creates a B-tree index where entries are sorted first by `department_id`, then by `hire_date` within each department, then by `salary` within each `(department_id, hire_date)` pair.\n\n---\n\n## 1. Filtering (WHERE Clause)\n\n### The Leftmost Prefix Rule\n\nA composite index can be used for filtering **only if** the query filters on a **leftmost prefix** of the indexed"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 42,
+          "completion_tokens": 160,
+          "total_tokens": 202,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 42,
+          "prompt_ms": 7154.5,
+          "prompt_per_token_ms": 170.345,
+          "prompt_per_second": 5.9,
+          "predicted_n": 160,
+          "predicted_ms": 16847.1,
+          "predicted_per_token_ms": 105.294,
+          "predicted_per_second": 9.5,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_s": 24.0178745000012
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791530743.2054696,
+        "duration_s": 24.0,
+        "finish": "length",
+        "prompt_tokens": 42,
+        "reused": 0,
+        "output_tokens": 160,
+        "prompt_total": 42,
+        "prompt_read": 42,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 160,
+        "prompt_ms": 7154.5,
+        "decode_ms": 16847.1,
+        "decode_tok_s": 9.5,
+        "hit_rate": 0.804,
+        "pcie_share": 0.059,
+        "ram_blobs": 13400,
+        "file_blobs": 8270,
+        "file_mb": 9000.0,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    }
+  ],
+  "health": {
+    "status": "ok",
+    "max_context": 131072,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "images": false,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "engine": {
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "max_context": 131072,
+    "images": false,
+    "version": "0.1.40",
+    "context": 131072,
+    "kv": "int8",
+    "kv_resident": 32768,
+    "expert_slots": 4990,
+    "expert_cache_mib": 8922,
+    "expert_slots_primary": 4990,
+    "expert_cache_primary_mib": 8922,
+    "spec": 2,
+    "mtp_max": 0,
+    "lookup": 0,
+    "vram_free_mib": 1107,
+    "cvec": 0,
+    "arena_mib": 12286,
+    "pool_workers": 7,
+    "pcie_frac": "0.55",
+    "spec_min_p": "0.00",
+    "conversation_cache_mib": 0,
+    "conversation_cache_slots": 4,
+    "conversation_cache_min_free_mib": 2560,
+    "tail_role_token": -1,
+    "vram_elastic": 0,
+    "engine": "0.1.40"
+  },
+  "warmup": {
+    "id": "chatcmpl-ba8dc2593418492a866dbcff",
+    "object": "chat.completion",
+    "created": 1791530595,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "A database transaction groups a series of database operations into a single logical unit of work, ensuring that either all operations succeed together or none are applied at all. This mechanism guarantees data integrity and consistency by adhering to the ACID properties (Atomicity, Consistency, Isolation, and Durability). For example, in"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 24,
+      "completion_tokens": 64,
+      "total_tokens": 88,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 24,
+      "prompt_ms": 7247.4,
+      "prompt_per_token_ms": 301.975,
+      "prompt_per_second": 3.3,
+      "predicted_n": 64,
+      "predicted_ms": 10215.3,
+      "predicted_per_token_ms": 159.614,
+      "predicted_per_second": 6.3,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_s": 17.464863200000764
+  },
+  "metrics": {
+    "engine": {
+      "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+      "max_context": 131072,
+      "images": false,
+      "version": "0.1.40",
+      "context": 131072,
+      "kv": "int8",
+      "kv_resident": 32768,
+      "expert_slots": 4990,
+      "expert_cache_mib": 8922,
+      "expert_slots_primary": 4990,
+      "expert_cache_primary_mib": 8922,
+      "spec": 2,
+      "mtp_max": 0,
+      "lookup": 0,
+      "vram_free_mib": 1107,
+      "cvec": 0,
+      "arena_mib": 12286,
+      "pool_workers": 7,
+      "pcie_frac": "0.55",
+      "spec_min_p": "0.00",
+      "conversation_cache_mib": 0,
+      "conversation_cache_slots": 4,
+      "conversation_cache_min_free_mib": 2560,
+      "tail_role_token": -1,
+      "vram_elastic": 0,
+      "engine": "0.1.40"
+    },
+    "totals": {
+      "since": 1791530594.6382284,
+      "requests": 7,
+      "prompt_tokens": 286,
+      "reused": 0,
+      "output_tokens": 1024,
+      "prompt_ms": 56027.1,
+      "decode_ms": 115077.4,
+      "drafts_offered": 0,
+      "drafts_accepted": 0
+    }
+  },
+  "memory": {
+    "min_available_gib": 3.689453125,
+    "max_pagefile_used_gib": 0.102264404296875
+  }
+}

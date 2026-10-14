@@ -41,11 +41,29 @@
 
 namespace fs = std::filesystem;
 
+#if defined(_WIN32)
+namespace strata::core::detail {
+// Test-only access to existing handles/state: no production fault-injection flag or hot-path branch.
+struct FileExpertSourceTestAccess {
+    static void* exchange_handle(FileExpertSource& s, size_t file, void* h, bool buffered) {
+        void*& slot = buffered ? s.buffered_[file] : s.direct_[file];
+        return std::exchange(slot, h);
+    }
+    static std::string exchange_path(FileExpertSource& s, size_t file, std::string path) {
+        return std::exchange(s.paths_[file], std::move(path));
+    }
+    static void set_busy(FileExpertSource& s, size_t slot, bool busy) { s.stage_busy_[slot] = busy ? 1 : 0; }
+};
+}
+#endif
+
 namespace {
 
 void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
 }
+
+void set_env(const char* name, const char* value);
 
 struct TempDirectory {
     fs::path path;
@@ -157,6 +175,9 @@ void test_canonical_layout() {
     FileExpertSource source;
     bool opened = source.open(dir.path.string(), layers, experts, err);
     require(opened, "could not map canonical pack: " + err);
+    const uint64_t mapped_before = source.mapped_view_bytes();
+    require(!source.retire_direct_mappings(err) && source.mapped_view_bytes() == mapped_before &&
+            !source.direct_mappings_retired(), "unsupported canonical retirement changed mappings");
     require(source.blobs() == layers * experts, "canonical blob count is wrong");
     const uint8_t* first = source.blob(0, 0);
     const uint8_t* second = source.blob(0, 1);
@@ -187,6 +208,155 @@ void test_canonical_layout() {
 }
 
 #if defined(STRATA_NATIVE_EXPERTS)
+void test_direct_mapping_retirement() {
+#if defined(_WIN32)
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    using Access = strata::core::detail::FileExpertSourceTestAccess;
+    using FM = FileExpertSource::FetchMetric;
+    constexpr int64_t layers = 2, experts = 3;
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    NativeFmt fm[2];
+    require(native_fmt(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, 2560, 640, fm[0], err), err);
+    require(native_fmt(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640, fm[1], err), err);
+    require(fm[0].bytes == 1868800 && fm[1].bytes == 2176000, "retirement fixture geometry changed");
+    std::vector<uint8_t> truth[2], payload[2], header[2];
+    uint64_t absolute[6] = {}, relative[6] = {}, per[6] = {};
+    const char* files[2] = {"roles-a.gguf", "roles-b.gguf"};
+    const char* roles[3] = {"gate", "up", "down"};
+    auto put = [](std::vector<uint8_t>& out, uint64_t n, size_t bytes) {
+        for (size_t i = 0; i < bytes; ++i) out.push_back((uint8_t) (n >> (8 * i)));
+    };
+    auto str = [&](std::vector<uint8_t>& out, const std::string& s) {
+        put(out, s.size(), 8); out.insert(out.end(), s.begin(), s.end());
+    };
+    for (int f = 0; f < 2; ++f) {
+        put(header[f], 0x46554747, 4); put(header[f], 3, 4);
+        put(header[f], 3, 8); put(header[f], 0, 8); // three tensors, no metadata
+    }
+    for (int l = 0; l < 2; ++l) {
+        truth[l].resize((size_t) (experts * fm[l].bytes));
+        for (size_t i = 0; i < truth[l].size(); ++i)
+            truth[l][i] = (uint8_t) ((i * 131u + l * 37u) ^ (i >> 7) ^ (i >> 17));
+        uint64_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const int file = (l + r) % 2, i = 3 * l + r;
+            per[i] = r < 2 ? fm[l].up_off : fm[l].bytes - fm[l].down_off;
+            relative[i] = payload[file].size();
+            str(header[file], "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight");
+            put(header[file], 3, 4);
+            put(header[file], r < 2 ? 2560 : 640, 8);
+            put(header[file], r < 2 ? 640 : 2560, 8);
+            put(header[file], experts, 8);
+            put(header[file], r < 2 ? fm[l].gu_type : fm[l].d_type, 4);
+            put(header[file], relative[i], 8);
+            for (int e = 0; e < experts; ++e) {
+                const auto first = truth[l].begin() + (ptrdiff_t) (e * fm[l].bytes + at);
+                payload[file].insert(payload[file].end(), first, first + (ptrdiff_t) per[i]);
+            }
+            at += per[i];
+        }
+    }
+    for (int f = 0; f < 2; ++f) {
+        header[f].resize((header[f].size() + 31) / 32 * 32, 0);
+        for (int l = 0; l < 2; ++l) for (int r = 0; r < 3; ++r)
+            if ((l + r) % 2 == f) absolute[3 * l + r] = header[f].size() + relative[3 * l + r];
+        std::ofstream out(dir.path / files[f], std::ios::binary);
+        out.write((const char*) header[f].data(), (std::streamsize) header[f].size());
+        out.write((const char*) payload[f].data(), (std::streamsize) payload[f].size());
+        require((bool) out, "could not write split-role GGUF fixture");
+    }
+    {
+        std::ofstream metadata(dir.path / "native_experts.txt");
+        for (int l = 0; l < 2; ++l) {
+            metadata << l << ' ' << fm[l].gu_type << ' ' << fm[l].d_type << ' '
+                     << (l == 0 ? 0 : experts * fm[0].bytes) << ' ' << fm[l].bytes;
+            for (int r = 0; r < 3; ++r) metadata << ' ' << absolute[3 * l + r];
+            metadata << ' ' << files[l % 2] << ',' << files[(l + 1) % 2] << ',' << files[l % 2] << '\n';
+        }
+        require((bool) metadata, "could not write split-role native layout");
+    }
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+    FileExpertSource source;
+    source.set_gguf((dir.path / files[0]).string());
+    require(source.open(dir.path.string(), layers, experts, err), err);
+    const uint64_t mapped = source.mapped_view_bytes();
+    require(mapped == header[0].size() + header[1].size() + 12134400 && source.gguf_mode(),
+            "split-role GGUF mapped size is wrong");
+    require(!source.retire_direct_mappings(err) && source.mapped_view_bytes() == mapped,
+            "mapped-only source allowed retirement");
+    auto matches = [&](const uint8_t* p, int l, int e) {
+        return p && !std::memcmp(p, truth[l].data() + e * fm[l].bytes, (size_t) fm[l].bytes);
+    };
+    const auto* live = source.blob(0, 0);
+    require(matches(live, 0, 0), "mapped split-role fixture differs");
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    std::string why;
+    const bool direct = source.set_unbuffered(0, why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    require(direct, "retirement fixture could not enable unbuffered reads: " + why);
+    source.set_file_cache_bytes(3 * 2176000ull, true);
+    Access::set_busy(source, 0, true);
+    require(!source.retire_direct_mappings(err) && source.mapped_view_bytes() == mapped,
+            "retirement accepted an in-flight fill");
+    Access::set_busy(source, 0, false);
+    const auto original_path = Access::exchange_path(source, 1, (dir.path / "missing.gguf").string());
+    const bool invalid_path = source.retire_direct_mappings(err);
+    Access::exchange_path(source, 1, original_path);
+    require(!invalid_path && source.mapped_view_bytes() == mapped && !source.direct_mappings_retired() &&
+            matches(source.blob(0, 0), 0, 0), "failed fallback open did not preserve mapped source");
+    source.set_fetch_profiling(true);
+    const auto before = source.fetch_stats();
+    require(source.retire_direct_mappings(err), err);
+    require(source.direct_mappings_retired() && !source.mapped() && source.mapped_view_bytes() == 0 &&
+            source.gguf_mode() && source.unbuffered(), "retirement did not release all views or preserve mode");
+    require(source.fetch_stats().values == before.values, "retirement read model payloads");
+    require(matches(live, 0, 0) && source.blob(0, 0) == live, "retirement changed a live staging pointer");
+    require(source.retire_direct_mappings(err), "retirement is not idempotent");
+    require(source.recheck_unbuffered(why), "retired source switched to absent mappings");
+    const int64_t batch[3] = {0, 1, 2};
+    source.prefetch(1, batch, 3);
+    for (int e = 0; e < 3; ++e) require(matches(source.blob(1, e), 1, e), "retired batch changed expert bytes");
+    require(matches(live, 0, 0), "retired batch overwrote a protected live pointer");
+    std::vector<uint8_t> copy((size_t) fm[0].bytes);
+    require(source.copy_blob(0, 2, copy.data()) && matches(copy.data(), 0, 2), "retired copy_blob differs");
+    require(source.release(0, 0) == 0 && !source.warms(), "retired source offered mapped page operations");
+    source.warm(0, batch, 3); // explicit callers must also be safe when no views remain
+    require(source.warmed() == 0, "retired warm touched missing views");
+    require(source.direct_fallbacks() == 0, "normal retired reads unexpectedly fell back");
+
+    const auto direct_handle = Access::exchange_handle(source, 0, INVALID_HANDLE_VALUE, false);
+    const auto fallback_before = source.fetch_stats();
+    require(source.copy_blob(0, 2, copy.data()) && matches(copy.data(), 0, 2), "positional fallback bytes differ");
+    require(source.fetch_stats().get(FM::buffered_read_bytes) - fallback_before.get(FM::buffered_read_bytes) == 1868800,
+            "buffered fallback read an unexpected byte count");
+    std::vector<uint8_t> a((size_t) fm[0].bytes), b((size_t) fm[1].bytes);
+    bool ok_a = false, ok_b = false;
+    std::thread ta([&] { ok_a = source.copy_blob(0, 1, a.data()); });
+    std::thread tb([&] { ok_b = source.copy_blob(1, 2, b.data()); });
+    ta.join(); tb.join();
+    require(ok_a && ok_b && matches(a.data(), 0, 1) && matches(b.data(), 1, 2),
+            "concurrent positional fallbacks shared a file position or buffer");
+    const auto fallback_handle = Access::exchange_handle(source, 0, INVALID_HANDLE_VALUE, true);
+    const bool failed_copy = source.copy_blob(0, 1, a.data());
+    const auto* failed_blob = source.blob(0, 1); // not previously cached: publish must invalidate this failed fill
+    Access::exchange_handle(source, 0, fallback_handle, true);
+    Access::exchange_handle(source, 0, direct_handle, false);
+    require(!failed_copy && failed_blob == nullptr, "double I/O failure published partial expert bytes");
+    require(matches(source.blob(0, 1), 0, 1), "failed fill poisoned a later valid lookup");
+    require(source.mapped_view_bytes() == 0, "fallback recreated whole-file mappings");
+    source.close();
+    require(!source.direct_mappings_retired() && !source.gguf_mode() && source.mapped_view_bytes() == 0,
+            "close retained retired source state");
+    require(source.open(dir.path.string(), layers, experts, err) && source.mapped_view_bytes() == mapped &&
+            !source.direct_mappings_retired() && matches(source.blob(0, 1), 0, 1), "reopen retained experimental state");
+    std::cout << "direct mapping retirement: split/mixed bytes, live buffers, fallback/open/I/O faults, concurrency, reset PASS\n";
+#else
+    std::cout << "direct mapping retirement: Windows-only experiment, not exercised on this platform\n";
+#endif
+}
+
 void test_native_variable_layout() {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
@@ -456,6 +626,285 @@ void test_unbuffered_reads() {
     source.close();
 }
 
+void test_fetch_profiling() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    using FM = FileExpertSource::FetchMetric;
+    constexpr int64_t layers = 8, experts = 3;
+    require(BLOB == 1382400, "fetch-profile fixture geometry changed");
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+    std::vector<uint8_t> truth((size_t) (layers * experts * BLOB));
+    for (size_t i = 0; i < truth.size(); ++i) truth[i] = (uint8_t) ((i * 71u) ^ (i >> 11));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        out.write((const char*) truth.data(), (std::streamsize) truth.size());
+        require((bool) out, "could not write fetch-profile fixture");
+    }
+    FileExpertSource source;
+    require(source.open(dir.path.string(), layers, experts, err), err);
+    std::vector<uint8_t> copy((size_t) BLOB);
+    require(source.copy_blob(0, 0, copy.data()), "disabled mapped copy failed");
+    for (uint64_t n : source.fetch_stats().values) require(n == 0, "disabled profile collected counters");
+    source.set_fetch_profiling(true);
+    require(source.copy_blob(0, 0, copy.data()) && !std::memcmp(copy.data(), truth.data(), (size_t) BLOB),
+            "profiled mapped copy changed bytes");
+    const auto mapped = source.fetch_stats();
+    require(mapped.get(FM::mapped_copy_bytes) == 1382400 && mapped.get(FM::mapped_copy_ns) > 0 &&
+            mapped.get(FM::submitted_bytes) == 0, "mapped-copy profile did not separate useful bytes from OS reads");
+    source.close();
+    require(!source.fetch_profiling(), "close retained profiling opt-in");
+    for (uint64_t n : source.fetch_stats().values) require(n == 0, "close retained fetch-profile counters");
+
+    require(source.open(dir.path.string(), layers, experts, err), err);
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    std::string why;
+    const bool direct = source.set_unbuffered(0, why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    if (!direct) {
+        std::cout << "fetch profiling: mapped bytes/reset PASS; direct counters skipped (" << why << ")\n";
+        return;
+    }
+    source.set_file_cache_bytes(3 * BLOB);
+    source.set_fetch_profiling(true);
+    source.begin_layer(0, nullptr, 0);
+    const int64_t batch[3] = {0, 1, 2};
+    source.prefetch(0, batch, 3);
+    const auto cold = source.fetch_stats();
+    require(cold.get(FM::claims) == 3 && cold.get(FM::misses) == 3 && cold.get(FM::hits) == 0 &&
+            cold.get(FM::allocations) == 3 && cold.get(FM::allocation_bytes) == 4147200 &&
+            cold.get(FM::scan_slots) == 3, "cold fetch-profile claim/allocation counts are wrong");
+    require(cold.get(FM::read_batches) == 1 && cold.get(FM::read_requests) == 1 &&
+            cold.get(FM::submitted_bytes) == 4149248 && cold.get(FM::completed_bytes) == 4149248 &&
+            cold.get(FM::direct_copy_bytes) == 4147200 && cold.get(FM::mapped_copy_bytes) == 0,
+            "batch profile did not distinguish aligned OS bytes from useful expert bytes");
+    require(cold.get(FM::read_ns) >= cold.get(FM::read_plan_ns) + cold.get(FM::read_submit_ns) +
+            cold.get(FM::read_wait_ns) + cold.get(FM::direct_copy_ns) && cold.get(FM::read_wait_ns) > 0 &&
+            cold.get(FM::direct_copy_ns) > 0, "direct-read phases overlap or were not timed");
+    auto check = [&](int64_t l, int64_t e) {
+        const auto* p = source.blob(l, e);
+        require(p && !std::memcmp(p, truth.data() + (size_t) ((l * experts + e) * BLOB), (size_t) BLOB),
+                "fetch profiling changed expert bytes");
+    };
+    for (int64_t e : batch) check(0, e);
+    source.prefetch(0, batch, 3);
+    for (int64_t e : batch) check(0, e);
+    const auto warm = source.fetch_stats();
+    require(warm.get(FM::claims) == 12 && warm.get(FM::hits) == 9 && warm.get(FM::misses) == 3 &&
+            warm.get(FM::busy_hits) == 0 && warm.get(FM::fill_wait_ns) == 0 &&
+            warm.get(FM::read_batches) == 1 && warm.get(FM::direct_copy_bytes) == 4147200,
+            "warm profile counted extra reads, misses, or fill waits");
+    source.set_fetch_profiling(false);
+    source.begin_layer(1, nullptr, 0);
+    check(1, 0);
+    require(source.fetch_stats().values == warm.values, "disabled profile changed existing counters");
+    source.set_fetch_profiling(true);
+    for (int64_t l : {2, 3, 4, 5}) source.begin_layer(l, nullptr, 0);
+    check(6, 0);
+    const auto evicted = source.fetch_stats();
+    require(evicted.get(FM::evictions) == 1 && evicted.get(FM::allocations) == 3 &&
+            evicted.get(FM::misses) == 4 && evicted.get(FM::direct_copy_bytes) == 5529600,
+            "profile did not count one safe buffer reuse and exactly one new read");
+    require(source.direct_fallbacks() == 0, "profile fixture fell back to mapped reads");
+    source.close();
+    for (uint64_t n : source.fetch_stats().values) require(n == 0, "direct profile counters survived close");
+    std::cout << "fetch profiling: disabled/reset, mapped/direct bytes, cold/warm counts, phases, safe reuse PASS\n";
+}
+
+void test_recent_file_cache() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    TempDirectory dir(fs::current_path());
+    constexpr int64_t layers = 8, experts = 2;
+    const uint64_t blob_bytes = (uint64_t) BLOB;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+    std::vector<uint8_t> truth((size_t) (layers * experts * blob_bytes));
+    for (size_t i = 0; i < truth.size(); ++i) truth[i] = (uint8_t) ((i * 131u + (i / blob_bytes) * 37u) ^ (i >> 8));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        out.write((const char*) truth.data(), (std::streamsize) truth.size());
+        require((bool) out, "could not write recent-cache fixture");
+    }
+    FileExpertSource source;
+    auto open = [&] {
+        require(source.open(dir.path.string(), layers, experts, err), err);
+        set_env("STRATA_UNBUFFERED_LOAD", "1");
+        std::string why;
+        const bool ok = source.set_unbuffered(0, why);
+        set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+        return ok;
+    };
+    if (!open()) {
+        std::cout << "recent file cache: skipped (unbuffered reads unavailable)\n";
+        return;
+    }
+    auto traverse = [&](int expert) {
+        for (int64_t layer = 0; layer < layers; ++layer) {
+            source.begin_layer(layer, nullptr, 0);
+            if (layer % 2) continue;
+            const int64_t e = expert;
+            source.prefetch(layer, &e, 1);
+            const uint8_t* b = source.blob(layer, expert);
+            require(b && !std::memcmp(b, truth.data() + (layer * experts + expert) * blob_bytes, (size_t) blob_bytes),
+                    "recent cache returned stale or wrong expert bytes");
+        }
+    };
+    for (int i = 0; i < 3; ++i) traverse(0);
+    const uint64_t legacy_reads = source.file_read_bytes();
+    source.close();
+    require(open(), "could not reopen recent-cache fixture");
+    require(source.set_file_cache_bytes(4 * blob_bytes + 1) == 4 * blob_bytes, "cache target was not rounded down");
+    for (int i = 0; i < 3; ++i) traverse(0);
+    require(source.file_read_bytes() == 4 * blob_bytes, "cached experts were re-read on the next token");
+    require(source.file_read_bytes() < legacy_reads, "recent cache did not reduce reads versus legacy staging");
+    traverse(1); // Evict the four aged entries with a different expert working set.
+    require(source.file_read_bytes() == 8 * blob_bytes, "pressure did not load the new working set once");
+    traverse(1);
+    require(source.file_read_bytes() == 8 * blob_bytes, "new working set was not retained");
+    traverse(0);
+    require(source.file_read_bytes() == 12 * blob_bytes, "evicted working set was not reloaded exactly");
+    source.close();
+    require(open(), "could not reopen after cache eviction");
+    for (int i = 0; i < 3; ++i) traverse(0);
+    require(source.file_read_bytes() == legacy_reads, "reopen retained the opt-in cache policy");
+    std::cout << "recent file cache: exact bytes, reuse, eviction, reopen PASS\n";
+}
+
+#if defined(STRATA_NATIVE_EXPERTS)
+void test_compact_file_cache() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 8, experts = 4;
+    // The actual two UD-Q2_K_XL expert sizes, not values derived from the cache's accounting.
+    constexpr uint64_t small = 1868800, large = 2176000;
+    NativeFmt small_fmt, large_fmt;
+    std::string err;
+    require(native_fmt(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, 2560, 640, small_fmt, err), err);
+    require(native_fmt(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640, large_fmt, err), err);
+    require(small_fmt.bytes == small && large_fmt.bytes == large, "mixed-cache fixture geometry changed");
+    TempDirectory dir(fs::current_path());
+    std::vector<uint64_t> offsets;
+    std::vector<uint8_t> truth;
+    {
+        std::ofstream metadata(dir.path / "native_experts.txt");
+        for (int64_t l = 0; l < layers; ++l) {
+            const uint64_t bytes = l == 2 ? large : small;
+            offsets.push_back(truth.size());
+            metadata << l << ' ' << (l == 2 ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XS) << ' '
+                     << GGML_TYPE_IQ4_NL << ' ' << truth.size() << ' ' << bytes << '\n';
+            for (int64_t e = 0; e < experts; ++e)
+                for (uint64_t i = 0; i < bytes; ++i)
+                    truth.push_back((uint8_t) ((i * 131u + (l * experts + e) * 37u) ^ (i >> 8)));
+        }
+        require((bool) metadata, "could not write mixed-cache layout");
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        out.write((const char*) truth.data(), (std::streamsize) truth.size());
+        require((bool) out, "could not write mixed-cache experts");
+    }
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+    FileExpertSource source;
+    auto open = [&] {
+        require(source.open(dir.path.string(), layers, experts, err), err);
+        set_env("STRATA_UNBUFFERED_LOAD", "1");
+        std::string why;
+        const bool ok = source.set_unbuffered(0, why);
+        set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+        return ok;
+    };
+    if (!open()) {
+        std::cout << "compact file cache: skipped (unbuffered reads unavailable)\n";
+        return;
+    }
+    auto bytes_match = [&](const uint8_t* p, int64_t l, int64_t e) {
+        const uint64_t bytes = l == 2 ? large : small;
+        return p && std::memcmp(p, truth.data() + offsets[(size_t) l] + e * bytes, (size_t) bytes) == 0;
+    };
+    auto get = [&](int64_t l, int64_t e) {
+        source.begin_layer(l, nullptr, 0);
+        const uint8_t* p = source.blob(l, e);
+        require(bytes_match(p, l, e), "compact cache returned the wrong mixed-layout bytes");
+        return p;
+    };
+    auto age = [&] { for (int64_t l : {0, 1, 2, 3}) source.begin_layer(l, nullptr, 0); };
+    auto check = [&](uint64_t bytes, size_t buffers) {
+        const auto stats = source.file_cache_stats();
+        require(stats.allocated_bytes == bytes && stats.buffers == buffers, "compact buffer accounting is wrong");
+    };
+
+    // Same byte budget: five small experts fit only with compact storage. Repeated traversal must be all hits.
+    const uint64_t target = 5 * small + 1;
+    require(source.set_file_cache_bytes(target) == 4 * large, "legacy mixed-size budget rounding changed");
+    for (int round = 0; round < 3; ++round) for (int64_t l : {0, 1, 3, 4, 5}) get(l, 0);
+    const uint64_t legacy_reads = source.file_read_bytes();
+    check(4 * large, 4);
+    require(!source.file_cache_stats().compact, "compact storage enabled by default");
+    source.close();
+    require(open(), "mixed-cache reopen failed");
+    require(source.set_file_cache_bytes(target, true) == target, "compact budget was rounded to maximum slots");
+    for (int round = 0; round < 3; ++round) for (int64_t l : {0, 1, 3, 4, 5}) get(l, 0);
+    require(source.file_read_bytes() == 5 * small && legacy_reads > 5 * small,
+            "compact storage did not retain five small experts under the byte budget");
+    check(5 * small, 5);
+    require(source.file_cache_stats().compact, "compact storage was not enabled");
+
+    // A safe small victim grows for a large expert, and a safe large victim shrinks for a small one.
+    source.close();
+    require(open(), "mixed-cache resize reopen failed");
+    require(source.set_file_cache_bytes(large, true) == large, "mixed-cache resize target changed");
+    get(0, 0);
+    check(small, 1);
+    age();
+    get(2, 0);
+    check(large, 1);
+    age();
+    get(1, 1);
+    check(small, 1);
+    require(source.file_read_bytes() == 2 * small + large, "cross-size replacement read accounting is wrong");
+
+    // A fresh live pointer cannot be resized or evicted even when another layer exceeds the target.
+    source.close();
+    require(open(), "mixed-cache overflow reopen failed");
+    source.set_file_cache_bytes(2 * small, true);
+    const uint8_t* p = get(0, 0);
+    const uint8_t* q = get(2, 0);
+    check(small + large, 2);
+    require(bytes_match(p, 0, 0) && bytes_match(q, 2, 0), "live pointers changed during mixed-size overflow");
+    // The next layer is still inside both lifetimes: even vector growth must preserve their addresses/bytes.
+    get(1, 0);
+    check(2 * small + large, 3);
+    require(bytes_match(p, 0, 0) && bytes_match(q, 2, 0), "pool growth overwrote a live mixed-size buffer");
+    age();
+    get(4, 0);
+    check(2 * small, 2);
+    // Repeated pressure recovers freed slots and returns below target after both cross-size replacements.
+    for (int round = 0; round < 8; ++round) {
+        age();
+        get(2, round % experts);
+        check(large, 1);
+        age();
+        get(5, round % experts);
+        check(small, 1);
+        get(6, round % experts);
+        check(2 * small, 2);
+    }
+    require(source.direct_fallbacks() == 0, "mixed-cache reads fell back to mapping");
+    source.close();
+    auto reset = source.file_cache_stats();
+    require(reset.target_bytes == 0 && reset.allocated_bytes == 0 && reset.buffers == 0 && !reset.compact,
+            "close retained compact-cache state");
+    require(open(), "mixed-cache final reopen failed");
+    require(source.file_read_bytes() == 0 && !source.file_cache_stats().compact,
+            "reopen retained compact mode or counters");
+    require(source.set_file_cache_bytes(0, true) == 0 && !source.file_cache_stats().compact,
+            "zero target enabled compact storage");
+    get(0, 0);
+    check(large, 1);
+    std::cout << "compact file cache: mixed bytes, byte budget, cross-size reuse, live overflow, recovery, reset PASS\n";
+}
+#endif
+
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
 void test_host_memory() {
@@ -613,8 +1062,12 @@ int main(int argc, char** argv) {
         test_host_memory();
         test_canonical_layout();
         test_unbuffered_reads();
+        test_fetch_profiling();
+        test_recent_file_cache();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
+        test_direct_mapping_retirement();
+        test_compact_file_cache();
 #endif
         if (argc == 2 && std::string(argv[1]) == "--rotation-gpu") {
             test_rotating_source(false, true);

@@ -1,0 +1,75 @@
+{
+  "baseline": "baseline-normal-4",
+  "compact": "compact-normal",
+  "timed_rows_complete": true,
+  "smoke_status": "failed in helper logging before smoke completion; engine timed data retained",
+  "baseline_tps": 10.685080622272384,
+  "compact_tps": 11.723129000823063,
+  "speed_change_percent": 9.714932579796653,
+  "all_choices_equal": true,
+  "baseline_file_mb": 42793.0,
+  "compact_file_mb": 39606.0,
+  "file_mb_change_percent": -7.447479727992901,
+  "rows": [
+    {
+      "round": 0,
+      "case": 0,
+      "same_choices": true,
+      "baseline_tps": 11.228779361503534,
+      "compact_tps": 11.934509379778465,
+      "baseline_file_mb": 6813.1,
+      "compact_file_mb": 6321.0
+    },
+    {
+      "round": 0,
+      "case": 1,
+      "same_choices": true,
+      "baseline_tps": 11.686082605996422,
+      "compact_tps": 12.70022701655792,
+      "baseline_file_mb": 6497.6,
+      "compact_file_mb": 5886.5
+    },
+    {
+      "round": 0,
+      "case": 2,
+      "same_choices": true,
+      "baseline_tps": 10.060425430240382,
+      "compact_tps": 10.460456206646311,
+      "baseline_file_mb": 7899.7,
+      "compact_file_mb": 7501.7
+    },
+    {
+      "round": 1,
+      "case": 0,
+      "same_choices": true,
+      "baseline_tps": 12.177950298740344,
+      "compact_tps": 12.902497439660664,
+      "baseline_file_mb": 6611.3,
+      "compact_file_mb": 6118.9
+    },
+    {
+      "round": 1,
+      "case": 1,
+      "same_choices": true,
+      "baseline_tps": 11.493922588431367,
+      "compact_tps": 12.33587503758587,
+      "baseline_file_mb": 6855.4,
+      "compact_file_mb": 6222.6
+    },
+    {
+      "round": 1,
+      "case": 2,
+      "same_choices": true,
+      "baseline_tps": 8.447060686851621,
+      "compact_tps": 10.513865159679327,
+      "baseline_file_mb": 8115.9,
+      "compact_file_mb": 7555.3
+    }
+  ],
+  "caveats": [
+    "One sequential A/B pair, Codex open. Not an alternating repeated benchmark.",
+    "Short prompts, 131072 configured capacity; no nearly-full-context compact benchmark.",
+    "file_mb is logical decode-interval expert bytes, not physical SSD traffic.",
+    "Overall compact-normal run marked failed by helper flush error after all timed rows; smoke must be rerun."
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "status": "failed",
+  "config": "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-fast-128k.json",
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-file-cache.exe",
+  "exe_sha256": "204674c9ba60a8b8f4e0e5096c5e3004de06cb1a7dcdbed634bbf440f2d983f2",
+  "timing_diagnostic": false,
+  "expected_max_context": 131072,
+  "rows": [],
+  "requests": [],
+  "error": "Server exited during startup; inspect the bounded logs.",
+  "memory": {
+    "samples": 214,
+    "min_available_gib": 6.898525238037109,
+    "max_pagefile_used_gib": null,
+    "pagefile_available": false,
+    "pagefile_unavailable_reason": "RuntimeError: PdhAddEnglishCounterW failed. Performance counters may be disabled.",
+    "stop_reason": null
+  }
+}

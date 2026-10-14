@@ -1,0 +1,319 @@
+{
+  "status": "complete",
+  "probe": "actual-helper-launch",
+  "started_unix": 1791605172.4475331,
+  "source_config": "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-portable-128k.json",
+  "source_config_sha256": "46b0392e37d1f0197ea109714a10aee7f606668eb2b82eed8f71ec8d989c164e",
+  "expected_context": 131072,
+  "executable": {
+    "path": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-portable.exe",
+    "bytes": 46220288,
+    "sha256": "fc0ae8c0e97ad501e6c1a994ee51f571d486e1b9e4fae73da9e84a82f7f17b4b"
+  },
+  "before": {
+    "model_name": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "host": "127.0.0.1",
+    "port": 8081,
+    "fit_max_tokens": true,
+    "open_browser": false,
+    "args": {
+      "--expert-cache": "auto",
+      "--max-context": "131072",
+      "--kv": "int8",
+      "--kv-resident": "32768",
+      "--spec": "2",
+      "--suffix-draft": "0",
+      "--lookup-chain": "0",
+      "--resident-budget-gib": "10",
+      "--prefill": "auto",
+      "--vram-reserve-mib": "1024",
+      "--no-prefill-borrow": null
+    },
+    "env": {
+      "STRATA_RESIDENT_HEADROOM_GIB": "4",
+      "STRATA_FILE_CACHE_MIB": "5851",
+      "STRATA_FILE_CACHE_COMPACT": "1",
+      "STRATA_OWNED_PRICE": null
+    },
+    "memory_policy_version": 1,
+    "memory_sample": {
+      "ram_gib": 30.88027572631836,
+      "vram_gib": 15.9921875,
+      "available_gib": 24.389842987060547,
+      "commit_available_gib": 47.388458251953125,
+      "available_fallback_gib": null,
+      "kv_ram_gib": 1.67578125,
+      "cpu_server_gib": 2.0,
+      "later_startup_gib": 1.0,
+      "headroom_gib": 4.0,
+      "gpu_commit_gib": 14.9921875,
+      "expert_pool_gib": 15.714061737060547,
+      "pinned_gib": 10,
+      "recent_mib": 5851,
+      "low_memory": false,
+      "over_budget": false
+    }
+  },
+  "requests": [
+    {
+      "label": "public-launch-arithmetic",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 times 23? Reply with only the integer."
+        }
+      ],
+      "max_tokens": 32,
+      "started_unix": 1791605267.3165357,
+      "response": {
+        "id": "chatcmpl-9552d82f4da44a6284a8f102",
+        "object": "chat.completion",
+        "created": 1791605267,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "391"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 28,
+          "completion_tokens": 4,
+          "total_tokens": 32,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 28,
+          "prompt_ms": 6615.0,
+          "prompt_per_token_ms": 236.25,
+          "prompt_per_second": 4.2,
+          "predicted_n": 4,
+          "predicted_ms": 926.7,
+          "predicted_per_token_ms": 231.675,
+          "predicted_per_second": 4.3,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 7.591
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791605267.3711326,
+        "duration_s": 7.5,
+        "finish": "stop",
+        "prompt_tokens": 28,
+        "reused": 0,
+        "output_tokens": 4,
+        "prompt_total": 28,
+        "prompt_read": 28,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 4,
+        "prompt_ms": 6615.0,
+        "decode_ms": 926.7,
+        "decode_tok_s": 4.3,
+        "hit_rate": 0.331,
+        "pcie_share": 0.108,
+        "ram_blobs": 583,
+        "file_blobs": 866,
+        "file_mb": 491.8,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      },
+      "finished_unix": 1791605274.9424078
+    }
+  ],
+  "limits": {
+    "available_ram_floor_gib": 2,
+    "consecutive_low_samples": 5,
+    "startup_timeout_seconds": 600,
+    "request_output_limit": 32,
+    "saved_log_max_bytes": 4194304
+  },
+  "scope": "Short launch/authentication/arithmetic acceptance only; no long-context or throughput claim.",
+  "private_config_ignored": true,
+  "command": [
+    "C:\\Users\\Joes\\Tools\\Strata\\.venv\\Scripts\\python.exe",
+    "C:\\Users\\Joes\\Tools\\Strata\\tools\\prepare_unsloth_q2.py",
+    "--launch",
+    "--config",
+    "C:\\Users\\Joes\\Tools\\Strata\\build-unsloth\\public-launch-probe-u8vu95b6\\config.json"
+  ],
+  "memory": {
+    "samples": 102,
+    "min_available_gib": 5.900901794433594,
+    "max_pagefile_used_gib": 0.3505706787109375,
+    "pagefile_available": true,
+    "pagefile_unavailable_reason": null,
+    "stop_reason": null
+  },
+  "health": {
+    "loaded": true,
+    "max_context": 131072,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl"
+  },
+  "after": {
+    "model_name": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "host": "127.0.0.1",
+    "port": 8081,
+    "fit_max_tokens": true,
+    "open_browser": false,
+    "args": {
+      "--expert-cache": "auto",
+      "--max-context": "131072",
+      "--kv": "int8",
+      "--kv-resident": "32768",
+      "--spec": "2",
+      "--suffix-draft": "0",
+      "--lookup-chain": "0",
+      "--resident-budget-gib": "11",
+      "--prefill": "auto",
+      "--vram-reserve-mib": "1024",
+      "--no-prefill-borrow": null
+    },
+    "env": {
+      "STRATA_RESIDENT_HEADROOM_GIB": "4",
+      "STRATA_FILE_CACHE_MIB": "5917",
+      "STRATA_FILE_CACHE_COMPACT": "1",
+      "STRATA_OWNED_PRICE": null
+    },
+    "memory_policy_version": 1,
+    "memory_sample": {
+      "ram_gib": 30.88027572631836,
+      "vram_gib": 15.9921875,
+      "available_gib": 25.454673767089844,
+      "commit_available_gib": 47.439456939697266,
+      "available_fallback_gib": null,
+      "kv_ram_gib": 1.67578125,
+      "cpu_server_gib": 2.0,
+      "later_startup_gib": 1.0,
+      "headroom_gib": 4.0,
+      "gpu_commit_gib": 14.9921875,
+      "expert_pool_gib": 16.778892517089844,
+      "pinned_gib": 11,
+      "recent_mib": 5917,
+      "low_memory": false,
+      "over_budget": false
+    }
+  },
+  "refresh_checks": {
+    "marker_removed": true,
+    "sample_has_available_memory": true,
+    "sample_has_selected_budgets": true,
+    "api_key_preserved": true,
+    "authenticated_loopback": true,
+    "context_preserved": true,
+    "fit_max_tokens": true,
+    "no_browser": true
+  },
+  "changed_fields": [
+    "args.--resident-budget-gib",
+    "env.STRATA_FILE_CACHE_MIB",
+    "memory_sample.available_gib",
+    "memory_sample.commit_available_gib",
+    "memory_sample.expert_pool_gib",
+    "memory_sample.pinned_gib",
+    "memory_sample.recent_mib"
+  ],
+  "authentication": [
+    {
+      "credentials": "missing",
+      "status": 401,
+      "passed": true
+    },
+    {
+      "credentials": "wrong",
+      "status": 401,
+      "passed": true
+    }
+  ],
+  "arithmetic": {
+    "expected": "391",
+    "answer": "391",
+    "passed": true,
+    "response": {
+      "id": "chatcmpl-9552d82f4da44a6284a8f102",
+      "object": "chat.completion",
+      "created": 1791605267,
+      "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "391"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 4,
+        "total_tokens": 32,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 28,
+        "prompt_ms": 6615.0,
+        "prompt_per_token_ms": 236.25,
+        "prompt_per_second": 4.2,
+        "predicted_n": 4,
+        "predicted_ms": 926.7,
+        "predicted_per_token_ms": 231.675,
+        "predicted_per_second": 4.3,
+        "draft_n": 0,
+        "draft_n_accepted": 0
+      },
+      "wall_seconds": 7.591
+    }
+  },
+  "engine": {
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "max_context": 131072,
+    "context": 131072,
+    "kv": "int8",
+    "kv_resident": 32768,
+    "expert_slots": 5272,
+    "expert_cache_mib": 9428,
+    "expert_slots_primary": 5272,
+    "expert_cache_primary_mib": 9428,
+    "spec": 2,
+    "mtp_max": 0,
+    "lookup": 0,
+    "vram_free_mib": 761,
+    "arena_mib": 11262,
+    "pool_workers": 7,
+    "pcie_frac": "0.55"
+  },
+  "owned_process_cleanup_completed": true,
+  "source_config_unchanged": true,
+  "runtime_allocations": {
+    "source": "engine startup log, separate from config requests",
+    "pinned_gib": 11.0,
+    "recent_effective_mib": 5917.0,
+    "recent_requested_mib": 5917,
+    "recent_buffer_mode": "compact"
+  },
+  "logs": {
+    "server": {
+      "bytes": 1176,
+      "truncated": false
+    },
+    "engine": {
+      "bytes": 6289,
+      "truncated": false
+    }
+  },
+  "finished_unix": 1791605275.9881833,
+  "private_config_removed": true
+}

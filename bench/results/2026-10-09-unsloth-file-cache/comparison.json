@@ -1,0 +1,15 @@
+{
+  "baseline": "fixed-baseline",
+  "candidate": "fixed-recent-4g",
+  "equal_response_count": true,
+  "identical_messages": 6,
+  "generation_gain_percent": 66.80824825422211,
+  "file_byte_reduction_percent": 46.621445473244606,
+  "larger_original_cache": {
+    "baseline": "fixed-baseline-12g",
+    "equal_response_count": true,
+    "identical_messages": 0,
+    "generation_gain_percent": 22.22729905924399,
+    "file_byte_reduction_percent": 10.664219968977884
+  }
+}

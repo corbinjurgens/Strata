@@ -1,0 +1,52 @@
+{
+  "health": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "max_context": 131072,
+      "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+      "images": false,
+      "api_key": true,
+      "loaded": true,
+      "service": "strata"
+    }
+  },
+  "unauthenticated_models": {
+    "status": 401
+  },
+  "authenticated_models": {
+    "status": 200,
+    "body": {
+      "object": "list",
+      "data": [
+        {
+          "id": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+          "object": "model",
+          "status": {
+            "value": "loaded"
+          },
+          "meta": {
+            "n_ctx": 131072
+          },
+          "architecture": {
+            "input_modalities": [
+              "text"
+            ],
+            "output_modalities": [
+              "text"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "lan_unauthenticated_models": {
+    "status": 401
+  },
+  "lan_wrong_key_models": {
+    "status": 401
+  },
+  "lan_authenticated_models": {
+    "status": 200
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "date": "2026-10-09",
+  "platform": "Windows",
+  "cpu": "AMD Ryzen 7 9800X3D",
+  "cpu_cores": 8,
+  "cpu_threads": 16,
+  "ram_gib": 30.88027572631836,
+  "pagefile_gib": 24,
+  "commit_limit_gib": 54.88,
+  "gpu": "NVIDIA GeForce RTX 4080 SUPER",
+  "gpu_vram_mib": 16376,
+  "driver": "617.14",
+  "model_drive": "CT2000P3SSD8 NVMe 2 TB",
+  "cuda": "13.4.92",
+  "msvc": "19.44.35229",
+  "python": "3.13.13",
+  "build": {
+    "source": "local",
+    "version": "0.1.40",
+    "commit": "6794d901f81717ed9c5b5513c83c0eba1187f068",
+    "src": "ea0dd7eee972c491",
+    "archs": [
+      89
+    ],
+    "sha256": "edd7e1efbbfcb4e860da5e1793171400070d38fe397b6126c1678395c09b6c31"
+  },
+  "model_repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "model_revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+  "model_shards": {
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf": {
+      "size": 10946624,
+      "sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86"
+    },
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf": {
+      "size": 49979779296,
+      "sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6"
+    },
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf": {
+      "size": 28878402944,
+      "sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9"
+    }
+  },
+  "max_context": 131072,
+  "kv": "int8",
+  "kv_resident": 32768,
+  "prefill": "auto (8192 selected at startup)",
+  "vram_reserve_mib": 1024,
+  "resident_budget_gib": 8,
+  "spec": 2,
+  "mtp": false,
+  "suffix_draft": 0,
+  "lookup_chain": 0,
+  "parallel": 1,
+  "env": {
+    "STRATA_RESIDENT_HEADROOM_GIB": "8"
+  },
+  "port": 8080,
+  "api_key_enabled": true,
+  "dense_arena_bytes": 1485688320,
+  "startup_gpu_experts": 5083,
+  "startup_gpu_expert_gib": 8.88,
+  "startup_ram_experts": 4574,
+  "startup_ram_expert_gib": 8,
+  "startup_free_gpu_mib": 836
+}

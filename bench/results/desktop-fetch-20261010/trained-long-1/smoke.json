@@ -1,0 +1,204 @@
+[
+  {
+    "test": "stream-exact-echo",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "cedar-spark-173"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 26,
+      "completion_tokens": 9,
+      "total_tokens": 35,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 26,
+      "prompt_ms": 3068.4,
+      "prompt_per_token_ms": 118.015,
+      "prompt_per_second": 8.5,
+      "predicted_n": 9,
+      "predicted_ms": 2013.9,
+      "predicted_per_token_ms": 223.767,
+      "predicted_per_second": 4.5,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 5.099,
+    "first_token_s": 3.168037600000389
+  },
+  {
+    "test": "arithmetic",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "391"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 28,
+      "completion_tokens": 4,
+      "total_tokens": 32,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 28,
+      "prompt_ms": 2196.7,
+      "prompt_per_token_ms": 78.454,
+      "prompt_per_second": 12.7,
+      "predicted_n": 4,
+      "predicted_ms": 569.8,
+      "predicted_per_token_ms": 142.45,
+      "predicted_per_second": 7.0,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 2.768,
+    "first_token_s": null
+  },
+  {
+    "test": "conversation-history",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "maple-ridge-826"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 56,
+      "completion_tokens": 9,
+      "total_tokens": 65,
+      "prompt_tokens_details": {
+        "cached_tokens": 28
+      }
+    },
+    "timings": {
+      "cache_n": 28,
+      "prompt_n": 28,
+      "prompt_ms": 1901.6,
+      "prompt_per_token_ms": 67.914,
+      "prompt_per_second": 14.7,
+      "predicted_n": 9,
+      "predicted_ms": 1180.5,
+      "predicted_per_token_ms": 131.167,
+      "predicted_per_second": 7.6,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 3.107,
+    "first_token_s": null
+  },
+  {
+    "test": "python-function",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "```python\ndef unique_in_order(items):\n    seen = set()\n    result = []\n    for item in items:\n        if item not in seen:\n            seen.add(item)\n            result.append(item)\n    return result\n```"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 54,
+      "total_tokens": 94,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 40,
+      "prompt_ms": 2079.2,
+      "prompt_per_token_ms": 51.98,
+      "prompt_per_second": 19.2,
+      "predicted_n": 54,
+      "predicted_ms": 8470.4,
+      "predicted_per_token_ms": 156.859,
+      "predicted_per_second": 6.4,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 10.567,
+    "first_token_s": null
+  },
+  {
+    "test": "tool-call",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_df77cc37d5d34780b0857e4f",
+          "type": "function",
+          "function": {
+            "name": "lookup_order",
+            "arguments": "{\"order_id\":17}"
+          }
+        }
+      ]
+    },
+    "finish_reason": "tool_calls",
+    "usage": {
+      "prompt_tokens": 275,
+      "completion_tokens": 29,
+      "total_tokens": 304,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 275,
+      "prompt_ms": 24034.7,
+      "prompt_per_token_ms": 87.399,
+      "prompt_per_second": 11.4,
+      "predicted_n": 29,
+      "predicted_ms": 4581.3,
+      "predicted_per_token_ms": 157.976,
+      "predicted_per_second": 6.3,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 28.619,
+    "first_token_s": null
+  },
+  {
+    "test": "tool-result",
+    "passed": true,
+    "answer": {
+      "role": "assistant",
+      "content": "Order 17 has been retrieved successfully. Here are the details:\n\n- **Order ID:** 17\n- **Status:** Shipped\n- **Tracking Code:** parcel-552\n\nIs there anything else you'd like to know about this order?"
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 342,
+      "completion_tokens": 56,
+      "total_tokens": 398,
+      "prompt_tokens_details": {
+        "cached_tokens": 303
+      }
+    },
+    "timings": {
+      "cache_n": 303,
+      "prompt_n": 39,
+      "prompt_ms": 3557.8,
+      "prompt_per_token_ms": 91.226,
+      "prompt_per_second": 11.0,
+      "predicted_n": 56,
+      "predicted_ms": 5122.9,
+      "predicted_per_token_ms": 91.48,
+      "predicted_per_second": 10.9,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 8.707,
+    "first_token_s": null
+  }
+]

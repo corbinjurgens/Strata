@@ -1,0 +1,7 @@
+{
+  "baseline-normal": "Excluded: optional Windows PDH pagefile counter failure before load; helper subsequently repaired.",
+  "baseline-normal-2": "Excluded: sandbox prevented localhost requests, owned server stopped and helper recorded failure.",
+  "baseline-normal-3": "Excluded: tool/user interruption; stale running result. Escalated process inventory confirmed no benchmark server remained before baseline-normal-4.",
+  "baseline-normal-4": "Complete; accepted normal baseline.",
+  "compact-normal": "Running normal candidate and smoke."
+}

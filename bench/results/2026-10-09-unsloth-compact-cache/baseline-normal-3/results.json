@@ -1,0 +1,180 @@
+{
+  "status": "running",
+  "config": "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-fast-128k.json",
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-file-cache.exe",
+  "exe_sha256": "204674c9ba60a8b8f4e0e5096c5e3004de06cb1a7dcdbed634bbf440f2d983f2",
+  "timing_diagnostic": false,
+  "expected_max_context": 131072,
+  "rows": [],
+  "requests": [
+    {
+      "label": "warmup",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain what a database transaction does in a few sentences."
+        }
+      ],
+      "max_tokens": 64,
+      "response": {
+        "id": "chatcmpl-acd42e082c4d455687266482",
+        "object": "chat.completion",
+        "created": 1791537406,
+        "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "A database transaction groups a series of database operations into a single logical unit of work, ensuring that either all operations succeed together or none are applied at all. This mechanism guarantees data integrity and consistency by adhering to the ACID properties (Atomicity, Consistency, Isolation, and Durability), preventing partial updates that"
+            },
+            "finish_reason": "length"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "total_tokens": 88,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 24,
+          "prompt_ms": 5873.0,
+          "prompt_per_token_ms": 244.708,
+          "prompt_per_second": 4.1,
+          "predicted_n": 64,
+          "predicted_ms": 23791.7,
+          "predicted_per_token_ms": 371.745,
+          "predicted_per_second": 2.7,
+          "draft_n": 0,
+          "draft_n_accepted": 0
+        },
+        "wall_seconds": 29.681
+      },
+      "metric": {
+        "projection": null,
+        "time": 1791537406.5812771,
+        "duration_s": 29.7,
+        "finish": "length",
+        "prompt_tokens": 24,
+        "reused": 0,
+        "output_tokens": 64,
+        "prompt_total": 24,
+        "prompt_read": 24,
+        "reasoning_recoveries": 0,
+        "reasoning_repeat_coverage": 0.0,
+        "engine_generated": 64,
+        "prompt_ms": 5873.0,
+        "decode_ms": 23791.7,
+        "decode_tok_s": 2.7,
+        "hit_rate": 0.691,
+        "pcie_share": 0.067,
+        "ram_blobs": 6285,
+        "file_blobs": 6103,
+        "file_mb": 3587.5,
+        "drafts_offered": 0,
+        "drafts_accepted": 0
+      }
+    },
+    {
+      "label": "round-0-case-0",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Technical explanation case 0."
+        },
+        {
+          "role": "user",
+          "content": "Explain how a hash table handles collisions, resizing, and lookup. Give a detailed technical explanation."
+        }
+      ],
+      "max_tokens": 160
+    }
+  ],
+  "health": {
+    "status": "ok",
+    "max_context": 131072,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "images": false,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "engine": {
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "max_context": 131072,
+    "images": false,
+    "version": "0.1.40",
+    "context": 131072,
+    "kv": "int8",
+    "kv_resident": 32768,
+    "expert_slots": 4990,
+    "expert_cache_mib": 8922,
+    "expert_slots_primary": 4990,
+    "expert_cache_primary_mib": 8922,
+    "spec": 2,
+    "mtp_max": 0,
+    "lookup": 0,
+    "vram_free_mib": 1038,
+    "cvec": 0,
+    "arena_mib": 8190,
+    "pool_workers": 7,
+    "pcie_frac": "0.55",
+    "spec_min_p": "0.00",
+    "conversation_cache_mib": 0,
+    "conversation_cache_slots": 4,
+    "conversation_cache_min_free_mib": 2560,
+    "tail_role_token": -1,
+    "vram_elastic": 0,
+    "engine": "0.1.40"
+  },
+  "memory": {
+    "samples": 61,
+    "min_available_gib": 4.034778594970703,
+    "max_pagefile_used_gib": 0.0920257568359375,
+    "pagefile_available": true,
+    "pagefile_unavailable_reason": null,
+    "stop_reason": null
+  },
+  "warmup": {
+    "id": "chatcmpl-acd42e082c4d455687266482",
+    "object": "chat.completion",
+    "created": 1791537406,
+    "model": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "A database transaction groups a series of database operations into a single logical unit of work, ensuring that either all operations succeed together or none are applied at all. This mechanism guarantees data integrity and consistency by adhering to the ACID properties (Atomicity, Consistency, Isolation, and Durability), preventing partial updates that"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 24,
+      "completion_tokens": 64,
+      "total_tokens": 88,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 24,
+      "prompt_ms": 5873.0,
+      "prompt_per_token_ms": 244.708,
+      "prompt_per_second": 4.1,
+      "predicted_n": 64,
+      "predicted_ms": 23791.7,
+      "predicted_per_token_ms": 371.745,
+      "predicted_per_second": 2.7,
+      "draft_n": 0,
+      "draft_n_accepted": 0
+    },
+    "wall_seconds": 29.681
+  }
+}

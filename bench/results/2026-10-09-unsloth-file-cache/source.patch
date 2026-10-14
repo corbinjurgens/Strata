@@ -1,0 +1,149 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 3eda5a0..fcb618e 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -538,0 +539,4 @@ public:
++    /// Optional recent-file cache in the existing assembly buffers. Startup only; allocates lazily and returns
++    /// the rounded retention target. Live/in-flight buffers still obey the original lifetime rules and may need
++    /// more room than this target. Zero retains the original staging policy. Caller budgets the extra host RAM.
++    uint64_t set_file_cache_bytes(uint64_t bytes);
+@@ -642,0 +647 @@ private:
++    size_t stage_cache_slots_ = 0;
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index d0ff201..c2c9a83 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -654,0 +655 @@ void FileExpertSource::close() {
++        stage_cache_slots_ = 0;
+@@ -803,0 +805,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
++uint64_t FileExpertSource::set_file_cache_bytes(uint64_t bytes) {
++    std::lock_guard<std::mutex> lk(stage_mu_);
++    stage_cache_slots_ = staged() && stage_blob_ > 0
++        ? (size_t) std::min<uint64_t>((uint64_t) blobs_, bytes / stage_blob_) : 0;
++    return (uint64_t) stage_cache_slots_ * stage_blob_;
++}
++
+@@ -830,13 +838,20 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill) {
+-    if (v == stage_buf_.size()) {
+-        stage_buf_.emplace_back(new (std::nothrow) uint8_t[(size_t) stage_blob_]);
+-        if (!stage_buf_.back()) { stage_buf_.pop_back(); return false; }
+-        stage_key_.push_back(-1);
+-        stage_epoch_.push_back(0);
+-        stage_used_.push_back(0);
+-        stage_busy_.push_back(0);
+-        if (stage_buf_.size() == 512 && !stage_grew_) {
+-            stage_grew_ = true;
+-            std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
+-                         stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
+-        }
+-    } else {
++    const size_t previous_size = stage_buf_.size();
++    if (v == previous_size || previous_size < stage_cache_slots_) {
++        // A bounded recent working set can survive the next token's layer traversal. Preserve the original
++        // eligible victim as a fallback if an optional cache allocation fails; busy/live buffers are never reused.
++        std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[(size_t) stage_blob_]);
++        if (buffer) {
++            v = previous_size;
++            stage_buf_.push_back(std::move(buffer));
++            stage_key_.push_back(-1);
++            stage_epoch_.push_back(0);
++            stage_used_.push_back(0);
++            stage_busy_.push_back(0);
++            if (stage_buf_.size() == 512 && !stage_grew_) {
++                stage_grew_ = true;
++                std::fprintf(stderr, "FileExpertSource: %zu assembled expert buffers (%.2f GiB)\n",
++                             stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
++            }
++        } else if (v == previous_size) return false;
++    }
++    if (v < previous_size) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index d7cec00..ff4157c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -5541,0 +5542,18 @@ int main(int argc, char** argv) {
++    // Opt-in cache for recent experts outside the profile-ranked RAM/GPU tiers. Set it after the RAM arena is
++    // allocated so its capacity is limited by remaining physical RAM and Windows commit, with 4 GiB headroom.
++    if (const char* v = std::getenv("STRATA_FILE_CACHE_MIB"); v != nullptr && v[0] != '\0') {
++        char* end = nullptr;
++        errno = 0;
++        const unsigned long long mib = std::strtoull(v, &end, 10);
++        if (v[0] == '-' || end == v || *end != '\0' || errno == ERANGE || mib > (UINT64_MAX >> 20)) {
++            std::fprintf(stderr, "strata generate: STRATA_FILE_CACHE_MIB must be a nonnegative integer\n");
++            return 2;
++        }
++        strata::core::detail::HostMemory mem;
++        uint64_t target = 0;
++        if (strata::core::detail::host_available_memory(mem))
++            target = strata::core::detail::clamp_resident_budget((uint64_t) mib << 20, mem.available, mem.commit, 4ull << 30);
++        const uint64_t actual = src.set_file_cache_bytes(target);
++        std::fprintf(stderr, "strata generate: recent file expert cache %.1f MiB (requested %llu MiB; lazy, 4 GiB headroom)\n",
++                     (double) actual / (1ull << 20), mib);
++    }
+diff --git a/tests/core/file_expert_source_test.cpp b/tests/core/file_expert_source_test.cpp
+index 5659097..c70f02a 100644
+--- a/tests/core/file_expert_source_test.cpp
++++ b/tests/core/file_expert_source_test.cpp
+@@ -458,0 +459,60 @@ void test_unbuffered_reads() {
++void test_recent_file_cache() {
++    using namespace strata::core;
++    using namespace strata::kernels::cpu;
++    TempDirectory dir(fs::current_path());
++    constexpr int64_t layers = 8, experts = 2;
++    const uint64_t blob_bytes = (uint64_t) BLOB;
++    std::string err;
++    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
++    std::vector<uint8_t> truth((size_t) (layers * experts * blob_bytes));
++    for (size_t i = 0; i < truth.size(); ++i) truth[i] = (uint8_t) ((i * 131u + (i / blob_bytes) * 37u) ^ (i >> 8));
++    {
++        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
++        out.write((const char*) truth.data(), (std::streamsize) truth.size());
++        require((bool) out, "could not write recent-cache fixture");
++    }
++    FileExpertSource source;
++    auto open = [&] {
++        require(source.open(dir.path.string(), layers, experts, err), err);
++        set_env("STRATA_UNBUFFERED_LOAD", "1");
++        std::string why;
++        const bool ok = source.set_unbuffered(0, why);
++        set_env("STRATA_UNBUFFERED_LOAD", nullptr);
++        return ok;
++    };
++    if (!open()) {
++        std::cout << "recent file cache: skipped (unbuffered reads unavailable)\n";
++        return;
++    }
++    auto traverse = [&](int expert) {
++        for (int64_t layer = 0; layer < layers; ++layer) {
++            source.begin_layer(layer, nullptr, 0);
++            if (layer % 2) continue;
++            const int64_t e = expert;
++            source.prefetch(layer, &e, 1);
++            const uint8_t* b = source.blob(layer, expert);
++            require(b && !std::memcmp(b, truth.data() + (layer * experts + expert) * blob_bytes, (size_t) blob_bytes),
++                    "recent cache returned stale or wrong expert bytes");
++        }
++    };
++    for (int i = 0; i < 3; ++i) traverse(0);
++    const uint64_t legacy_reads = source.file_read_bytes();
++    source.close();
++    require(open(), "could not reopen recent-cache fixture");
++    require(source.set_file_cache_bytes(4 * blob_bytes + 1) == 4 * blob_bytes, "cache target was not rounded down");
++    for (int i = 0; i < 3; ++i) traverse(0);
++    require(source.file_read_bytes() == 4 * blob_bytes, "cached experts were re-read on the next token");
++    require(source.file_read_bytes() < legacy_reads, "recent cache did not reduce reads versus legacy staging");
++    traverse(1); // Evict the four aged entries with a different expert working set.
++    require(source.file_read_bytes() == 8 * blob_bytes, "pressure did not load the new working set once");
++    traverse(1);
++    require(source.file_read_bytes() == 8 * blob_bytes, "new working set was not retained");
++    traverse(0);
++    require(source.file_read_bytes() == 12 * blob_bytes, "evicted working set was not reloaded exactly");
++    source.close();
++    require(open(), "could not reopen after cache eviction");
++    for (int i = 0; i < 3; ++i) traverse(0);
++    require(source.file_read_bytes() == legacy_reads, "reopen retained the opt-in cache policy");
++    std::cout << "recent file cache: exact bytes, reuse, eviction, reopen PASS\n";
++}
++
+@@ -615,0 +676 @@ int main(int argc, char** argv) {
++        test_recent_file_cache();

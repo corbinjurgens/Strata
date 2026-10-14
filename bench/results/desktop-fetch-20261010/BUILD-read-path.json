@@ -1,0 +1,17 @@
+{
+  "source": "local",
+  "version": "0.1.40",
+  "commit": "6794d901f81717ed9c5b5513c83c0eba1187f068",
+  "src": "51760fcdf51c450e",
+  "archs": [
+    89
+  ],
+  "exe": "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-read-path.exe",
+  "sha256": "fc0ae8c0e97ad501e6c1a994ee51f571d486e1b9e4fae73da9e84a82f7f17b4b",
+  "experimental": true,
+  "source_sha256": {
+    "src/core/expert_source.cpp": "c7eb8ac167e3b86e514113453dceac2862b818795532b8cca212983fa5a8c049",
+    "include/strata/core/expert_source.hpp": "1e9fe03f61fce833bffe89c2511b61c193025d7cdd187a360b07850c7e2b5611",
+    "src/program/generate.cpp": "d7f9d443b73c85229ed6281b7afffac7c509ecb7184588c6407fdae2b88ca73c"
+  }
+}

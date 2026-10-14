@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -61,6 +62,28 @@
 #endif
 
 namespace strata::core {
+
+namespace {
+// Disabled diagnostics do not read the clock or touch shared counters. finish() also marks explicit phase
+// boundaries, so the direct-read plan, submit, wait and copy timers do not overlap each other.
+class FetchTimer {
+public:
+    explicit FetchTimer(std::atomic<uint64_t>* counter) : counter_(counter) {
+        if (counter_) start_ = std::chrono::steady_clock::now();
+    }
+    ~FetchTimer() { finish(); }
+    void finish() {
+        if (!counter_) return;
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_).count();
+        counter_->fetch_add((uint64_t) ns, std::memory_order_relaxed);
+        counter_ = nullptr;
+    }
+private:
+    std::atomic<uint64_t>* counter_;
+    std::chrono::steady_clock::time_point start_;
+};
+} // namespace
 
 namespace detail {
 
@@ -640,18 +663,26 @@ void FileExpertSource::close() {
     role_ptr_.clear();
     role_bytes_.clear();
     role_file_.clear();
+    role_offset_.clear();
     paths_.clear();
     for (void* h : direct_) close_direct(h);
     direct_.clear();
+    for (void* h : buffered_) close_direct(h);
+    buffered_.clear();
+    direct_mappings_retired_ = false;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
+        stage_capacity_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
         stage_used_.clear();
         stage_busy_.clear();
         stage_of_.clear();
         stage_blob_ = 0;
+        stage_cache_slots_ = 0;
+        stage_cache_bytes_ = stage_allocated_bytes_ = 0;
+        stage_compact_ = false;
         stage_seq_ = 0;
         epoch_ = 0;
         last_layer_ = -1;
@@ -664,6 +695,8 @@ void FileExpertSource::close() {
     file_read_bytes_.store(0);
     file_blob_bytes_.store(0);
     file_us_.store(0);
+    fetch_profiling_ = false;
+    for (auto& value : fetch_counts_) value.store(0, std::memory_order_relaxed);
 #if defined(_WIN32)
     if (base_ != nullptr) UnmapViewOfFile((LPCVOID) base_);
     if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
@@ -709,6 +742,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
     role_ptr_.assign((size_t) (3 * n_layers_), nullptr);
     role_bytes_.assign((size_t) (3 * n_layers_), 0);
     role_file_.assign((size_t) (3 * n_layers_), 0);
+    role_offset_.assign((size_t) (3 * n_layers_), 0);
     for (int64_t l = 0; l < n_layers_; ++l) {
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
@@ -769,6 +803,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
                 return false;
             }
             role_ptr_[i] = m.base + (size_t) at;
+            role_offset_[i] = at;
             role_bytes_[i] = per[r];
         }
     }
@@ -785,12 +820,15 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
         if (read_direct(&f, 1)) return true;
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
+    if (direct_mappings_retired_) return read_buffered(layer, expert, dst);
+    FetchTimer mapped_copy(fetch_counter(FetchMetric::mapped_copy_ns));
     if (!role_ptr_.empty()) {
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
             const uint64_t per = role_bytes_[i];
             std::memcpy(dst + at, role_ptr_[i] + (size_t) ((uint64_t) expert * per), (size_t) per);
+            fetch_add(FetchMetric::mapped_copy_bytes, per);
             at += per;
         }
         return true;
@@ -798,7 +836,32 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
+    fetch_add(FetchMetric::mapped_copy_bytes, layer_blob_bytes_[(size_t) layer]);
     return true;
+}
+
+uint64_t FileExpertSource::set_file_cache_bytes(uint64_t bytes, bool compact) {
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    stage_cache_slots_ = staged() && stage_blob_ > 0
+        ? (size_t) std::min<uint64_t>((uint64_t) blobs_, bytes / stage_blob_) : 0;
+    stage_compact_ = compact && bytes > 0 && staged() && stage_blob_ > 0;
+    stage_cache_bytes_ = stage_compact_ ? std::min(bytes, expert_bytes())
+                                      : (uint64_t) stage_cache_slots_ * stage_blob_;
+    return stage_cache_bytes_;
+}
+
+FileExpertSource::FileCacheStats FileExpertSource::file_cache_stats() {
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    FileCacheStats stats{stage_cache_bytes_, stage_allocated_bytes_, 0, stage_compact_};
+    for (const auto& b : stage_buf_) if (b) ++stats.buffers;
+    return stats;
+}
+
+FileExpertSource::FetchStats FileExpertSource::fetch_stats() const {
+    FetchStats stats;
+    for (size_t i = 0; i < stats.values.size(); ++i)
+        stats.values[i] = fetch_counts_[i].load(std::memory_order_relaxed);
+    return stats;
 }
 
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
@@ -809,44 +872,139 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill) {
+    FetchTimer claim(fetch_counter(FetchMetric::claim_ns));
+    fetch_add(FetchMetric::claims);
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
+    FetchTimer lookup(fetch_counter(FetchMetric::lookup_ns));
     auto it = stage_of_.find(key);
+    lookup.finish();
     fill = false;
     if (it != stage_of_.end()) {
         v = it->second;
         stage_epoch_[v] = epoch_;
         stage_used_[v] = seq;
+        fetch_add(FetchMetric::hits);
+        if (stage_busy_[v]) fetch_add(FetchMetric::busy_hits);
         return true;
     }
-    v = stage_buf_.size();
+    fetch_add(FetchMetric::misses);
+    const size_t previous_size = stage_buf_.size();
+    v = previous_size;
+    size_t empty = previous_size;
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
-    for (size_t i = 0; i < stage_buf_.size(); ++i)
-        if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
-            stage_used_[i] < oldest) {
+    auto eligible = [&](size_t i) {
+        return !stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq);
+    };
+    FetchTimer scan(fetch_counter(FetchMetric::scan_ns));
+    fetch_add(FetchMetric::scan_slots, previous_size);
+    for (size_t i = 0; i < previous_size; ++i) {
+        if (!stage_buf_[i]) {
+            if (empty == previous_size) empty = i;
+        } else if (eligible(i) && stage_used_[i] < oldest) {
             oldest = stage_used_[i];
             v = i;
         }
-    if (v == stage_buf_.size()) {
-        stage_buf_.emplace_back(new (std::nothrow) uint8_t[(size_t) stage_blob_]);
-        if (!stage_buf_.back()) { stage_buf_.pop_back(); return false; }
+    }
+    scan.finish();
+    const uint64_t need = stage_compact_ ? layer_blob_bytes_[(size_t) (key / n_expert_)] : stage_blob_;
+    const bool grow = stage_compact_
+        ? stage_allocated_bytes_ <= stage_cache_bytes_ && need <= stage_cache_bytes_ - stage_allocated_bytes_
+        : previous_size < stage_cache_slots_;
+    if (v == previous_size || grow) v = empty;
+    std::unique_ptr<uint8_t[]> buffer;
+    if (v == previous_size || stage_capacity_[v] != need) {
+        {
+            FetchTimer allocation(fetch_counter(FetchMetric::allocation_ns));
+            buffer.reset(new (std::nothrow) uint8_t[(size_t) need]);
+        }
+        if (buffer) {
+            fetch_add(FetchMetric::allocations);
+            fetch_add(FetchMetric::allocation_bytes, need);
+        }
+        if (!buffer) {
+            // Optional growth/shrink failed: retain the oldest safe buffer large enough for these bytes.
+            // Its actual capacity stays charged; neither a live pointer nor an old lookup changes on failure.
+            v = previous_size;
+            oldest = std::numeric_limits<uint64_t>::max();
+            FetchTimer fallback_scan(fetch_counter(FetchMetric::scan_ns));
+            fetch_add(FetchMetric::scan_slots, previous_size);
+            for (size_t i = 0; i < previous_size; ++i)
+                if (stage_capacity_[i] >= need && eligible(i) && stage_used_[i] < oldest) {
+                    oldest = stage_used_[i];
+                    v = i;
+                }
+            if (v == previous_size) return false;
+        }
+    }
+    // Reserve every parallel vector and the new lookup before erasing a victim. Reserves can change vector
+    // storage but not the individually allocated blobs handed to readers. Empty slots are always reused first.
+    try {
+        FetchTimer metadata(fetch_counter(FetchMetric::allocation_ns));
+        if (v == previous_size) {
+            const size_t cap = stage_buf_.capacity() > previous_size ? stage_buf_.capacity()
+                : std::max<size_t>(previous_size + 1, std::max<size_t>(8, previous_size * 2));
+            stage_buf_.reserve(cap);
+            stage_capacity_.reserve(cap);
+            stage_key_.reserve(cap);
+            stage_epoch_.reserve(cap);
+            stage_used_.reserve(cap);
+            stage_busy_.reserve(cap);
+        }
+        stage_of_.emplace(key, v);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    if (v == previous_size) {
+        stage_buf_.push_back(nullptr);
+        stage_capacity_.push_back(0);
         stage_key_.push_back(-1);
         stage_epoch_.push_back(0);
         stage_used_.push_back(0);
         stage_busy_.push_back(0);
-        if (stage_buf_.size() == 512 && !stage_grew_) {
-            stage_grew_ = true;
-            std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
-                         stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
-        }
-    } else {
+    } else if (stage_key_[v] >= 0) {
+        FetchTimer eviction(fetch_counter(FetchMetric::eviction_ns));
         stage_of_.erase(stage_key_[v]);
+        fetch_add(FetchMetric::evictions);
+    }
+    if (buffer) {
+        FetchTimer replacement(fetch_counter(FetchMetric::eviction_ns));
+        stage_allocated_bytes_ -= stage_capacity_[v];
+        stage_buf_[v] = std::move(buffer);
+        stage_capacity_[v] = need;
+        stage_allocated_bytes_ += need;
     }
     stage_key_[v] = key;
     stage_epoch_[v] = epoch_;
     stage_used_[v] = seq;
     stage_busy_[v] = 1;
-    stage_of_[key] = v;
+    // A larger replacement can need more than one old entry's room. Release only safe oldest entries;
+    // indices remain stable for pending fills. If all remaining entries are live, preserve the original overflow.
+    while (stage_compact_ && stage_allocated_bytes_ > stage_cache_bytes_) {
+        size_t victim = stage_buf_.size();
+        oldest = std::numeric_limits<uint64_t>::max();
+        FetchTimer eviction_scan(fetch_counter(FetchMetric::scan_ns));
+        fetch_add(FetchMetric::scan_slots, stage_buf_.size());
+        for (size_t i = 0; i < stage_buf_.size(); ++i)
+            if (stage_buf_[i] && eligible(i) && stage_used_[i] < oldest) {
+                oldest = stage_used_[i];
+                victim = i;
+            }
+        eviction_scan.finish();
+        if (victim == stage_buf_.size()) break;
+        FetchTimer eviction(fetch_counter(FetchMetric::eviction_ns));
+        stage_of_.erase(stage_key_[victim]);
+        if (stage_key_[victim] >= 0) fetch_add(FetchMetric::evictions);
+        stage_key_[victim] = -1;
+        stage_buf_[victim].reset();
+        stage_allocated_bytes_ -= stage_capacity_[victim];
+        stage_capacity_[victim] = 0;
+    }
+    if (stage_buf_.size() == 512 && !stage_grew_) {
+        stage_grew_ = true;
+        std::fprintf(stderr, "FileExpertSource: %zu assembled expert buffers (%.2f GiB)\n",
+                     stage_buf_.size(), (double) stage_allocated_bytes_ / 1073741824.0);
+    }
     fill = true;
     return false;
 }
@@ -860,13 +1018,16 @@ bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8
 }
 
 void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us) {
+    FetchTimer publish(fetch_counter(FetchMetric::publish_ns));
     file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
     if (ok) {
         file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
     }
     {
+        FetchTimer lock_wait(fetch_counter(FetchMetric::lock_wait_ns));
         std::lock_guard<std::mutex> lk(stage_mu_);
+        lock_wait.finish();
         stage_busy_[v] = 0;
         if (!ok) {
             stage_of_.erase(stage_key_[v]);
@@ -877,18 +1038,23 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
 }
 
 const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
+    FetchTimer caller(fetch_counter(FetchMetric::caller_ns));
     const int64_t key = layer * n_expert_ + expert;
     size_t v = 0;
     bool fill = false;
     uint8_t* dst = nullptr;
     {
+        FetchTimer lock_wait(fetch_counter(FetchMetric::lock_wait_ns));
         std::unique_lock<std::mutex> lk(stage_mu_);
+        lock_wait.finish();
         const bool have = claim_stage(key, v, fill);
         if (!have && !fill) return nullptr;
         dst = stage_buf_[v].get();
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
+            FetchTimer fill_wait(stage_busy_[v] ? fetch_counter(FetchMetric::fill_wait_ns) : nullptr);
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
+            fill_wait.finish();
             if (stage_key_[v] != key) return nullptr;   // its fill failed
             return dst;
         }
@@ -898,9 +1064,12 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
 
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    FetchTimer caller(fetch_counter(FetchMetric::caller_ns));
     std::vector<Fill> todo;
     {
+        FetchTimer lock_wait(fetch_counter(FetchMetric::lock_wait_ns));
         std::lock_guard<std::mutex> lk(stage_mu_);
+        lock_wait.finish();
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
             if (e < 0 || e >= n_expert_) continue;
@@ -924,9 +1093,12 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
 
 void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) {
     if (direct_.empty() || pairs == nullptr || n <= 0) return;   // unbuffered only: the mapped fill stays as it was
+    FetchTimer caller(fetch_counter(FetchMetric::caller_ns));
     std::vector<Fill> todo;
     {
+        FetchTimer lock_wait(fetch_counter(FetchMetric::lock_wait_ns));
         std::lock_guard<std::mutex> lk(stage_mu_);
+        lock_wait.finish();
         for (int64_t i = 0; i < std::min<int64_t>(n, 64); ++i) {
             const int64_t l = pairs[i].first, e = pairs[i].second;
             if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
@@ -957,6 +1129,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
 
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     if (todo.empty()) return;
+    FetchTimer fill(fetch_counter(FetchMetric::fill_ns));
     if (!direct_.empty()) {
         // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
         // fill) on up to 4 threads, a decode layer's few misses on this one
@@ -994,6 +1167,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             return (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
         }();
         if (pvm != nullptr) {
+            FetchTimer hint(fetch_counter(FetchMetric::prefetch_hint_ns));
             std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
             ranges.reserve(todo.size() * 3);
             for (const Fill& f : todo)
@@ -1091,6 +1265,10 @@ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
 
 bool FileExpertSource::recheck_unbuffered(std::string& why) {
 #if defined(_WIN32) || defined(__linux__)
+    if (direct_mappings_retired_) {
+        why = "direct mappings were retired; retaining direct reads with buffered positional fallback";
+        return true;
+    }
     if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0') {
         why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
         return !direct_.empty();
@@ -1122,7 +1300,131 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
 #endif
 }
 
+uint64_t FileExpertSource::mapped_view_bytes() const {
+    if (maps_.empty()) return base_ == nullptr ? 0 : mapped_bytes_;
+    uint64_t bytes = 0;
+    for (const Map& m : maps_) if (m.base != nullptr) bytes += m.bytes;
+    return bytes;
+}
+
+bool FileExpertSource::retire_direct_mappings(std::string& err) {
+#if defined(_WIN32)
+    if (direct_mappings_retired_) {
+        if (mapped_view_bytes() == 0) return true;
+        err = "FileExpertSource: an earlier mapping retirement was incomplete; close and reopen the source";
+        return false;
+    }
+    if (base_ == nullptr || role_ptr_.empty() || maps_.empty() || direct_.size() != maps_.size() ||
+        role_offset_.size() != role_ptr_.size()) {
+        err = "FileExpertSource: mapping retirement requires an open native GGUF source using unbuffered reads";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        if (std::any_of(stage_busy_.begin(), stage_busy_.end(), [](char b) { return b != 0; })) {
+            err = "FileExpertSource: cannot retire mappings with an expert fill in flight";
+            return false;
+        }
+    }
+    // Validate and acquire every fallback handle before touching a view. Merely opening the handles issues no
+    // model-payload read. Each actual fallback uses its own OVERLAPPED/event, never a shared mutable file position.
+    std::vector<void*> handles;
+    struct CloseHandles {
+        std::vector<void*>& handles;
+        ~CloseHandles() { for (void* h : handles) CloseHandle((HANDLE) h); }
+    } cleanup{handles};
+    handles.reserve(paths_.size());
+    for (const std::string& path : paths_) {
+        const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
+        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
+        HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            err = "FileExpertSource: cannot open buffered fallback for " + path + " (error " +
+                  std::to_string((unsigned long long) error) + "); mappings retained";
+            return false;
+        }
+        handles.push_back(h);
+    }
+    buffered_.swap(handles);
+    // Every pointer consumer now uses either validated offsets or the bounded positional fallback. An OS unmap
+    // failure leaves that view owned for close(), and the source usable; the caller still refuses the experiment.
+    direct_mappings_retired_ = true;
+    base_ = nullptr;
+    std::fill(role_ptr_.begin(), role_ptr_.end(), nullptr);
+    DWORD error = ERROR_SUCCESS;
+    for (Map& m : maps_) {
+        if (m.base != nullptr) {
+            if (!UnmapViewOfFile(m.base)) { if (error == ERROR_SUCCESS) error = GetLastError(); continue; }
+            m.base = nullptr;
+        }
+        if (m.mapping != nullptr) { CloseHandle((HANDLE) m.mapping); m.mapping = nullptr; }
+        if (m.file != nullptr) { CloseHandle((HANDLE) m.file); m.file = nullptr; }
+    }
+    if (error != ERROR_SUCCESS) {
+        err = "FileExpertSource: mapping retirement incomplete (error " + std::to_string((unsigned long long) error) +
+              "); source remains usable through positional reads";
+        return false;
+    }
+    return true;
+#else
+    err = "FileExpertSource: direct mapping retirement is a Windows-only experiment";
+    return false;
+#endif
+}
+
+bool FileExpertSource::read_buffered(int64_t layer, int64_t expert, uint8_t* dst) const {
+#if defined(_WIN32)
+    if (!direct_mappings_retired_ || dst == nullptr || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_ || buffered_.size() != maps_.size()) return false;
+    FetchTimer buffered(fetch_counter(FetchMetric::buffered_read_ns));
+    struct Event {
+        HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ~Event() { if (h != nullptr) CloseHandle(h); }
+    } event;
+    if (event.h == nullptr) return false;
+    uint64_t at = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        const uint64_t per = role_bytes_[i], off = role_offset_[i] + (uint64_t) expert * per;
+        const HANDLE file = (HANDLE) buffered_[(size_t) role_file_[i]];
+        for (uint64_t done = 0; done < per;) {
+            const DWORD bytes = (DWORD) std::min<uint64_t>(per - done, 8ull << 20);
+            OVERLAPPED ov{};
+            ov.Offset = (DWORD) (off + done);
+            ov.OffsetHigh = (DWORD) ((off + done) >> 32);
+            ov.hEvent = event.h;
+            if (!ResetEvent(event.h)) return false;
+            FetchTimer submit(fetch_counter(FetchMetric::read_submit_ns));
+            if (!ReadFile(file, dst + at + done, bytes, nullptr, &ov) && GetLastError() != ERROR_IO_PENDING)
+                return false;
+            fetch_add(FetchMetric::read_requests);
+            fetch_add(FetchMetric::submitted_bytes, bytes);
+            submit.finish();
+            DWORD got = 0;
+            FetchTimer wait(fetch_counter(FetchMetric::read_wait_ns));
+            const bool ok = GetOverlappedResult(file, &ov, &got, TRUE) != FALSE;
+            wait.finish();
+            fetch_add(FetchMetric::completed_bytes, got);
+            if (!ok || got != bytes) return false;
+            fetch_add(FetchMetric::buffered_read_bytes, got);
+            done += got;
+        }
+        at += per;
+    }
+    return true;
+#else
+    (void) layer; (void) expert; (void) dst;
+    return false;
+#endif
+}
+
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+    FetchTimer read(fetch_counter(FetchMetric::read_ns));
+    FetchTimer plan(fetch_counter(FetchMetric::read_plan_ns));
+    fetch_add(FetchMetric::read_batches);
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
@@ -1162,8 +1464,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * f.layer + r);
             const uint64_t per = role_bytes_[i];
-            const Map& m = maps_[(size_t) role_file_[i]];
-            const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
+            const uint64_t off = role_offset_[i] + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
             at += per;
@@ -1210,9 +1511,11 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         sc.ev.push_back(e);
     }
     sc.ov.assign(sc.req.size(), OVERLAPPED{});
+    plan.finish();
     // every request in flight before the first wait: the drive sees the whole batch as one queue
     size_t issued = 0;
     bool ok = true;
+    FetchTimer submit(fetch_counter(FetchMetric::read_submit_ns));
     for (size_t q = 0; q < sc.req.size(); ++q) {
         const Req& r = sc.req[q];
         OVERLAPPED& o = sc.ov[q];
@@ -1224,16 +1527,25 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             break;
         }
         ++issued;
+        fetch_add(FetchMetric::read_requests);
+        fetch_add(FetchMetric::submitted_bytes, r.size);
     }
+    submit.finish();
     std::vector<DWORD>& got = sc.got;
     got.assign(sc.req.size(), 0);
-    for (size_t q = 0; q < issued; ++q)
+    FetchTimer wait(fetch_counter(FetchMetric::read_wait_ns));
+    for (size_t q = 0; q < issued; ++q) {
         if (!GetOverlappedResult(sc.req[q].h, &sc.ov[q], &got[q], TRUE)) ok = false;
+        fetch_add(FetchMetric::completed_bytes, got[q]);
+    }
+    wait.finish();
     if (!ok || issued < sc.req.size()) return false;
+    FetchTimer copy(fetch_counter(FetchMetric::direct_copy_ns));
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+        fetch_add(FetchMetric::direct_copy_bytes, x.n);
     }
     return true;
 #elif defined(__linux__)
@@ -1282,8 +1594,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * f.layer + r);
             const uint64_t per = role_bytes_[i];
-            const Map& m = maps_[(size_t) role_file_[i]];
-            const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
+            const uint64_t off = role_offset_[i] + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
             at += per;
@@ -1329,8 +1640,10 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     sc.cb.resize(std::min<size_t>(sc.req.size(), (size_t) kDepth));
     sc.cbp.resize(sc.cb.size());
     sc.ev.resize(sc.cb.size());
+    plan.finish();
     bool ok = true;
     for (size_t w0 = 0; ok && w0 < sc.req.size(); w0 += (size_t) kDepth) {
+        FetchTimer submit(fetch_counter(FetchMetric::read_submit_ns));
         const size_t wn = std::min<size_t>((size_t) kDepth, sc.req.size() - w0);
         for (size_t j = 0; j < wn; ++j) {
             const Req& r = sc.req[w0 + j];
@@ -1349,11 +1662,20 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         size_t queued = 0;
         while (queued < wn) {
             const long r = syscall(SYS_io_submit, sc.ctx, (long) (wn - queued), sc.cbp.data() + queued);
-            if (r > 0) { queued += (size_t) r; continue; }
+            if (r > 0) {
+                fetch_add(FetchMetric::read_requests, (uint64_t) r);
+                if (fetch_profiling_)
+                    for (size_t j = queued; j < queued + (size_t) r; ++j)
+                        fetch_add(FetchMetric::submitted_bytes, sc.req[w0 + j].size);
+                queued += (size_t) r;
+                continue;
+            }
             if (r < 0 && errno == EINTR) continue;
             ok = false;
             break;
         }
+        submit.finish();
+        FetchTimer wait(fetch_counter(FetchMetric::read_wait_ns));
         for (size_t done = 0; done < queued;) {
             const long r = syscall(SYS_io_getevents, sc.ctx, 1L, (long) (queued - done), sc.ev.data(), nullptr);
             if (r < 0) {
@@ -1366,16 +1688,19 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             for (long j = 0; j < r; ++j) {
                 const io_event& e = sc.ev[(size_t) j];
                 sc.got[(size_t) e.data] = e.res;
+                if (e.res > 0) fetch_add(FetchMetric::completed_bytes, (uint64_t) e.res);
                 if (e.res < 0) ok = false;
             }
             done += (size_t) r;
         }
     }
     if (!ok) return false;
+    FetchTimer copy(fetch_counter(FetchMetric::direct_copy_ns));
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if (sc.got[x.req] < 0 || (uint64_t) sc.got[x.req] < x.in_req + x.skip + x.n) return false;
         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+        fetch_add(FetchMetric::direct_copy_bytes, x.n);
     }
     return true;
 #else
@@ -1385,7 +1710,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
-    if (role_ptr_.empty() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (direct_mappings_retired_ || role_ptr_.empty() || n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -1533,7 +1858,9 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
     (void) ids;
     (void) k;
     if (!staged()) return;
+    FetchTimer lock_wait(fetch_counter(FetchMetric::lock_wait_ns));
     std::lock_guard<std::mutex> lk(stage_mu_);
+    lock_wait.finish();
     if (layer != last_layer_) {
         ++epoch_;
         last_layer_ = layer;
@@ -1549,7 +1876,8 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
 }
 
 bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
-    if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if ((base_ == nullptr && !direct_mappings_retired_) || dst == nullptr || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
@@ -2224,7 +2552,8 @@ const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) co
 }
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
-    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    if ((base_ == nullptr && !direct_mappings_retired_) || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;

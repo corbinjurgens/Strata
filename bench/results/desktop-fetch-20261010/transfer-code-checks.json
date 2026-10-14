@@ -1,0 +1,72 @@
+[
+  {
+    "run": "baseline-transfer-3",
+    "case": "python-run-lengths",
+    "passed": true,
+    "checks": 4,
+    "code_sha256": "55a0feaf0d80d2cb5dea22a70fa8197ada5298ef446402343c06845590996f45"
+  },
+  {
+    "run": "baseline-transfer-3",
+    "case": "python-mutation-debug",
+    "passed": true,
+    "checks": 3,
+    "code_sha256": "63f0fb3ccb7a80873a4132c74f8605fe415d938a72dc34841bda0dfc6db57a89"
+  },
+  {
+    "run": "fixed-4g-base-1",
+    "case": "python-run-lengths",
+    "passed": true,
+    "checks": 4,
+    "code_sha256": "55a0feaf0d80d2cb5dea22a70fa8197ada5298ef446402343c06845590996f45"
+  },
+  {
+    "run": "fixed-4g-base-1",
+    "case": "python-mutation-debug",
+    "passed": true,
+    "checks": 3,
+    "code_sha256": "63f0fb3ccb7a80873a4132c74f8605fe415d938a72dc34841bda0dfc6db57a89"
+  },
+  {
+    "run": "fixed-4g-trained-1",
+    "case": "python-run-lengths",
+    "passed": true,
+    "checks": 4,
+    "code_sha256": "55a0feaf0d80d2cb5dea22a70fa8197ada5298ef446402343c06845590996f45"
+  },
+  {
+    "run": "fixed-4g-trained-1",
+    "case": "python-mutation-debug",
+    "passed": true,
+    "checks": 3,
+    "code_sha256": "63f0fb3ccb7a80873a4132c74f8605fe415d938a72dc34841bda0dfc6db57a89"
+  },
+  {
+    "run": "trained-idle-2",
+    "case": "python-run-lengths",
+    "passed": true,
+    "checks": 4,
+    "code_sha256": "55a0feaf0d80d2cb5dea22a70fa8197ada5298ef446402343c06845590996f45"
+  },
+  {
+    "run": "trained-idle-2",
+    "case": "python-mutation-debug",
+    "passed": true,
+    "checks": 3,
+    "code_sha256": "63f0fb3ccb7a80873a4132c74f8605fe415d938a72dc34841bda0dfc6db57a89"
+  },
+  {
+    "run": "trained-transfer-2",
+    "case": "python-run-lengths",
+    "passed": true,
+    "checks": 4,
+    "code_sha256": "55a0feaf0d80d2cb5dea22a70fa8197ada5298ef446402343c06845590996f45"
+  },
+  {
+    "run": "trained-transfer-2",
+    "case": "python-mutation-debug",
+    "passed": true,
+    "checks": 3,
+    "code_sha256": "63f0fb3ccb7a80873a4132c74f8605fe415d938a72dc34841bda0dfc6db57a89"
+  }
+]

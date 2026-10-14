@@ -1,0 +1,62 @@
+{
+  "baseline-10g": {
+    "aggregate_tok_s": 8.2896686550358,
+    "total_file_mb": 30410.0,
+    "responses": 3,
+    "expert_slots": 5075,
+    "memory": {
+      "min_available_gib": 5.327030181884766,
+      "max_pagefile_used_gib": 0.11378097534179688
+    }
+  },
+  "baseline-8g": {
+    "aggregate_tok_s": 7.32579488690041,
+    "total_file_mb": 35795.3,
+    "responses": 3,
+    "expert_slots": 5054,
+    "memory": {
+      "min_available_gib": 7.41943359375,
+      "max_pagefile_used_gib": 0.11342239379882812
+    }
+  },
+  "fixed-baseline-12g": {
+    "aggregate_tok_s": 9.154880552649622,
+    "total_file_mb": 47901.3,
+    "responses": 6,
+    "expert_slots": 4990,
+    "memory": {
+      "min_available_gib": 3.689453125,
+      "max_pagefile_used_gib": 0.102264404296875
+    }
+  },
+  "fixed-baseline": {
+    "aggregate_tok_s": 6.708159427794001,
+    "total_file_mb": 80168.9,
+    "responses": 6,
+    "expert_slots": 4990,
+    "memory": {
+      "min_available_gib": 7.4739990234375,
+      "max_pagefile_used_gib": 0.11239242553710938
+    }
+  },
+  "fixed-recent-4g": {
+    "aggregate_tok_s": 11.189763231603623,
+    "total_file_mb": 42793.0,
+    "responses": 6,
+    "expert_slots": 4990,
+    "memory": {
+      "min_available_gib": 3.635143280029297,
+      "max_pagefile_used_gib": 0.12002182006835938
+    }
+  },
+  "recent-2g": {
+    "aggregate_tok_s": 9.71390525299664,
+    "total_file_mb": 25284.7,
+    "responses": 3,
+    "expert_slots": 5069,
+    "memory": {
+      "min_available_gib": 6.211639404296875,
+      "max_pagefile_used_gib": 0.1137542724609375
+    }
+  }
+}
