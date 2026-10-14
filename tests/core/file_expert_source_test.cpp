@@ -541,6 +541,30 @@ void test_resident_memory_budget() {
     require(clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin - 1, headroom) == 0 &&
                 clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin, headroom) == 0,
             "subtracting the clamping margin underflowed");
+
+    // The recent cache must leave the resident policy's resolved floor after the RAM arena is allocated.
+    constexpr uint64_t resident_headroom = 8 * GiB;
+    require(clamp_resident_budget(6 * GiB, 10 * GiB, 10 * GiB, resident_headroom) == 2 * GiB - margin,
+            "a recent cache request consumed the resident policy's headroom");
+    require(clamp_resident_budget(6 * GiB, 10 * GiB, 12 * GiB, resident_headroom) == 2 * GiB - margin,
+            "a recent cache request exceeded physical memory above the resident floor");
+    require(clamp_resident_budget(6 * GiB, 12 * GiB, 10 * GiB, resident_headroom) == 2 * GiB - margin,
+            "a recent cache request exceeded commit capacity above the resident floor");
+    require(clamp_resident_budget(1 * GiB, 10 * GiB, 10 * GiB, resident_headroom) == 1 * GiB,
+            "a smaller recent cache request received a clamping margin");
+    require(clamp_resident_budget(2 * GiB, 10 * GiB, 10 * GiB, resident_headroom) == 2 * GiB,
+            "a recent cache request exactly above the resident floor was reduced");
+    require(clamp_resident_budget(6 * GiB, 8 * GiB, 10 * GiB, resident_headroom) == 0 &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 8 * GiB, resident_headroom) == 0,
+            "a recent cache request was admitted at the resident floor");
+    require(clamp_resident_budget(6 * GiB, 10 * GiB, 10 * GiB, 0) == 6 * GiB,
+            "a zero headroom override reduced a fitting recent cache request");
+    require(clamp_resident_budget(6 * GiB, 2 * GiB, 10 * GiB, 0) == 2 * GiB - margin &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 2 * GiB, 0) == 2 * GiB - margin,
+            "a zero headroom override ignored the memory limits");
+    require(clamp_resident_budget(6 * GiB, 0, 10 * GiB, 0) == 0 &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 0, 0) == 0,
+            "a zero headroom override admitted a cache with no available memory");
 }
 
 void test_cgroup_memory_budget() {

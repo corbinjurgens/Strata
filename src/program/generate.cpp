@@ -5540,7 +5540,8 @@ int main(int argc, char** argv) {
 #endif
     }
     // Opt-in cache for recent experts outside the profile-ranked RAM/GPU tiers. Set it after the RAM arena is
-    // allocated so its capacity is limited by remaining physical RAM and Windows commit, with 4 GiB headroom.
+    // allocated so its lazy capacity target is limited by remaining physical RAM and Windows commit, leaving
+    // the resident policy's headroom floor (4 GiB without resident experts).
     bool file_cache_compact = false;
     if (const char* v = std::getenv("STRATA_FILE_CACHE_COMPACT"); v != nullptr && v[0] != '\0') {
         if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
@@ -5557,14 +5558,15 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: STRATA_FILE_CACHE_MIB must be a nonnegative integer\n");
             return 2;
         }
+        const uint64_t headroom = o.resident_cpu_experts ? o.resident_headroom : 4ull << 30;
         strata::core::detail::HostMemory mem;
         uint64_t target = 0;
         if (strata::core::detail::host_available_memory(mem))
-            target = strata::core::detail::clamp_resident_budget((uint64_t) mib << 20, mem.available, mem.commit, 4ull << 30);
+            target = strata::core::detail::clamp_resident_budget((uint64_t) mib << 20, mem.available, mem.commit, headroom);
         const uint64_t actual = src.set_file_cache_bytes(target, file_cache_compact);
-        std::fprintf(stderr, "strata generate: recent file expert cache %.1f MiB (requested %llu MiB; %s buffers, lazy, 4 GiB headroom)\n",
+        std::fprintf(stderr, "strata generate: recent file expert cache %.1f MiB (requested %llu MiB; %s buffers, lazy, %g GiB headroom)\n",
                      (double) actual / (1ull << 20), mib,
-                     file_cache_compact && actual > 0 ? "compact" : "largest-blob");
+                     file_cache_compact && actual > 0 ? "compact" : "largest-blob", (double) headroom / (1ull << 30));
     }
     if (const char* v = std::getenv("STRATA_FILE_DIRECT_UNMAP"); v != nullptr && v[0] != '\0') {
         if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
