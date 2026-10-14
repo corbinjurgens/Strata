@@ -422,9 +422,19 @@ The pinned profile-cache request is 70% of that pool, rounded down to whole GiB 
 larger-RAM machine or 12 GiB below 48 GiB RAM. The remainder requests compact recent-cache storage, capped at
 16384 MiB. Under severe pressure the helper requests a small positive 0.25 GiB pinned budget and can reduce
 the recent cache to zero; it reports the low-memory condition. The engine still clamps requests at startup.
-Profile requests are ceilings subject to allocation checks. Recent retention is a lazy target: protected
-live entries and temporary replacement storage may exceed it. Neither cache continuously resizes its budget
-after launch, and a startup headroom floor does not reserve memory against later allocations or other apps.
+Profile requests are ceilings subject to allocation checks. The engine finalizes the recent target after
+required startup buffers and checks current physical RAM and Windows commit on retention misses. Optional
+growth always leaves the existing 256 MiB clamp margin above the requested headroom, including when the
+configured target itself fits. Under pressure it reuses fitting safe buffers and releases only eligible cold
+entries; existing capacities are already charged to the memory sample. Recent retention is a lazy target: protected live entries and mandatory
+staging may exceed it. The pinned expert budget remains fixed after launch. These checks cannot reserve
+memory against later allocations or other applications.
+
+On Windows/NVIDIA, automatic expert-cache startup with a requested reserve of at least 256 MiB also checks
+the final CUDA allocation budget before serving. It refuses startup below the existing 256 MiB stall-warning
+floor, or when that memory query fails. An explicit cache size or a deliberately smaller reserve retains
+its existing warning behavior. This final check includes runtime/library allocations absent from the early
+cache forecast; increasing the reserve cannot create room when fixed allocations already fill the GPU.
 
 After resampling, a launch with both host-cache requests still automatic requires current available physical
 memory, available Windows commit on Windows, and at least 0.25 GiB in the computed expert pool. A measured zero
@@ -481,8 +491,48 @@ config's `env` remain explicit diagnostic opt-ins.
 The engine source includes Windows and Linux paths, and the helper can generate a shell launcher, but its
 `--build-engine` wrapper currently supports Windows/NVIDIA only. On Linux, use the repository's normal
 `setup.sh --build`/CMake path and local paths/configuration; the Windows build commands above are not a
-validated Linux recipe. Neither this new helper policy nor the read-path experiment below has laptop or
-Linux runtime measurements in this work.
+validated Linux recipe. The laptop startup/cache-warmup checks below are partial runtime measurements;
+Linux and the read-path experiment remain unmeasured here.
+
+### Laptop startup and cache warmup, 2026-10-14 to 2026-10-15
+
+An isolated candidate was tested on the RTX 4050 Laptop 6 GB with 63.71 GiB usable RAM, Windows, no pagefile,
+CUDA 13.4 and driver 617.42. Normal applications stayed open; only the internal display was active. Context
+capacity remained 131072, with q4_0 KV, 20480 resident cells, 64-token prefill chunks, and the unchanged automatic
+host-cache split. The original engines and saved configurations were retained.
+
+Before the runtime admission correction, available Windows commit reached 7.20 GiB during cache warmup,
+despite the 8 GiB startup headroom request. The corrected watched run kept available commit above 8 GiB;
+the user reported responsive typing, window switching and scrolling throughout.
+
+With the experimental lazy-loading profile, a subsequent fresh 32767-token prompt returned all three codes
+distributed through the input; the follow-up reused 32792 tokens and returned the final code plus the correct
+integer. Fresh prefill took 1586.4 seconds (20.7 tokens/s). This approximately 30-minute run preceded the final
+margin refinement: available commit briefly reached 7.88 GiB, with 14 one-second samples below 8 GiB.
+That result prompted applying the existing 256 MiB margin consistently to optional cache growth.
+
+The final candidate then completed three 512-token generations, correct cached follow-ups after each, and
+121 seconds of idle monitoring. Across 282 seconds of telemetry, available physical RAM stayed above
+17.58 GiB and available commit above 8.39 GiB, with no sample below 8 GiB. The sustained generations decoded
+at 13.0 to 13.5 tokens/s. CUDA reported 424 MiB free at startup and 392 MiB after every completed request.
+This final run validates the margin on that workload; the 32K retrieval run was on the preceding candidate,
+and a near-full 128K laptop prompt remains untested.
+
+GPU tracing separated the host-complement mapping from prompt initialization. With the engine's default
+eager CUDA module loading, cuBLAS creation cost 220 MiB in an isolated library probe, versus 12 MiB with lazy
+loading. The full model's startup CUDA-free memory was 214 MiB under eager loading and 424 MiB in a separate
+profile with `CUDA_MODULE_LOADING=LAZY`. The user also reported responsiveness during that comparison.
+NVIDIA documents that lazy loading postpones kernel loading; the startup saving alone does not verify all
+first-use kernels or near-full-context stability. The engine's eager default remains unchanged, and the lazy
+setting is an explicit experimental profile override. See [CUDA module loading](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html#cuda-module-loading).
+On the final candidate, direct startup probes confirmed that the eager profile was refused before `READY`,
+while the lazy profile reached `READY` and exited cleanly on `QUIT`.
+
+Local raw evidence is under `.claude/laptop-headroom-correction-20261014/`: `watched-startup`,
+`lazy-comparison`, `long-retrieval`, `margin-stress`, `startup-checks-final`, and `eager-cublas-probe.json`.
+Responsiveness was observed by the user during the two watched short runs; the longer automated runs were
+not watched for responsiveness. These measurements do not establish external-monitor fit, RTX 4080 SUPER
+acceptance, Linux runtime behavior, or desktop-stall causation.
 
 Offline checks for policy choices, physical/commit limits, credentials, explicit overrides, repeated refresh,
 publication failures, command quoting and build receipts are in

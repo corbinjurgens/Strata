@@ -690,6 +690,7 @@ void FileExpertSource::close() {
         stage_blob_ = 0;
         stage_cache_slots_ = 0;
         stage_cache_bytes_ = stage_allocated_bytes_ = 0;
+        stage_headroom_ = ~uint64_t{0};
         stage_compact_ = false;
         stage_seq_ = 0;
         epoch_ = 0;
@@ -854,13 +855,14 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     return true;
 }
 
-uint64_t FileExpertSource::set_file_cache_bytes(uint64_t bytes, bool compact) {
+uint64_t FileExpertSource::set_file_cache_bytes(uint64_t bytes, bool compact, uint64_t headroom) {
     std::lock_guard<std::mutex> lk(stage_mu_);
     stage_cache_slots_ = staged() && stage_blob_ > 0
         ? (size_t) std::min<uint64_t>((uint64_t) blobs_, bytes / stage_blob_) : 0;
     stage_compact_ = compact && bytes > 0 && staged() && stage_blob_ > 0;
     stage_cache_bytes_ = stage_compact_ ? std::min(bytes, expert_bytes())
                                       : (uint64_t) stage_cache_slots_ * stage_blob_;
+    stage_headroom_ = headroom;
     return stage_cache_bytes_;
 }
 
@@ -885,7 +887,7 @@ FileExpertSource::FetchStats FileExpertSource::fetch_stats() const {
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
-bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill) {
+bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, const detail::HostMemory* memory) {
     FetchTimer claim(fetch_counter(FetchMetric::claim_ns));
     fetch_add(FetchMetric::claims);
     constexpr uint64_t kStageSeq = 256;
@@ -922,12 +924,48 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill) {
     }
     scan.finish();
     const uint64_t need = stage_compact_ ? layer_blob_bytes_[(size_t) (key / n_expert_)] : stage_blob_;
-    const bool grow = stage_compact_
-        ? stage_allocated_bytes_ <= stage_cache_bytes_ && need <= stage_cache_bytes_ - stage_allocated_bytes_
-        : previous_size < stage_cache_slots_;
+    const bool guarded = stage_cache_bytes_ > 0 && stage_headroom_ != ~uint64_t{0};
+    uint64_t retention = stage_cache_bytes_;
+    bool allocation_fits = true;
+    if (guarded) {
+        detail::HostMemory sampled;
+        if (memory == nullptr && detail::host_available_memory(sampled)) memory = &sampled;
+        if (memory == nullptr) {
+            retention = 0;
+            allocation_fits = false;
+        } else {
+            // Existing capacities have already reduced available memory. Add them back only when finding a
+            // total retention target; a replacement must also fit while its old buffer is still allocated.
+            auto including_cache = [&](uint64_t available) {
+                return available > UINT64_MAX - stage_allocated_bytes_
+                    ? UINT64_MAX : available + stage_allocated_bytes_;
+            };
+            // Use the existing clamp margin even when the configured target fits: the final allocation must
+            // leave room for allocator bookkeeping and the request's later checkpoint/library work.
+            retention = std::min(stage_cache_bytes_, detail::clamp_resident_budget(UINT64_MAX,
+                including_cache(memory->available), including_cache(memory->commit), stage_headroom_));
+            allocation_fits = need <= detail::clamp_resident_budget(UINT64_MAX,
+                memory->available, memory->commit, stage_headroom_);
+        }
+    }
+    const bool grow = allocation_fits && (stage_compact_ || guarded
+        ? stage_allocated_bytes_ <= retention && need <= retention - stage_allocated_bytes_
+        : previous_size < stage_cache_slots_);
     if (v == previous_size || grow) v = empty;
+    if (!allocation_fits) {
+        // Pressure must not turn a safe, already charged buffer into a new allocation merely to make its
+        // compact size exact. Prefer the oldest fitting capacity; live and in-flight pointers stay untouched.
+        size_t fitting = previous_size;
+        oldest = std::numeric_limits<uint64_t>::max();
+        for (size_t i = 0; i < previous_size; ++i)
+            if (stage_buf_[i] && stage_capacity_[i] >= need && eligible(i) && stage_used_[i] < oldest) {
+                oldest = stage_used_[i];
+                fitting = i;
+            }
+        if (fitting != previous_size) v = fitting;
+    }
     std::unique_ptr<uint8_t[]> buffer;
-    if (v == previous_size || stage_capacity_[v] != need) {
+    if (v == previous_size || (stage_capacity_[v] != need && (allocation_fits || stage_capacity_[v] < need))) {
         {
             FetchTimer allocation(fetch_counter(FetchMetric::allocation_ns));
             buffer.reset(new (std::nothrow) uint8_t[(size_t) need]);
@@ -994,7 +1032,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill) {
     stage_busy_[v] = 1;
     // A larger replacement can need more than one old entry's room. Release only safe oldest entries;
     // indices remain stable for pending fills. If all remaining entries are live, preserve the original overflow.
-    while (stage_compact_ && stage_allocated_bytes_ > stage_cache_bytes_) {
+    while ((stage_compact_ || guarded) && stage_allocated_bytes_ > retention) {
         size_t victim = stage_buf_.size();
         oldest = std::numeric_limits<uint64_t>::max();
         FetchTimer eviction_scan(fetch_counter(FetchMetric::scan_ns));

@@ -5558,8 +5558,8 @@ int main(int argc, char** argv) {
 #endif
     }
     // Opt-in cache for recent experts outside the profile-ranked RAM/GPU tiers. Set it after the RAM arena is
-    // allocated so its lazy capacity target is limited by remaining physical RAM and Windows commit, leaving
-    // the resident policy's headroom floor (4 GiB without resident experts).
+    // allocated, then finalize the target after required startup buffers. Lazy growth also checks the same
+    // physical/commit headroom at allocation time (4 GiB without resident experts).
     bool file_cache_compact = false;
     if (const char* v = std::getenv("STRATA_FILE_CACHE_COMPACT"); v != nullptr && v[0] != '\0') {
         if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
@@ -5568,7 +5568,10 @@ int main(int argc, char** argv) {
         }
         file_cache_compact = v[0] == '1';
     }
-    if (const char* v = std::getenv("STRATA_FILE_CACHE_MIB"); v != nullptr && v[0] != '\0') {
+    const char* file_cache_request = std::getenv("STRATA_FILE_CACHE_MIB");
+    const bool file_cache_given = file_cache_request != nullptr && file_cache_request[0] != '\0';
+    uint64_t file_cache_bytes = 0;
+    if (const char* v = file_cache_request; v != nullptr && v[0] != '\0') {
         char* end = nullptr;
         errno = 0;
         const unsigned long long mib = std::strtoull(v, &end, 10);
@@ -5576,16 +5579,29 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: STRATA_FILE_CACHE_MIB must be a nonnegative integer\n");
             return 2;
         }
+        file_cache_bytes = (uint64_t) mib << 20;
+    }
+    auto configure_file_cache = [&]() {
+        if (!file_cache_given) return;
         const uint64_t headroom = o.resident_cpu_experts ? o.resident_headroom : 4ull << 30;
         strata::core::detail::HostMemory mem;
         uint64_t target = 0;
-        if (strata::core::detail::host_available_memory(mem))
-            target = strata::core::detail::clamp_resident_budget((uint64_t) mib << 20, mem.available, mem.commit, headroom);
-        const uint64_t actual = src.set_file_cache_bytes(target, file_cache_compact);
+        if (strata::core::detail::host_available_memory(mem)) {
+            // Existing assembly buffers are already charged to the snapshot; this target includes them.
+            const uint64_t charged = src.file_cache_stats().allocated_bytes;
+            auto add_charged = [&](uint64_t available) {
+                return available > UINT64_MAX - charged ? UINT64_MAX : available + charged;
+            };
+            target = strata::core::detail::clamp_resident_budget(file_cache_bytes,
+                add_charged(mem.available), add_charged(mem.commit), headroom);
+        }
+        const uint64_t actual = src.set_file_cache_bytes(target, file_cache_compact, headroom);
         std::fprintf(stderr, "strata generate: recent file expert cache %.1f MiB (requested %llu MiB; %s buffers, lazy, %g GiB headroom)\n",
-                     (double) actual / (1ull << 20), mib,
+                     (double) actual / (1ull << 20), (unsigned long long) (file_cache_bytes >> 20),
                      file_cache_compact && actual > 0 ? "compact" : "largest-blob", (double) headroom / (1ull << 30));
-    }
+    };
+    configure_file_cache();
+    mem_mark("the resident expert complement");
     if (const char* v = std::getenv("STRATA_FILE_DIRECT_UNMAP"); v != nullptr && v[0] != '\0') {
         if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
             std::fprintf(stderr, "strata generate: STRATA_FILE_DIRECT_UNMAP must be 0 or 1\n");
@@ -5945,6 +5961,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            mem_mark("before the prompt path initialization");
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
@@ -6300,6 +6317,7 @@ int main(int argc, char** argv) {
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
+        configure_file_cache();
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -7176,6 +7194,25 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
             profile_saved_at = Clock::now();
         };
+        // Validate before the detached stdin reader starts: startup rejection must not leave it referencing locals.
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+        if (auto_cache && o.vram_reserve_mib >= 256) {
+            size_t free_b = 0, total_b = 0;
+            const cudaError_t memory_status = cudaMemGetInfo(&free_b, &total_b);
+            if (memory_status != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: cannot validate automatic startup VRAM: %s\n",
+                             cudaGetErrorString(memory_status));
+                return 1;
+            }
+            if (free_b < (256ull << 20)) {
+                std::fprintf(stderr, "strata serve: automatic startup refused: %lld MiB of VRAM free after all "
+                                     "buffers, below the 256 MiB safety floor. The remaining fixed allocations "
+                                     "must be reduced; increasing the expert-cache reserve alone may not fit.\n",
+                             (long long) (free_b >> 20));
+                return 1;
+            }
+        }
+#endif
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
         std::atomic<bool> stop_req{false};
@@ -10126,6 +10163,7 @@ int main(int argc, char** argv) {
                 std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);
             else
                 std::snprintf(read_txt, sizeof(read_txt), "%lld", (long long) fresh);
+            mem_mark("the completed request");
             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
                          (long long) n, (long long) resume, read_txt, prompt_ms,
@@ -10616,6 +10654,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
+        configure_file_cache();
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
         ver.set_split(o.spec_split);

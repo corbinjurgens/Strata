@@ -855,6 +855,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    auto trace_memory = [](const char* where) {
+        if (std::getenv("STRATA_TRACE") == nullptr) return;
+        size_t free_bytes = 0, total_bytes = 0;
+        const cudaError_t sync = cudaDeviceSynchronize();
+        const cudaError_t query = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (sync == cudaSuccess && query == cudaSuccess)
+            std::fprintf(stderr, "strata trace: prefill %lld MiB free after %s\n",
+                         (long long) (free_bytes >> 20), where);
+    };
+    trace_memory("entry");
     if (chunk <= 0) { err = "prefill: the chunk must be positive"; return false; }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
@@ -951,6 +961,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.owned.push_back(m.ident_table);
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
+    trace_memory("host staging and identity buffers");
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
@@ -967,6 +978,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.gemm.set_f16_io(m.f16_io);
         set_act_f16(m.f16_io);
     }
+    trace_memory("GEMM scratch and handle");
     if (!carve(T, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
@@ -977,6 +989,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
+    trace_memory("owned chunk buffers");
     return true;
 }
 
