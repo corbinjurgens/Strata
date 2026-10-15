@@ -117,9 +117,8 @@ starts its own server from saved settings and does not refresh automatic setting
 
 ## Remaining work
 
-The handoff's `$WASABI_VAULT/4. Projects/Strata/deferred.md` and exact entry
-"Validate remaining 4080S and laptop display conditions" were absent from this desktop's local vault.
-No replacement or duplicate task was created. When that entry is available, mark its desktop
-startup/short/sustained/near-128K retrieval/reuse portion complete and retain laptop external-display
-acceptance as open. Full laptop 128K and Linux acceptance remain unverified. The historical desktop
-stall cause remains unresolved.
+At the time this report was first saved, the handoff's deferred entry was unavailable locally.
+It became available during the same day's performance follow-up. The completed desktop portion was
+recorded and the original entry archived through the project-note helper; laptop eager startup and
+external-display acceptance remain open. Full laptop 128K and Linux acceptance remain unverified.
+The historical desktop stall cause remains unresolved.

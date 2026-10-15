@@ -581,6 +581,78 @@ display, full laptop 128K and Linux acceptance remain separate.
 
 See the [desktop report and sanitized results](../bench/results/2026-10-15-4080s-shared-policy/README.md).
 
+## Desktop cache and placement comparisons, 2026-10-15
+
+The same desktop and `563c136c` executable were then tested with more available RAM. The comparison
+profiles were frozen with 22.18 GiB physical RAM and 48.75 GiB commit available, versus 17.08 and
+43.47 GiB at the earlier acceptance freeze. Idle nvidia-smi free memory was still 16036 MiB; the GPU
+already had similar availability. Capacity, int8 KV, 32768 resident cells, eager CUDA loading,
+automatic prefill, parallel 1 and the 1024 MiB GPU reserve stayed unchanged.
+
+Each comparison used the same three technical prompts twice with 160-token output limits, then
+the fixed broader coding, arithmetic and note-writing prompts. The technical answers generated
+960 tokens per run. Rates below are completion tokens divided by engine decode time; startup,
+prefill and idle time are excluded. They are not comparable to the 512-token tutorial rates alone.
+All comparison profiles requested 4 GiB host headroom. Pinned/recent requests and measured decode
+rates, listed as technical / broader, were:
+
+- Shipped placement, 5 GiB / 3486 MiB: 7.67 / 4.80 tokens/s; repeated after the other profiles,
+  7.43 / 4.16 tokens/s.
+- Refreshed automatic budgets, shipped placement, 9 GiB / 4609 MiB: 9.18 / 6.56 tokens/s.
+- The same budgets with the existing desktop-trained placement: 19.35 / 4.87 tokens/s.
+- Trained placement, 12 GiB / 1537 MiB: 24.24 / 5.66 tokens/s.
+- Shipped placement, 12 GiB / 1537 MiB: 14.01 / 5.56 tokens/s.
+
+The 9/4609 and 12/1537 pairs requested the same total host-cache bytes. Actual allocation still
+depends on admission and protected buffers. Starting placements were copied and hashed, with profile
+saving disabled. These results support a technical-workload placement benefit and a budget-split
+tradeoff; the large technical gain did not carry over consistently to the broader workload. The
+original/repeated control and per-request records retain the variability. One refreshed-profile
+technical response fell to 3.4 tokens/s, and the initial control's inventory prompt took 69.59 seconds
+in prefill.
+
+For the first technical request, engine-reported logical expert-file payload fell from 8934.6 MB in
+the control to 1630.7 MB with the trained 12 GiB profile. These counters are not physical SSD traffic.
+All these runs completed without an emergency guard trigger, with logged CUDA-free samples at or
+above 673 MiB. The trained 9 GiB profile briefly reached 3.797 GiB available RAM, below its requested
+4 GiB headroom. Its sharpest dip occurred with nearly unchanged owned RSS/private memory, consistent
+with global memory variation but insufficient to identify its owner. Headroom is an allocation
+policy, not a guaranteed system floor. These automated comparisons had no new responsiveness observation.
+
+The broader answers retained quality limitations: the code cases passed review, but inventory
+reconciliation was incomplete at the 160-token budget and the status paragraph omitted the explicit
+derived count of 593 scans. They are performance workloads, not a claim that all output requirements passed.
+
+A separate candidate therefore requested 6 GiB headroom. With shipped placement and an equal
+11.5 GiB total cache request, 11 GiB pinned / 512 MiB recent decoded three 512-token tutorials at
+9.1, 10.2 and 9.3 tokens/s, but cached follow-ups took 13.77-15.27 seconds. Moving 2 GiB from pinned
+to recent storage, for 9 GiB / 2560 MiB, gave 10.8, 12.5 and 12.8 tokens/s and 6.34-6.52 second
+follow-ups. All reused their 560-token prefix and processed 29 new prompt tokens. The balanced
+candidate also passed idle monitoring and a complete 256-token-budget JSON inventory check,
+including the 320-unit reconciliation. Minimum available RAM was 6.017 GiB, available commit
+16.069 GiB, and logged CUDA-free memory 731 MiB over this 332-second run.
+
+Without refreshing that balanced profile, a separate 1259-second run passed the API smoke checks,
+fresh near-limit retrieval, context fitting and prefix reuse. The fresh request retained all
+130880 prompt tokens and returned the three reference codes in order. Prefill took 1079.271 seconds
+and request wall time was 1099.079 seconds, versus 1160.493 and 1166.828 seconds in the earlier
+acceptance. Its short 27-token answer decoded at 1.4 tokens/s versus 4.5 earlier, so the faster
+prefill does not establish a large-context decode improvement. The follow-up retained its full
+130944-token history, reused 130906 tokens, processed 38 new tokens and correctly returned the code
+and arithmetic result in 8.204 seconds, versus 9.333 earlier.
+
+Minimum available RAM in that long run was 5.856 GiB, available commit 15.574 GiB, and logged
+CUDA-free memory 677 MiB. No guard triggered. The requested 6 GiB headroom was again a soft target;
+the sampled RAM minimum was slightly below it. CUDA figures are engine stage samples, not continuous
+VRAM monitoring. These single-run comparisons combine changed cache budgets and current machine
+conditions, and do not establish desktop responsiveness while unattended. After cleanup, the
+working files and original checkout still matched their baseline, frozen configurations and engine
+hashes were unchanged, no Strata process remained and loopback port 8081 was free.
+
+These are separate experimental configurations; the shared defaults and working profile selection
+were not changed. Local per-request results, frozen nonsecret settings and telemetry are under
+`.claude/4080s-performance-20261015/`; the new artifacts are not included in the repository.
+
 ## Earlier RTX 4080 SUPER desktop validation at 128K
 
 Measured on 2026-10-09: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM, a 24 GiB Windows pagefile,
