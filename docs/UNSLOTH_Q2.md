@@ -653,6 +653,69 @@ These are separate experimental configurations; the shared defaults and working 
 were not changed. Local per-request results, frozen nonsecret settings and telemetry are under
 `.claude/4080s-performance-20261015/`; the new artifacts are not included in the repository.
 
+### Dedicated-use follow-up
+
+The user then confirmed the desktop was in its intended Strata-only state, with normal applications
+closed. At the comparison freeze, available physical RAM was 22.741 GiB and available commit was
+48.651 GiB. The executable, shipped expert placement, 131072-token capacity, int8 KV, 32768 resident
+cells, eager loading, prefill and speculation settings stayed unchanged. These were automated runs;
+desktop responsiveness was not observed. Each profile generated the same three 512-token tutorials,
+their cached arithmetic follow-ups, a complete inventory answer and idle checks.
+
+The rates below count only those 1536 tutorial completion tokens divided by their summed engine
+decode time. They exclude prefill and startup, and differ from the earlier 160-token technical set:
+
+- Control, 9 GiB pinned / 2560 MiB recent / 6 GiB headroom: 11.93 tokens/s, with individual rates
+  10.7, 12.5 and 12.8. Cached follow-ups took 6.28-6.53 seconds.
+- More recent storage, 9 GiB / 4608 MiB / 4 GiB headroom: 11.01 tokens/s, with rates 9.5, 11.9 and
+  12.0. Follow-ups took 6.80-7.37 seconds. The complete inventory answer took 26.29 seconds versus
+  the initial control's 82.45 seconds; a later control repeat took 31.21 seconds. That variation
+  prevents attributing the inventory improvement to recent-cache capacity alone.
+- More pinned storage, 11 GiB / 2560 MiB / 4 GiB headroom: 13.34 tokens/s, with rates 10.5, 15.5 and
+  15.2. Follow-ups took 26.49, 5.28 and 5.65 seconds; the first was a substantial latency outlier.
+- That same host allocation with GPU reserve reduced from 1024 to 768 MiB: 8.73 tokens/s, with
+  rates 6.4, 10.2 and 11.1. Actual GPU expert storage grew from 5272 slots / 9.21 GiB to 5415 slots /
+  9.46 GiB, and logged CUDA-free memory fell from 731 to 475 MiB. Spending that extra VRAM did not
+  improve this run; its follow-ups took 7.33, 6.11 and 6.95 seconds. Remaining trials retained the
+  1024 MiB reserve.
+- After those runs, 12 GiB / 2560 MiB / 3 GiB headroom: 15.85 tokens/s, with rates 15.4, 16.1 and
+  16.1. Follow-ups took 4.78, 4.67 and 24.37 seconds. This increased requested host expert storage
+  from the control's 11.5 GiB to 14.5 GiB and confirmed 12.00 GiB actually pinned. It improved
+  tutorial throughput but did not eliminate latency outliers. Minimum available RAM was 3.587 GiB,
+  available commit 14.114 GiB and logged CUDA-free memory 731 MiB over 250.887 seconds.
+
+Repeating the control after those candidates measured 11.91 tokens/s overall, again with individual
+rates of 10.7, 12.5 and 12.8 and follow-ups at 6.26-6.62 seconds. The 12 GiB-pinned candidate's
+aggregate tutorial decode rate was about 33% higher than the controls, while its 24.37-second
+follow-up prevents a claim of uniformly lower interactive latency. These measurements do not
+identify the cause of the latency outliers.
+
+All these short runs passed the exact, reuse, inventory-reconciliation and idle checks without a
+guard trigger. Before the 3 GiB-headroom trial, fresh planning admitted its 14.5 GiB request with
+22.882 GiB RAM available. The local guard was tightened for that trial: stop immediately below
+2 GiB available RAM, or below 2.5 GiB for five consecutive samples, while retaining commit and
+stage-CUDA checks. Injected checks exercised the actual guard's immediate stop, sustained stop,
+boundary reset and opt-in behavior. Admission and headroom still do not guarantee a runtime floor.
+Per-request records and frozen settings are local under `.claude/4080s-performance-20261015/dedicated/`.
+
+The frozen 12 GiB-pinned candidate then passed smoke, fresh near-limit retrieval, context fitting
+and reuse in a separate 1033.891-second run. A fresh admission check found 22.924 GiB available RAM;
+the profile itself was not refreshed. The fresh request retained all 130880 prompt tokens and
+returned the three reference codes in order. Prefill took 849.223 seconds and request wall time
+was 853.728 seconds, versus the balanced candidate's 1079.271 and 1099.079 seconds. That is about
+21% less prefill time in this measured pair. The follow-up retained its full 130944-token history,
+reused 130906 tokens, processed 38 new tokens and returned the correct code and arithmetic result
+in 5.325 seconds, versus 8.204 seconds. The near-limit answers decoded at 6.5 and 9.4 tokens/s,
+but contained only 27 and 14 tokens; they do not establish sustained near-128K decode throughput.
+
+Minimum available RAM was 3.196 GiB, available commit 12.999 GiB, and logged CUDA-free memory
+677 MiB. No guard triggered. After cleanup, the baseline working files, original checkout,
+frozen configurations, shipped placement and engine hashes were unchanged; no Strata process
+remained and port 8081 was free. The local `summary.json` and `post-snapshot.json` retain the
+measurements and preservation checks. The shared defaults and selected working profile remain
+unchanged. This separate candidate uses the dedicated desktop conditions and has no new watched
+responsiveness acceptance; its short-request latency outlier remains unresolved.
+
 ## Earlier RTX 4080 SUPER desktop validation at 128K
 
 Measured on 2026-10-09: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM, a 24 GiB Windows pagefile,
