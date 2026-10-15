@@ -328,7 +328,8 @@ context limit alone does not establish that a prompt of that length fits or runs
 **131072-token context capacity by default**. It detects RAM, available physical memory, Windows available
 commit and GPU VRAM, then reports its allocation requests and reserved allowances. It enables the compact
 recent-file cache from this branch. This is an explained startup policy, not a guarantee of optimal speed or
-of fit for every workload. Neither PC has passed full-model acceptance of the combined automatic policy.
+of fit for every workload. The guarded RTX 4080 SUPER workload below passed on 2026-10-15. Full laptop
+128K and Linux acceptance remain unverified.
 The historical laptop and desktop measurements used their stated manual settings.
 
 The helper defaults to `engine/strata-unsloth-portable.exe`, `engine/BUILD-unsloth-portable.json`,
@@ -547,7 +548,40 @@ driver 617.14, CUDA 13.4.92 and MSVC 19.44.35229. Its sm_89 engine built and ran
 model hashes passed, and `--compat-bf16` packing produced the 1.38 GiB arena. Those checks establish that
 preparation step, not the performance of the newer automatic policy.
 
-## RTX 4080 SUPER desktop validation at 128K
+## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
+
+Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
+30.88 GiB usable RAM, Windows, driver 617.14 and CUDA 13.4.92. Windows had a 28 GiB pagefile and a
+58.88 GiB commit limit. The isolated engine used eager CUDA loading and the existing UD-Q2_K_XL model.
+The working engine, profiles and selected launcher were preserved.
+
+The policy was refreshed once immediately before testing and then frozen. It requested 5 GiB pinned
+experts, 3486 MiB compact recent cache, 4 GiB host headroom and a 1024 MiB GPU reserve. Capacity remained
+131072 tokens, with int8 KV, 32768 resident cells, automatic prefill, verifier window 2 and parallel 1.
+These are the desktop's sampled automatic settings, not recommended fixed budgets for other starts.
+
+Short exact answers, cached follow-ups, three 512-token generations and a 60-second idle check passed.
+The sustained generations decoded at 7.1, 8.2 and 8.2 tokens/s. During this watched phase the user reported
+"responsive throughout". Its 390 seconds of one-second monitoring found at least 4.249 GiB available
+physical RAM and 15.037 GiB available commit, with at most 26.631 GiB physical RAM used and 43.843 GiB
+system commit. CUDA reported 761 MiB free at serving and 731 MiB after completed requests.
+
+All six smoke checks then passed on a separate owned server using the same frozen profile. A fresh
+130880-token prompt returned all three reference codes in order and passed output-budget fitting.
+Prefill took 1160.49 seconds; total request wall time was 1166.83 seconds. The follow-up retained 130944
+prompt tokens, reused 130906 tokens, processed 38 new prompt tokens and returned the correct code and
+arithmetic answer in 9.33 seconds. Over this 1385-second phase, available RAM stayed above 8.583 GiB,
+available commit above 18.730 GiB, and logged CUDA-free samples at or above 677 MiB.
+
+CUDA figures are engine queries at startup and request stages, not continuous VRAM minima. No guard
+triggered. Both servers exited, port 8081 was released, and hashes of all 33 preserved working files
+were unchanged. The user was away during the long phase, so its desktop responsiveness was unobserved.
+These checks do not explain the earlier desktop stalls or establish broad model quality. Laptop external
+display, full laptop 128K and Linux acceptance remain separate.
+
+See the [desktop report and sanitized results](../bench/results/2026-10-15-4080s-shared-policy/README.md).
+
+## Earlier RTX 4080 SUPER desktop validation at 128K
 
 Measured on 2026-10-09: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM, a 24 GiB Windows pagefile,
 and model files on a Crucial CT2000P3SSD8 NVMe drive. The source-built engine is commit `6794d90` for sm_89.

@@ -1,0 +1,23 @@
+{
+  "samples": 1371,
+  "min_available_gib": 8.583515167236328,
+  "max_pagefile_used_gib": null,
+  "pagefile_available": false,
+  "pagefile_unavailable_reason": "No pagefile sample was collected.",
+  "stop_reason": null,
+  "min_commit_available_gib": 18.730636596679688,
+  "max_owned_rss_bytes": 12372602880,
+  "max_owned_private_bytes": 31288438784,
+  "cuda_stage_samples": 23,
+  "last_cuda_stage": {
+    "cuda_free_mib": 677,
+    "stage": "the completed request",
+    "enforced": true,
+    "observed_unix": 1792045359.7853577,
+    "source": "engine-log"
+  },
+  "min_enforced_cuda_free_mib": 677,
+  "cuda_coverage": "Engine stage samples only; no continuous VRAM telemetry",
+  "commit_source": "GetPerformanceInfo CommitLimit minus CommitTotal; not swap usage",
+  "elapsed_seconds": 1385.3830406999996
+}

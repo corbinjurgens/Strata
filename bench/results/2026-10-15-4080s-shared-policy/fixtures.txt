@@ -1,0 +1,21 @@
+[1/4] Building CXX object CMakeFiles\expert_cache_retry_test.dir\tests\core\expert_cache_retry_test.cpp.obj
+[2/4] Linking CXX executable expert_cache_retry_test.exe
+[3/4] Building CXX object CMakeFiles\file_expert_source_test.dir\tests\core\file_expert_source_test.cpp.obj
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/expert.hpp(74): warning C4324: 'strata::kernels::cpu::ActQ': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/pool.hpp(263): warning C4324: 'strata::kernels::cpu::ExpertPool': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/pool.hpp(264): warning C4324: 'strata::kernels::cpu::ExpertPool': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/pool.hpp(265): warning C4324: 'strata::kernels::cpu::ExpertPool': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/pool.hpp(266): warning C4324: 'strata::kernels::cpu::ExpertPool': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/pool.hpp(267): warning C4324: 'strata::kernels::cpu::ExpertPool': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\include\strata/kernels/cpu/pool.hpp(270): warning C4324: 'strata::kernels::cpu::ExpertPool': structure was padded due to alignment specifier
+C:\Users\Joes\Tools\Strata-4080s-headroom\tests\core\file_expert_source_test.cpp(160): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+[4/4] Linking CXX executable file_expert_source_test.exe
+Test project C:/Users/Joes/Tools/Strata-4080s-headroom/build-4080s-headroom
+    Start 1: expert_cache_retry_test
+1/2 Test #1: expert_cache_retry_test ..........   Passed    0.77 sec
+    Start 7: file_expert_source_test
+2/2 Test #7: file_expert_source_test ..........   Passed    0.45 sec
+
+100% tests passed out of 2
+
+Total Test time (real) =   1.24 sec

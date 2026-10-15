@@ -1,0 +1,14 @@
+{
+  "recorded_at": "2026-10-15T15:23:37.733372+09:00",
+  "windows_memory": {
+    "physical_available_bytes": 24289636352,
+    "physical_used_bytes": 8867807232,
+    "commit_total_bytes": 10645258240,
+    "commit_limit_bytes": 63222214656,
+    "commit_available_bytes": 52576956416
+  },
+  "physical_available_gib": 22.62148666381836,
+  "nvidia_smi_supplemental": "10 MiB, 16036 MiB",
+  "no_strata_process": true,
+  "actual_cuda_free_after_exit": "Unavailable: owned engine context exited; no extra context created."
+}
