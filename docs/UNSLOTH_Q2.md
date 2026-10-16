@@ -5,6 +5,24 @@ with the manual memory settings below; setup's default configuration does not fi
 runtime checks, not a quality benchmark or a guarantee on other PCs. Setup requires engine 0.1.40 or newer
 for this experiment. Images are disabled; AMD use is unvalidated.
 
+## Shared source and local profiles
+
+Use `origin/main` from `https://github.com/corbinjurgens/Strata.git` on both the RTX 4050 laptop and
+RTX 4080 SUPER desktop. The shared source combines the laptop allocation and memory-safety work with
+the desktop cache work. Hardware differences belong in each PC's generated profile, rather than in
+separate source branches. The dated results below describe their original engines and conditions;
+they predate acceptance of the merged engine and do not establish a new speedup or merged-engine
+runtime acceptance on either PC.
+
+Build and prepare locally using the [hardware-aware preparation steps](#hardware-aware-preparation-for-both-pcs).
+Each PC needs its own executable and build receipt, model paths and native pack, runtime libraries,
+credentials and generated profile. Do not copy the desktop JSON or its fixed cache budgets onto the
+laptop. Preserve existing working profiles, launchers and their selection while preparing a separate
+candidate. The automatic policy keeps 131072-token capacity and eager CUDA loading by default; memory
+admission and runtime checks still apply. The dedicated-use desktop settings below remain opt-in.
+New profiles default to authenticated loopback at `127.0.0.1:8080`; retain authentication if deliberately
+enabling access from another machine.
+
 ## Files and formats
 
 The source is [Unsloth's UD-Q2_K_XL at revision 38bb39e](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q2_K_XL).
@@ -247,9 +265,10 @@ cost of more expert reads from the SSD. These proposed settings have not been ap
 
 ## Combined branch and upstream fixes, 2026-10-14
 
-`codex/unsloth-low-vram` incorporates the desktop's `codex/unsloth-file-cache` work (`411ee540`) alongside the
-laptop's allocation changes. Use this combined branch on either PC. Its hardware-aware helper selects a local
-profile; the desktop's separately trained placement remains an explicit experiment rather than a hardware default.
+At this stage, `codex/unsloth-low-vram` incorporated the desktop's `codex/unsloth-file-cache` work (`411ee540`)
+alongside the laptop's allocation changes. This history is now included in `origin/main`. The hardware-aware
+helper selects a local profile; the desktop's separately trained placement remains an explicit experiment
+rather than a hardware default.
 
 The branch selectively adapts upstream's [batched prompt reads](https://github.com/Niko1221/Strata/commit/0b030b96fc6a13a3f815ec25f4d6491f47745b1c)
 and Windows commit checks from [its memory fix](https://github.com/Niko1221/Strata/commit/5728828a8498a4581f51a61f5a64805174648c0f).
@@ -280,12 +299,13 @@ desktop runtime validation remain outstanding. Existing laptop launchers continu
 
 ## Original manual setup
 
-This custom branch uses the tested upstream `v0.1.40.1` source baseline (`82f46a8`) with the selective backports
+The historical manual trials used upstream `v0.1.40.1` (`82f46a8`) with the selective backports
 described above. The [hardware-aware helper below](#hardware-aware-preparation-for-both-pcs) prepares a separate
-automatic profile. The earlier manual method remains available. For a separate installation, clone the branch:
+automatic profile from the current shared source. The earlier manual method remains available. For a separate
+installation, clone shared `main` into a new folder:
 
 ```text
-git clone --branch codex/unsloth-low-vram --single-branch https://github.com/corbinjurgens/Strata.git
+git clone --branch main --single-branch https://github.com/corbinjurgens/Strata.git
 cd Strata
 ```
 
@@ -342,9 +362,9 @@ the configuration on each PC; copying a desktop JSON would carry its paths and b
 
 ### Reproduce from source and existing model files
 
-Use a checkout containing the current engine, setup and helper changes, including
-`tools/prepare_unsloth_q2.py`. An older checkout does not include this branch's engine and helper changes. Check out
-this branch before reproducing them elsewhere; ignored executables, generated configs, build
+Use a checkout of shared `origin/main` containing the current engine, setup and helper changes, including
+`tools/prepare_unsloth_q2.py`. Update an existing checkout only after preserving its local changes and working
+profile selection, or use the separate clone above. Ignored executables, generated configs, build
 receipts and launchers must be rebuilt or generated locally. Keep API keys out of Git.
 
 The Windows build wrapper needs the normal Python environment and installed CUDA, MSVC, CMake, Ninja and
@@ -440,12 +460,30 @@ cache forecast; increasing the reserve cannot create room when fixed allocations
 After resampling, a launch with both host-cache requests still automatic requires current available physical
 memory, available Windows commit on Windows, and at least 0.25 GiB in the computed expert pool. A measured zero
 is insufficient capacity, rather than unknown telemetry. Linux does not require Windows commit. Rejection
-preserves the saved config and does not start the server. The below-2-GiB warning alone does not reject a plan.
+preserves the saved config and prevents engine creation and HTTP serving. The helper may already have started
+the Python server process to perform those checks. The below-2-GiB warning alone does not reject a plan.
 
-The launcher samples hardware and memory again before each start. The saved `memory_policy` records which
-values are automatic. Manual changes to its managed arguments/environment become persistent overrides;
-other config values, credentials and server settings are preserved. A manual pinned budget reduces an
-automatic recent-cache request, and an explicit recent request limits an automatic pinned request. To mark
+The saved `memory_policy` opts a profile into automatic preparation. Both the helper's `--launch` path
+and direct server startup from that config use the same preparation before loading the engine. Hardware
+and memory are sampled once per server start. The saved profile is an automatic template: preparation
+checks admission and readiness, then returns refreshed managed values for that server's lifetime without
+rewriting the saved JSON. This avoids overwriting concurrent user edits. Edits observed during preparation
+cause refusal, but an edit made after those checks is not guaranteed to block startup. An idle reload or
+recovery after an engine crash does not promise another policy refresh; restart the server to plan again.
+The preparation commands still create and save new profiles. Configurations without `memory_policy`
+remain static/manual.
+Automatic profiles select one GPU index. A temporary server `--gpu` selection is used for that launch's
+policy sample and engine without replacing the saved GPU selection. An explicit `CUDA_VISIBLE_DEVICES`
+that matches the selected GPU is accepted; conflicting or invalid visibility selections or ordering are
+rejected before engine creation and HTTP serving. Static/manual profiles retain their multi-GPU path.
+
+The policy records which values are automatic. User edits saved in its managed arguments/environment
+are treated as overrides on later starts; other config values, credentials and server settings are
+preserved. Supported cache and KV argument removals and managed environment removals remain explicit
+overrides. An automatic profile requires an explicit, supported `--max-context` capacity: if it is missing
+or invalid, correct the saved argument before starting. A static profile can use the engine's defaults.
+A manual pinned budget reduces an automatic recent-cache request, and an explicit recent request limits
+an automatic pinned request. To mark
 deliberate new-profile overrides even when they equal the current automatic choice, use
 `--resident-budget-gib`, `--file-cache-mib` or `--resident-headroom-gib` during creation. Oversized explicit
 requests remain explicit and are reported; this does not bypass engine safety clamps. Remove `memory_policy`
@@ -455,15 +493,15 @@ An explicit override or removal of either `--resident-budget-gib` or `STRATA_FIL
 launch path and its warnings, including across repeated refreshes. Profile requests, when present, must be
 finite and positive; recent MiB must be a nonnegative integer; host headroom and VRAM reserve must be finite
 and nonnegative. Zero recent retention and zero headroom remain valid. The same validation applies to new
-CLI overrides and edited policy configs before publication or launch.
-JSON null in a managed environment setting means removal: the saved environment omits that key while the
-policy retains the explicit removal across refreshes. It is never passed to the engine as the string `None`.
+CLI overrides and edited policy configs before profile creation or engine launch.
+JSON null in a managed environment setting means explicit removal: that key is omitted from the runtime
+environment across refreshes. It is never passed to the engine as the string `None`.
 The engine saturates oversized finite GiB-to-byte requests before allocation checks. A positive profile
 request below one byte keeps a one-byte budget, so it cannot select the zero/full-complement sentinel;
 such a budget can still fail allocation because no expert fits it.
 
 Each managed memory-policy argument must appear at most once, including context, KV and boolean switches.
-Duplicate managed arguments are rejected before config publication or server startup; the helper preserves
+Duplicate managed arguments are rejected before profile creation or engine startup; preparation preserves
 the saved bytes so the ambiguous argument list can be corrected explicitly.
 
 Numeric strings use ASCII decimal or scientific syntax; separators such as underscores and non-ASCII
@@ -477,10 +515,11 @@ allowance, and reports any requested/effective difference. An effective prefix a
 rejected before launch to avoid signed-integer overflow. Removing the argument retains the conservative
 zero-reserve allowance used by the planner.
 
-`tools/benchmark_compact_cache.py` consumes the saved effective settings without refreshing the portable
-policy. For comparisons, refresh and save the effective config once, then freeze and record those settings
-alongside actual residency. `--plan` previews a refresh without saving it. Historical benchmark results do
-not validate a later automatic policy.
+`tools/benchmark_compact_cache.py` consumes saved settings without refreshing the portable policy. A saved
+automatic template does not contain the latest server's refreshed runtime budgets. For comparisons, use
+a separate frozen static config containing the intended effective settings, and record those settings
+alongside actual residency. `--plan` previews a refresh without saving it. Historical benchmark results
+do not validate a later automatic policy.
 
 New profiles set `fit_max_tokens=true` and `open_browser=false`. Output-budget fitting shortens a client's
 requested output allowance to the remaining context; it does not truncate the prompt or increase capacity.
