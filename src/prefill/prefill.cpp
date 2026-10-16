@@ -101,6 +101,44 @@ constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// Opt-in routed-only staging at the original chunk threshold and GPU ring size. The fallback uses eight of
+// those slots and full-chunk MoE buffers; it can select different expert kernels from the streamed walk.
+inline bool demand_only_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_DEMAND_ONLY");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+// Payload accounting, independent of verifier profiling: no events, GPU readbacks or source/cache probes.
+// "Consumed" means selected by routing, not a completed DMA or a physical disk read. Fused layers keep routing
+// on the GPU; their scheduled blobs remain unclassified rather than introducing a diagnostic synchronization.
+struct DemandStats {
+    bool on = [] { const char* v = std::getenv("STRATA_PREFILL_DEMAND_STATS"); return v && v[0] == '1'; }();
+    uint64_t scheduled = 0, scheduled_bytes = 0, used = 0, used_bytes = 0, unused = 0, unused_bytes = 0;
+    uint64_t h2d = 0, h2d_bytes = 0;
+    void schedule(uint64_t count, uint64_t bytes) { scheduled += count; scheduled_bytes += count * bytes; }
+    void classify(bool routed, uint64_t bytes) {
+        if (routed) { ++used; used_bytes += bytes; }
+        else { ++unused; unused_bytes += bytes; }
+    }
+    void upload(uint64_t bytes) { ++h2d; h2d_bytes += bytes; }
+    void report(int64_t p0, int64_t tokens, int64_t lb, int64_t le, int ring, bool all) const {
+        if (!on) return;
+        std::fprintf(stderr, "strata prefill demand: phase=prefill pos=%lld tokens=%lld layers=%lld:%lld "
+                     "schedule=%s ring=%d scheduled_blobs=%llu scheduled_payload_bytes=%llu "
+                     "consumed_blobs=%llu consumed_payload_bytes=%llu unused_blobs=%llu unused_payload_bytes=%llu "
+                     "unclassified_blobs=%llu unclassified_payload_bytes=%llu "
+                     "h2d_submitted_blobs=%llu h2d_submitted_payload_bytes=%llu\n",
+                     (long long) p0, (long long) tokens, (long long) lb, (long long) le, all ? "all" : "demand", ring,
+                     (unsigned long long) scheduled, (unsigned long long) scheduled_bytes,
+                     (unsigned long long) used, (unsigned long long) used_bytes,
+                     (unsigned long long) unused, (unsigned long long) unused_bytes,
+                     (unsigned long long) (scheduled - used - unused),
+                     (unsigned long long) (scheduled_bytes - used_bytes - unused_bytes),
+                     (unsigned long long) h2d, (unsigned long long) h2d_bytes);
+    }
+};
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -978,7 +1016,8 @@ detail::WeightScratchLayout weight_scratch_layout() {
 // MMQ in the same buffers, so each keeps MMQ's size for stream_all_min() - 1 tokens.  `src`: the layout streams experts
 // (Prefill::init got an ExpertSource; without one no chunk takes the streamed walk, so no chunk is fused).
 bool fused_layout(size_t T, bool src) {
-    return src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE && (int64_t) T >= stream_all_min();
+    return !demand_only_enabled() && src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE &&
+           (int64_t) T >= stream_all_min();
 }
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
@@ -2232,14 +2271,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        const bool stream_eligible = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        const bool stream_all = !demand_only_enabled() && stream_eligible;
+        DemandStats demand;
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
             bool held = false;
             ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
         } pool_hold;
-        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all) {
+        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_eligible) {
             bool expect = false;
             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
         }
@@ -2256,6 +2297,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
                                 cudaMemcpyHostToDevice, P.s_cp);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
+                if (demand.on) demand.upload((uint64_t) lay0.blob_bytes(en.l));
                 P.plive[sl] = 1;
                 ++P.p_issued;
             }
@@ -2312,6 +2354,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     seq.push_back({(int32_t) l, e, b, job});
                 }
+                if (demand.on) {
+                    demand.schedule(seq.size() - seq_start[(size_t) l], (uint64_t) lay0.blob_bytes(l));
+                    if (ps_on) demand.schedule(m.pp->pseq.size() - m.pp->pseq_start[(size_t) l],
+                                               (uint64_t) lay0.blob_bytes(l));
+                }
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
@@ -2343,6 +2390,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
+                if (demand.on) demand.upload(bytes);
                 ++issued;
             }
         };
@@ -2358,6 +2406,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
         int64_t iss_streamed = 0, iss_dma = 0;
+        uint64_t iss_bytes = 0;
         std::thread issuer;
         struct IssuerJoin {
             std::atomic<bool>* stop;
@@ -2390,6 +2439,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.stage_live[sl] = true;
                     iss_ms += ms_since(th);
                     ++iss_streamed;
+                    if (demand.on) iss_bytes += bytes;
                     a_issued.store(idx + 1, std::memory_order_release);
                 }
             });
@@ -3190,6 +3240,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
+                        if (demand.on) {
+                            const uint64_t bytes = (uint64_t) lay.blob_bytes(l);
+                            if (stream_all) {
+                                for (size_t k = seq_start[(size_t) l]; k < seq_start[(size_t) l + 1]; ++k)
+                                    demand.classify(m.cnt[(size_t) seq[k].e] > 0, bytes);
+                                if (ps_on)
+                                    for (size_t k = m.pp->pseq_start[(size_t) l]; k < m.pp->pseq_start[(size_t) l + 1]; ++k)
+                                        demand.classify(m.cnt[(size_t) m.pp->pseq[k].e] > 0, bytes);
+                            } else {
+                                for (int32_t e : order) {
+                                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                    demand.schedule(1, bytes);
+                                    demand.classify(true, bytes);
+                                }
+                            }
+                        }
                         // Aurora (STRATA_MMQ_RESIDENT_SORT_NE=1, opt-in): a layer whose experts are ALL resident and
                         // run through MMQ groups takes them in row-count order, so each 16-expert group's max_rows
                         // (its padded tile rows) is close to its experts' own; slot/src/off are rebuilt coherently
@@ -3617,6 +3683,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
+                            if (demand.on) demand.upload((uint64_t) lay.blob_bytes(l));
                             return true;
                         };
                         // In the streamed walk an MMQ group is gathered in ONE launch, after ONE wait on its last
@@ -3925,7 +3992,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
+            if (demand.on) { demand.h2d += (uint64_t) iss_streamed; demand.h2d_bytes += iss_bytes; }
         }
+        demand.report(p0, T, LB, LE, m.ring, stream_all);
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -84,6 +85,76 @@ void allocation_layouts() {
     prefill.reset();
     require(pf::Prefill::bytes_needed(g, ss, 0) == 0, "zero chunk must not price a huge layout");
     require(!prefill.init(wt, g, ss, nullptr, nullptr, nullptr, 0, nullptr, err), "zero chunk accepted");
+}
+
+// Run separately with STRATA_PREFILL_DEMAND_ONLY=1 and STRATA_PREFILL_STREAM_MIN=1024. A 96-slot allocation
+// must retain full-chunk fallback scratch, even on CUDA hardware that normally takes the fused experts.
+void demand_only_layout() {
+    const char* demand = std::getenv("STRATA_PREFILL_DEMAND_ONLY");
+    require(demand && demand[0] == '1', "demand-only layout fixture requires STRATA_PREFILL_DEMAND_ONLY=1");
+    require(pf::Prefill::stream_all_min_tokens() == 1024, "demand-only fixture requires the original 1024-token threshold");
+    struct RingEnv {
+        std::string old;
+        bool present;
+        RingEnv() : present(std::getenv("STRATA_PREFILL_RING") != nullptr) {
+            if (present) old = std::getenv("STRATA_PREFILL_RING");
+        }
+        static void set(const char* value) {
+#if defined(_WIN32)
+            require(_putenv_s("STRATA_PREFILL_RING", value ? value : "") == 0, "set fixture ring");
+#else
+            require((value ? setenv("STRATA_PREFILL_RING", value, 1) : unsetenv("STRATA_PREFILL_RING")) == 0,
+                    "set fixture ring");
+#endif
+        }
+        ~RingEnv() { set(present ? old.c_str() : nullptr); }
+    } ring_env;
+    strata::core::ModelGeometry g;
+    strata::core::WeightTable wt;
+    strata::core::QsaState q;
+    q.max_cells = 131072;
+    q.n_pages = q.max_cells / 4;
+    q.kv_mode = 1;
+    q.kv_q4 = true;
+    strata::core::SessionState ss;
+    ss.qsa_states = &q;
+    std::string err;
+    const auto absent = std::filesystem::temp_directory_path() / "strata-prefill-allocation-fixture-no-pack";
+    require(!std::filesystem::exists(absent), "fixture's absent pack path unexpectedly exists");
+    require(k::cpu::expert_layout_load(absent.string(), g.n_layers, g.n_expert, err), err);
+    struct NoReadSource : strata::core::ExpertSource {
+        const uint8_t* blob(int64_t, int64_t) override { throw std::runtime_error("allocation fixture read a model blob"); }
+    } source;
+    RingEnv::set("96");
+    require(pf::Prefill::ring_slots_for(1023) == 8, "demand-only changed the small-chunk ring");
+    require(pf::Prefill::ring_slots_for(1024) == 96, "demand-only changed the original streaming threshold/ring");
+    constexpr int64_t chunk = 4096;
+    const uint64_t priced96 = pf::Prefill::bytes_needed(g, ss, chunk);
+    const uint64_t no_ring = pf::Prefill::bytes_needed_no_ring(g, ss, chunk);
+    require(priced96 - no_ring == 96ull * 1382400, "96-slot ring payload price differs from canonical Q2_0");
+    RingEnv::set("8");
+    const uint64_t priced8 = pf::Prefill::bytes_needed(g, ss, chunk);
+    // The explicit eight-slot layout already requires full-chunk fallback buffers. Comparing it against 96
+    // catches an accidental fused scratch shrink in the demand-only layout, rather than copying its formula.
+    require(priced96 == priced8 + 88ull * (1382400 + 256), "demand-only retained undersized fused MoE scratch");
+    RingEnv::set("96");
+    Dev arena((size_t) priced96);
+    pf::Prefill prefill;
+    require(!prefill.init(wt, g, ss, &source, nullptr, nullptr, chunk, nullptr, err, arena.p, priced96 - (64ull << 20)),
+            "demand-only accepted an undersized borrowed region");
+    require(!err.empty(), "demand-only allocation failure omitted its error");
+    prefill.reset();
+    err.clear();
+    require(prefill.init(wt, g, ss, &source, nullptr, nullptr, chunk, nullptr, err, arena.p, priced96), err);
+    for (int64_t n : {int64_t(1023), int64_t(1024), chunk}) {
+        const uint64_t price = pf::Prefill::bytes_needed(g, ss, n);
+        require(price <= priced96, "demand-only relayout exceeds the initial capacity");
+        require(prefill.relayout(n, arena.p, price, err), err);
+        require(prefill.chunk() == n, "demand-only relayout changed chunk capacity");
+    }
+    arena.guard();
+    std::printf("demand-only layout: chunk %lld ring 96 bytes %llu; eight-slot bytes %llu\n",
+                (long long) chunk, (unsigned long long) priced96, (unsigned long long) priced8);
 }
 
 void selection_bounds(int64_t queries, bool tensor_core) {
@@ -168,10 +239,16 @@ void attention_bounds(int64_t queries, bool q4) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--demand-only-layout") == 0) {
+            demand_only_layout();
+            std::puts("prefill demand-only allocation bounds: PASS");
+            return 0;
+        }
+        require(argc == 1, "unknown allocation fixture argument");
         allocation_layouts();
         for (int64_t n : {1, 15, 16, 17, 31, 32, 33, 63, 64, 255, 256}) {
             selection_bounds(n, false);
