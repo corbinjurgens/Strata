@@ -5,8 +5,9 @@ record changes that have not been released under Unreleased.
 
 ## Unreleased
 
-Work on `codex/unsloth-file-cache`, including the engine changes, preparation tools,
-tests, and measured desktop results. No release is claimed.
+Shared development now uses `main`; each PC keeps its own engine build, models and
+profiles. No release is claimed. The following desktop results describe the earlier
+`codex/unsloth-file-cache` workload; the dated entries record subsequent changes.
 
 - **What changed:** opt-in fetch diagnostics, a default-off Windows read-path experiment,
   hardware-aware UD-Q2_K_XL build/configuration/launch support, and guarded benchmark acceptance.
@@ -44,3 +45,26 @@ Implementation range: `89433d16ab0754939e2bcce16bc60c2caadea168..e4e7567a3ce2305
 - **Verification:** Windows CUDA architecture 89 candidate build; 90 Python tests and two targeted CTests,
   including 21 GPU-free retry checks; independent whole-diff review after corrective repairs;
   reviewed/committed diff identity and unchanged hashes for six protected engine/configuration files.
+
+## 2026-10-16 — Shared main and automatic startup (unreleased)
+
+Implementation range: `63a01bba5defba75d6e688f9c4d77a0dd2f7520f..9a73411d3a917f333bd327fd07626572fc28d2a6`.
+
+- **What changed:** combined the MSI main branch with the laptop memory safeguards and
+  desktop validation branch. Automatic profiles refresh and check admission once at
+  server startup for the effective GPU, using current physical RAM and Windows commit.
+  Refreshed settings stay in memory; startup leaves the saved profile unchanged.
+  Explicit overrides and static profiles retain their existing ownership.
+- **What worked:** an isolated CUDA build on the RTX 4080 SUPER Windows desktop passed
+  the smoke workload and an automatic-start arithmetic/code/reuse run. The automatic run
+  completed four requests with minimum available RAM 4.249 GiB, available commit
+  16.004 GiB and sampled CUDA-free VRAM 731 MiB. All protected local runtime files
+  matched their original hashes; the working installation was not switched.
+- **What did not or remains open:** no new speedup is established. These automated runs
+  do not establish watched responsiveness, merged-build full-128K acceptance or MSI
+  runtime acceptance. HIP/SYCL remain untested. CUDA memory readings were stage samples,
+  not continuous minima. Each PC must build locally and retain its own model paths.
+- **Verification:** 181 Python tests, 12 focused C++ checks, CUDA build, independent
+  semantic review and final reviewed-source hash comparison passed. GPU-selection
+  conflicts and missing automatic context fail before engine creation; runtime-only
+  refresh removes the reproduced saved-profile publication race.
