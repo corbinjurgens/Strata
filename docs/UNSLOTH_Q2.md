@@ -587,6 +587,100 @@ driver 617.14, CUDA 13.4.92 and MSVC 19.44.35229. Its sm_89 engine built and ran
 model hashes passed, and `--compat-bf16` packing produced the 1.38 GiB arena. Those checks establish that
 preparation step, not the performance of the newer automatic policy.
 
+## RTX 4050 comparison after the desktop changes, 2026-10-16
+
+The pre-pull source `63a01bba` and desktop source `9c16f6f1` were rebuilt with the same
+CUDA 13.4 / MSVC 19.43 toolchain, sm_89 flags and identical local GGML inputs. The machine
+was the RTX 4050 Laptop 6 GB / i7-13700H, with 63.71 GiB usable RAM, Windows 11,
+driver 617.42, no pagefile, an MSI M480 PRO NVMe SSD, the internal display and normal
+applications including Codex open. These were automated tests; UI responsiveness was
+not observed, and an external monitor was not connected.
+
+The existing static 39 GiB pinned profile was stopped during warmup on the old source:
+available commit reached 2.006 GiB and stayed below 4 GiB for five samples, despite
+the engine clamping the pinned allocation to 29.26 GiB. This is separate from an
+engine performance comparison. An eager-loading current-source control started at
+266 MiB CUDA-free but reached 234 MiB after warmup; the guard stopped it too.
+A separate baseline diagnostic, with only the current request-end `mem_mark` added,
+reproduced the same 234 MiB reading under identical eager controls. This confirms
+that shortfall predates the pull. Its source and original executable were restored;
+the diagnostic binary was not used for performance measurements.
+
+The matched comparison therefore used explicit `CUDA_MODULE_LOADING=LAZY`, 16 GiB
+pinned experts, 4096 MiB compact recent retention and 8 GiB host headroom. Capacity
+was 65536, q4_0 KV with 20480 resident cells, 256-token separate prefill buffers,
+verifier window 2 and no MTP, suffix or lookup drafting. These frozen controls
+used the existing GGUF-in-place pack; they are not refreshed automatic budgets.
+
+| Source / ready-copy setting | Decode tokens/s, two runs | Fresh 2048-token prefill, seconds |
+| --- | --- | --- |
+| Pre-pull `63a01bba`, off | 10.30 / 10.51 | 67.642 / 64.127 |
+| Current `9c16f6f1`, off | 10.16 / 10.41 | 64.124 / 66.549 |
+| Current `9c16f6f1`, on | 10.32 / 10.21 | 52.452 / 53.450 |
+
+Order was old / current-off / current-on / current-on / current-off / old. Each
+run used the same warmup, two rounds of the same three 160-token generation cases,
+fresh retrieval and a cached follow-up. All timed output sequences matched exactly,
+all retrieval/follow-up checks passed, and each run realized 59 GPU expert slots
+and 16 GiB pinned experts. Pooled decode was 10.40 before and 10.28 after; these
+overlapping short-run ranges do not establish a material regression or gain.
+
+Ready-copy reuse reduced prefill time by 18.20% and 16.65% against the faster
+current-source off control. It did not establish a decode gain. This is a 2K
+workload at 64K capacity, not the desktop's 8K test or a full-context result.
+Across this block, available commit stayed above 11.28 GiB. Current-source stage
+samples stayed at or above 420 MiB CUDA-free; the old source lacked the request-end
+trace, so its 472 MiB startup sample is not a continuous or comparable runtime minimum.
+
+The hardware-policy comparison produced identical argument/environment choices at
+both revisions across 48 healthy RAM/VRAM/context/memory combinations. The Python
+preparation, server configuration and benchmark suites passed 146 tests; the focused
+C++ cache-retry, file-source and prefill-allocation checks also passed. Local raw
+results, protected-file receipts, build provenance and harnesses are under
+`build-unsloth/msi4050-20261016/`. Existing engines and saved launchers were preserved.
+
+### Contiguous-layout pilot and refreshed automatic profile
+
+A separate contiguous pack was built with bounded buffers and independently compared
+against every original GGUF expert slice. All 46084915200 expert bytes matched; its
+SHA-256 was `5a71d41249331ac874f97f998e0ec807c13318ca0e0b8a334a9c0ca4e600cc07`,
+the same as the desktop artifact. Dense weights, index, layout and tokenizer hashes
+also matched the installed pack. With only the pack path changed from the frozen
+current-source off controls, one pilot measured 12.20 decode tokens/s and 22.807 seconds
+for fresh 2K prefill. That is 17.22% faster decode and 64.43% less prefill time than
+the faster current-source controls. All timed outputs and retrieval checks matched.
+Preparation and verification warmed storage; this was not a cold-cache test or a
+repeated storage-layout acceptance block. The additional 42.92 GiB expert file and
+copied pack files were removed after measurement; receipts and reproduction code remain.
+
+The old local pack initially lacked `source-verification.json`, so automatic startup
+was refused before engine creation. All original GGUF SHA-256 checks then passed and
+the verification receipt was added without rewriting the weights. The prepared eager
+128K profile was subsequently refused at 216 MiB CUDA-free, below the 256 MiB floor.
+
+A separate refreshed automatic profile using the original GGUF-in-place pack,
+explicit lazy CUDA and ready-copy reuse passed arithmetic, cached answers, three
+512-token generations, their cached follow-ups, 30 seconds of idle monitoring, and
+fresh 2048-token retrieval plus 2073-token cached reuse. Capacity stayed 131072,
+q4_0 KV and 20480 resident cells; prefill was 64. The runtime requested 17 GiB pinned
+and 7562 MiB recent, with the recent target finalized at 7053 MiB. Sustained generations
+measured 11.5 / 11.2 / 12.0 tokens/s. These different automatic allocations and workloads
+are not a matched speed comparison against the frozen 64K controls.
+
+Minimum physical RAM available was 19.52 GiB, commit available 7.549 GiB and logged
+CUDA-free memory 378 MiB. Five memory samples during fresh retrieval were below the
+requested 8 GiB commit allowance; the final memory sample recovered to 8.67 GiB.
+The run passed the 2 GiB immediate / 4 GiB sustained commit guards, but does not
+establish that the requested 8 GiB headroom is always retained. Stage readings are
+not continuous VRAM minima. Full near-128K inputs, external displays, observed UI
+responsiveness, HIP/SYCL and Linux remain unverified.
+
+An unselected local candidate is available at
+`build-unsloth/msi4050-20261016/run-automatic-128k.bat`, with an authenticated loopback
+profile on port 8081. It keeps automatic memory sizing, explicit lazy loading and
+ready-copy reuse; restart resamples memory. This is an experimental local candidate,
+not a default change or full-context acceptance.
+
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
 Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,

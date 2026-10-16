@@ -78,10 +78,12 @@ test. Do not infer responsiveness from unattended telemetry.
 
 ## Other acceptance gaps
 
-- Rebuild and validate the latest code on the other PC. RTX 4050 laptop default
-  eager-loading startup, usual external-monitor conditions and full near-128K
-  retrieval/reuse remain separate acceptance work. Preserve each PC's local models,
-  paths and automatic budgets.
+- The latest code was rebuilt and compared on the RTX 4050 laptop; matched lazy-loading
+  short/2K runs and ready-copy reuse passed. See the
+  [laptop report](docs/UNSLOTH_Q2.md#rtx-4050-comparison-after-the-desktop-changes-2026-10-16).
+  Eager first-use headroom remains insufficient on both the pre-pull and current code.
+  Usual external-monitor conditions and full near-128K retrieval/reuse still need
+  acceptance. Preserve each PC's local models, paths and automatic budgets.
 - HIP/SYCL builds and runtime behavior, and Linux acceptance, remain unverified for
   these changes. CUDA desktop results do not establish them.
 - Broader task quality remains unproven. Both reuse-on/off controls passed three
