@@ -148,6 +148,9 @@ void arena_test(const fs::path& root) {
     check(ok, "same object and table load successfully after failure " + l.err);
     if (!ok) return;
     check(l.dense.tensor_count() == tensors.size(), "packed copies do not inflate the native tensor count");
+    uint64_t estimated = 0;
+    check(NativeDense::weight_bytes_for({first.string(), second.string()}, l.wt, true, 0, 48, estimated, l.err) &&
+              estimated == l.dense.allocated_bytes(), "full-range estimate matches the native arena allocation");
     const auto* base = static_cast<const unsigned char*>(l.wt.find(tensors[0].name)->native_data);
     size_t at = 0, payload = 0;
     bool same = true, aligned = true, slices = true, packed_same = true;
@@ -196,6 +199,27 @@ void arena_test(const fs::path& root) {
                   !stage.wt.find(tensors[3].name)->native_data, "stage excludes layers outside its interval");
         check(stage.wt.find(tensors[1].name)->native_data != l.wt.find(tensors[1].name)->native_data,
               "separate stage owns its own allocation");
+        check(NativeDense::weight_bytes_for({first.string(), second.string()}, stage.wt, true, 1, 2,
+                                           estimated, stage.err) && estimated == stage.dense.allocated_bytes(),
+              "layer-one estimate matches its explicit stage allocation");
+    }
+
+    // Production stages use the global range and retain PLE even outside that range.
+    // An otherwise empty range keeps granule rounding from hiding an omitted PLE slice.
+    Loaded ple_stage;
+    if (cudaMalloc(&ple_stage.arena, 256) != cudaSuccess) { check(false, "allocate PLE stage arena"); return; }
+    const bool ple_table = ple_stage.wt.load(pack.string(), ple_stage.arena, 256, ple_stage.err, &skip);
+    NativeDense::set_layer_range(3, 4);
+    const bool ple_ok = ple_table && ple_stage.dense.load({first.string(), second.string()}, ple_stage.wt,
+                                                        ple_stage.err, true);
+    NativeDense::set_layer_range(-1, -1);
+    check(ple_ok, "production stage retains PLE outside its layer interval " + ple_stage.err);
+    if (ple_ok) {
+        check(ple_stage.dense.tensor_count() == 1 && ple_stage.wt.find(KEY)->native_data,
+              "otherwise empty production stage owns only its PLE matrix");
+        check(NativeDense::weight_bytes_for({first.string(), second.string()}, ple_stage.wt, true, 3, 4,
+                                           estimated, ple_stage.err) && estimated == ple_stage.dense.allocated_bytes(),
+              "production stage estimate includes PLE and its shared activation scratch");
     }
 }
 }  // namespace

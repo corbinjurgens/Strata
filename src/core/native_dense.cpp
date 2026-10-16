@@ -20,6 +20,23 @@
 
 namespace strata::core {
 namespace {
+// Price the shared arena once, with the same 2 MiB backing granule used by the layer-split planner.
+// Optional HC experiment matrices still have separate allocations; sub-MiB ones retain payload pricing.
+constexpr uint64_t kAllocGranule = 2ull << 20;
+constexpr uint64_t kSmallAlloc = 1ull << 20;
+uint64_t alloc_bytes(uint64_t bytes) {
+    return bytes < kSmallAlloc ? bytes : (bytes + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
+}
+size_t arena_slice(size_t& arena_bytes, size_t bytes) {
+    constexpr size_t alignment = 256;
+    const size_t limit = (std::numeric_limits<size_t>::max)();
+    if (bytes > limit - (alignment - 1)) throw std::overflow_error("native dense arena size overflow");
+    const size_t padded = (bytes + alignment - 1) & ~(alignment - 1);
+    if (arena_bytes > limit - padded) throw std::overflow_error("native dense arena size overflow");
+    const size_t offset = arena_bytes;
+    arena_bytes += padded;
+    return offset;
+}
 int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
 bool in_range(const std::string& name) {
     if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
@@ -132,6 +149,58 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+// The byte walk `load` does with set_layer_range(lb, le), retaining PLE on every stage, without the allocations:
+// the same filters in the same order, reading the GGUF headers and the canonical table only, so it needs no device.
+// A later stage's projections are not
+// on the card when the split search prices that stage; their aligned slices and scratch share one arena. The two
+// have to stay in step.  A repeated name is skipped rather than refused (`load` refuses it).
+bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
+                                   int64_t lb, int64_t le, uint64_t& out, std::string& err) {
+    out = 0;
+    try {
+        std::set<std::string> seen;
+        size_t arena_bytes = 0;
+        int max_in = 0;
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key)) continue;
+                if (tensor.name.rfind("blk.", 0) == 0 && tensor.name.find("ple") == std::string::npos) {
+                    const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                    if (l < lb || l >= le) continue;
+                }
+                if (!seen.insert(tensor.name).second) continue;
+                auto found = table.table_.find(tensor.name);
+                if (found == table.table_.end()) {
+                    err = "native dense: tensor absent from canonical table: " + tensor.name;
+                    return false;
+                }
+                const auto& ref = found->second;
+                if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
+                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
+                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                    err = "native dense: incompatible matrix " + tensor.name;
+                    return false;
+                }
+                const auto bytes = strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
+                arena_slice(arena_bytes, bytes);
+                max_in = (std::max)(max_in, (int) ref.ne0);
+                if (tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&
+                    strata::kernels::native_q8_0_packed_enabled() &&
+                    strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1))
+                    arena_slice(arena_bytes, bytes);
+            }
+        }
+        if (max_in > 0) arena_slice(arena_bytes, strata::kernels::native_q8_1_bytes(max_in));
+        out = alloc_bytes(arena_bytes);
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
 bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
                                            std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
@@ -166,19 +235,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::vector<std::unique_ptr<strata::GgufFile>> mappings;
         mappings.reserve(shards.size());
         size_t arena_bytes = 0;
-        auto slice = [&](size_t bytes) {
-            constexpr size_t alignment = 256;
-            const size_t limit = (std::numeric_limits<size_t>::max)();
-            if (bytes > limit - (alignment - 1)) throw std::overflow_error("native dense arena size overflow");
-            const size_t padded = (bytes + alignment - 1) & ~(alignment - 1);
-            if (arena_bytes > limit - padded) throw std::overflow_error("native dense arena size overflow");
-            const size_t offset = arena_bytes;
-            arena_bytes += padded;
-            return offset;
-        };
+        auto slice = [&](size_t bytes) { return arena_slice(arena_bytes, bytes); };
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0, hc_q8_bytes = 0;
+        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -188,7 +248,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
-            if (gguf.get("general.architecture")) {
+            if (gguf.get("general.architecture") && (!number || number->u == 0)) {
+                // splitter may copy general.architecture into every shard (Huihui abliterated re-split)
                 err = strata::check_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
@@ -306,6 +367,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                     pending_hc.push_back(PendingHc{&ref, std::move(data)});
                     hc_q8_bytes += bytes;
+                    allocated += alloc_bytes(bytes);
                 }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
@@ -366,6 +428,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         arena_ = arena.release();
         tensor_count_ = pending.size() + pending_hc.size();
         bytes_ = total + hc_q8_bytes;
+        allocated_ = alloc_bytes(arena_bytes) + allocated;
         if (hc_q8_requested())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);
