@@ -68,3 +68,31 @@ Implementation range: `63a01bba5defba75d6e688f9c4d77a0dd2f7520f..9a73411d3a917f3
   semantic review and final reviewed-source hash comparison passed. GPU-selection
   conflicts and missing automatic context fail before engine creation; runtime-only
   refresh removes the reproduced saved-profile publication race.
+
+## 2026-10-16 — Ready-cache copy reuse experiments (unreleased)
+
+Implementation range: `228cb8ab155fd334da840dcedb1bca46b5a16118..f235a929b6bf33ca5a348832f8e2be0f8e097766`.
+This range covers tracked Strata implementation and measurements documentation; local runtime
+profiles, engines and diagnostic artifacts are separate evidence, not part of that range.
+
+- **What changed:** default-off ready-cache copy reuse and independent copy/prefill payload
+  counters, an opt-in demand-only prefill path with full fallback scratch, and complete fetch
+  diagnostic line framing. Working profiles, shared defaults and model quantization stay unchanged.
+- **What worked:** on the RTX 4080 SUPER / Ryzen 7 9800X3D / 32 GB Windows desktop, clean
+  off/on/on/off runs measured 20.4298/18.9222/18.9218/20.5188 seconds for 8K prefill. Both enabled
+  repeats reduced latency by 7.38% versus the faster control. Fixed-budget 130880-token retrieval
+  and 130903-token reuse passed; fresh prefill took 253.983 seconds and the follow-up 3.044 seconds.
+  A separate unselected automatic candidate resampled to 9 GiB pinned / 4040 MiB recent cache and
+  passed arithmetic, code recall and prefix reuse; this short check has different memory budgets.
+- **What did not or remains open:** no repeated decode or cached-reply gain. Demand-only reduced
+  unused transfer payload but was slower; RAM splits, stager sleep and GPU ring changes did not
+  meet the 5% screen. Both reuse-on/off held-out controls missed interval union identically
+  (17 instead of 20); quality remains three of four, not a full acceptance pass. Long retrieval
+  has no matched speed control. Read-stall cause, watched responsiveness, laptop and HIP/SYCL
+  remain unverified; file-level WPR capture was denied. No new retention/pipeline rewrite was justified.
+- **Verification:** isolated CUDA build, 131 helper/benchmark Python tests, 11 C++ checks,
+  19 local harness probes, independent whole-diff and residual evidence review, raw telemetry,
+  protected-file hashes and owned-process cleanup passed. Long-run minimum available RAM was
+  4.407 GiB, Windows commit 16.028 GiB and logged CUDA-free VRAM 677 MiB; CUDA readings are stages.
+
+See [conditions, measurements and limits](docs/UNSLOTH_Q2.md#ready-copy-reuse-and-remaining-optimization-routes-2026-10-16).
