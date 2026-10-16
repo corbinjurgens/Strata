@@ -5652,6 +5652,13 @@ def main() -> int:
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    if a.engine == "strata" and cfg.get("memory_policy"):
+        from tools.prepare_unsloth_q2 import prepare_launch
+        gpu = (int(a.gpu) if a.gpu.strip().isdigit() else a.gpu) if a.gpu is not None else None
+        try:
+            cfg = prepare_launch(Path(a.config), gpu=gpu)
+        except (OSError, ValueError) as e:
+            ap.error(str(e))
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can

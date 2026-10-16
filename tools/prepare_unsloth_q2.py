@@ -207,7 +207,11 @@ def flag_value(args: list[str], flag: str):
     if flag == "--no-prefill-borrow":
         return True
     i = args.index(flag)
-    if i + 1 >= len(args) or args[i + 1].startswith("--"):
+    if i + 1 >= len(args):
+        raise ValueError(f"Missing value for {flag}.")
+    if not isinstance(args[i + 1], str):
+        raise ValueError(f"Invalid value for {flag}; expected a string.")
+    if args[i + 1].startswith("--"):
         raise ValueError(f"Missing value for {flag}.")
     return args[i + 1]
 
@@ -510,6 +514,37 @@ def refreshed_config(cfg: dict) -> dict:
         return cfg
     if policy.get("version") != POLICY_VERSION:
         raise ValueError("Unknown memory policy version; update the preparation helper before launching.")
+    context = flag_value(cfg["args"], "--max-context")
+    if context is None or not re.fullmatch(r"[0-9]+", str(context).strip()) or int(context) <= 0:
+        raise ValueError("Automatic memory policy requires an explicit positive --max-context capacity; "
+                         "restore the flag or use a static profile.")
+    selected = cfg.get("gpu")
+    if isinstance(selected, str) and selected.strip().isdigit():
+        selected = int(selected)
+    if selected is not None and (isinstance(selected, bool) or not isinstance(selected, int) or selected < 0):
+        raise ValueError("Automatic memory policy requires one GPU index; use a static profile for multiple GPUs.")
+    env = cfg.setdefault("env", {})
+    for name in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
+        names = [key for key in env if (key.upper() if os.name == "nt" else key) == name]
+        values = [env[key] for key in names]
+        if name == "CUDA_DEVICE_ORDER":
+            if any(value != "PCI_BUS_ID" for value in values):
+                raise ValueError("Automatic memory policy requires CUDA_DEVICE_ORDER=PCI_BUS_ID.")
+        else:
+            for value in values:
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value.strip()):
+                    raise ValueError("Automatic memory policy requires CUDA_VISIBLE_DEVICES to name one GPU index.")
+                index = int(value)
+                if selected is not None and selected != index:
+                    raise ValueError("Automatic memory policy GPU conflicts with CUDA_VISIBLE_DEVICES; "
+                                     "make the selected GPU and explicit mask agree.")
+                selected = index
+        if names:
+            # Windows environment names ignore case; use one spelling in the runtime copy.
+            for key in names:
+                del env[key]
+            env[name] = values[0]
+    cfg["gpu"] = selected
     validate_memory_overrides({"args": {flag: flag_value(cfg["args"], flag)
                                         for flag in ("--resident-budget-gib", "--vram-reserve-mib")},
                                "env": cfg.get("env", {})})
@@ -524,8 +559,9 @@ def refreshed_config(cfg: dict) -> dict:
                 (key in cfg.get("env", {}) and cfg["env"][key] is None)):
             explicit["env"][key] = cfg.get("env", {}).get(key)
     gpu, memory = detected_gpu(cfg.get("gpu")), dict(detected_memory())
+    cfg["gpu"] = gpu["index"]
     plan = memory_plan(ram=memory.pop("ram_gib"), vram=gpu["vram_gb"],
-                       context=int(flag_value(cfg["args"], "--max-context")), overrides=explicit, **memory)
+                       context=int(context), overrides=explicit, **memory)
     for flag in MEMORY_FLAGS:
         if flag in explicit.get("args", {}):
             continue
@@ -607,17 +643,33 @@ def admit_automatic_launch(plan: dict) -> None:
                          f"only {plan['expert_pool_gib']:g} GiB remains after policy allowances.")
 
 
-def launch(config: Path) -> int:
+def prepare_launch(config: Path, *, gpu=None) -> dict:
+    """Prepare an automatic profile once, before the server creates its engine.
+
+    A CLI GPU selection applies to this launch's sample and engine only; the
+    persistent profile is never written during startup.
+    """
     original = config.read_bytes()
-    cfg = refreshed_config(json.loads(original.decode("utf-8-sig")))
-    if cfg.get("memory_policy"):
-        admit_automatic_launch(cfg["memory_policy"]["sample"])
+    cfg = json.loads(original.decode("utf-8-sig"))
+    if gpu is not None:
+        cfg["gpu"] = gpu
+    if not cfg.get("memory_policy"):
+        return cfg
+    cfg = refreshed_config(cfg)
+    admit_automatic_launch(cfg["memory_policy"]["sample"])
     check_ready(cfg)
-    if cfg.get("memory_policy"):
-        report_memory(cfg["memory_policy"]["sample"], cfg)
-        if config.read_bytes() != original:
-            raise ValueError("Configuration changed while checking readiness; launch again to preserve those edits.")
-        atomic_files({config: json_bytes(cfg)})
+    report_memory(cfg["memory_policy"]["sample"], cfg)
+    if config.read_bytes() != original:
+        raise ValueError("Configuration changed while checking readiness; launch again to preserve those edits.")
+    return cfg
+
+
+def launch(config: Path) -> int:
+    cfg = json.loads(config.read_text(encoding="utf-8-sig"))
+    # Automatic preparation belongs to server startup, including direct invocations.
+    # Static helper profiles retain their existing readiness check.
+    if not cfg.get("memory_policy"):
+        check_ready(cfg)
     # The server derives persistent web/chat settings from this path; retain the real local config.
     command = [sys.executable, str(ROOT / "serve/server.py"), "--engine", "strata",
                "--config", str(config), "--port", str(cfg.get("port", 8080))]

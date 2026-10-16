@@ -259,13 +259,19 @@ class PortableProfiles(unittest.TestCase):
     def make_config(self, overrides=None):
         return prep.config_for(self.root / "source", self.root / "pack", 131072, None, overrides=overrides)
 
+    def prepared_server(self, command, **kwargs):
+        """Simulate the child server's preparation at the subprocess boundary."""
+        config = Path(command[command.index("--config") + 1])
+        self.runtime = prep.prepare_launch(config)
+        return SimpleNamespace(returncode=0)
+
     def assert_launch_rejected(self, cfg, message):
         original = json.dumps(cfg, indent=4).encode()
         self.config.write_bytes(original)
         with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
                 patch.object(prep.subprocess, "run") as run:
             with self.assertRaisesRegex(ValueError, message):
-                prep.launch(self.config)
+                prep.prepare_launch(self.config)
         publish.assert_not_called()
         run.assert_not_called()
         self.assertEqual(self.config.read_bytes(), original)
@@ -380,7 +386,7 @@ class PortableProfiles(unittest.TestCase):
                     self.config.write_bytes(prep.json_bytes(cfg))
                     with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
                             contextlib.redirect_stdout(io.StringIO()):
-                        run.return_value.returncode = 0
+                        run.side_effect = self.prepared_server
                         self.assertEqual(prep.launch(self.config), 0)
                     run.assert_called_once()
                     saved = json.loads(self.config.read_text())
@@ -489,14 +495,67 @@ class PortableProfiles(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(self.config.read_bytes(), original)
 
-    def test_launch_readiness_failure_neither_saves_nor_starts_server(self):
+    def test_preparation_readiness_failure_neither_saves_nor_starts_engine(self):
         self.config.write_bytes(prep.json_bytes(self.make_config()))
         original = self.config.read_bytes()
         with patch.object(prep, "check_ready", side_effect=ValueError("not ready")), \
                 patch.object(prep.subprocess, "run") as run:
             with self.assertRaisesRegex(ValueError, "not ready"):
-                prep.launch(self.config)
+                prep.prepare_launch(self.config)
         run.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_preparation_never_publishes_refreshed_runtime_budgets(self):
+        self.config.write_bytes(prep.json_bytes(self.make_config()))
+        original = self.config.read_bytes()
+        prep.detected_memory.return_value["available_gib"] = 17
+        with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                contextlib.redirect_stdout(io.StringIO()):
+            runtime = prep.prepare_launch(self.config)
+            prep.detected_memory.return_value["available_gib"] = 27
+            second = prep.prepare_launch(self.config)
+        publish.assert_not_called()
+        self.assertEqual(value(runtime["args"], "--resident-budget-gib"), "5")
+        self.assertEqual(value(second["args"], "--resident-budget-gib"), "12")
+        self.assertEqual(value(json.loads(original)["args"], "--resident-budget-gib"), "12")
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_preparation_cli_gpu_does_not_add_a_saved_selection(self):
+        cfg = self.make_config()
+        cfg.pop("gpu")
+        self.config.write_bytes(prep.json_bytes(cfg))
+        with patch.object(prep, "check_ready"), patch.object(prep, "detected_gpu", return_value={"vram_gb": 6, "index": 2}) as gpu, \
+                contextlib.redirect_stdout(io.StringIO()):
+            runtime = prep.prepare_launch(self.config, gpu=2)
+        gpu.assert_called_once_with(2)
+        self.assertEqual(runtime["gpu"], 2)
+        self.assertNotIn("gpu", json.loads(self.config.read_text()))
+
+    def test_static_preparation_skips_telemetry_readiness_and_publication(self):
+        cfg = self.make_config()
+        cfg.pop("memory_policy")
+        original = json.dumps(cfg, indent=3).encode()
+        self.config.write_bytes(original)
+        with patch.object(prep, "refreshed_config") as refresh, patch.object(prep, "check_ready") as ready, \
+                patch.object(prep, "atomic_files") as publish:
+            runtime = prep.prepare_launch(self.config, gpu=2)
+        refresh.assert_not_called()
+        ready.assert_not_called()
+        publish.assert_not_called()
+        self.assertEqual(runtime["gpu"], 2)
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_automatic_gpu_lists_fail_before_sampling_or_publication(self):
+        self.config.write_bytes(prep.json_bytes(self.make_config()))
+        original = self.config.read_bytes()
+        prep.detected_memory.reset_mock()
+        with patch.object(prep, "check_ready") as ready, patch.object(prep, "atomic_files") as publish:
+            for gpu in ("0,2", [0, 2]):
+                with self.subTest(gpu=gpu), self.assertRaisesRegex(ValueError, "one GPU index"):
+                    prep.prepare_launch(self.config, gpu=gpu)
+        prep.detected_memory.assert_not_called()
+        ready.assert_not_called()
+        publish.assert_not_called()
         self.assertEqual(self.config.read_bytes(), original)
 
     def test_launch_rejects_zero_and_subminimum_automatic_pools(self):
@@ -515,10 +574,10 @@ class PortableProfiles(unittest.TestCase):
                 self.config.write_bytes(prep.json_bytes(cfg))
                 with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
                         contextlib.redirect_stdout(io.StringIO()):
-                    run.return_value.returncode = 0
+                    run.side_effect = self.prepared_server
                     self.assertEqual(prep.launch(self.config), 0)
                 run.assert_called_once()
-                saved = json.loads(self.config.read_text())
+                saved = self.runtime
                 self.assertEqual(saved["memory_policy"]["sample"]["expert_pool_gib"], pool)
                 self.assertTrue(saved["memory_policy"]["sample"]["low_memory"])
                 self.assertEqual(value(saved["args"], "--resident-budget-gib"), "0.25")
@@ -543,10 +602,10 @@ class PortableProfiles(unittest.TestCase):
         self.config.write_bytes(prep.json_bytes(cfg))
         with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
                 contextlib.redirect_stdout(io.StringIO()):
-            run.return_value.returncode = 0
+            run.side_effect = self.prepared_server
             self.assertEqual(prep.launch(self.config), 0)
         run.assert_called_once()
-        sample = json.loads(self.config.read_text())["memory_policy"]["sample"]
+        sample = self.runtime["memory_policy"]["sample"]
         self.assertFalse(sample["windows_commit"])
         self.assertIsNone(sample["commit_available_gib"])
         self.assertEqual(sample["expert_pool_gib"], 18.32421875)
@@ -656,14 +715,14 @@ class PortableProfiles(unittest.TestCase):
                 self.config.write_bytes(prep.json_bytes(cfg))
                 with patch.object(prep, "check_ready"), patch.object(prep.subprocess, "run") as run, \
                         contextlib.redirect_stdout(io.StringIO()):
-                    run.return_value.returncode = 0
+                    run.side_effect = self.prepared_server
                     self.assertEqual(prep.launch(self.config), 0)
                 run.assert_called_once()
-                saved = json.loads(self.config.read_text())
-                actual = prep.flag_value(saved["args"], name) if group == "args" else saved["env"].get(name)
+                runtime = self.runtime
+                actual = prep.flag_value(runtime["args"], name) if group == "args" else runtime["env"].get(name)
                 self.assertEqual(actual, override)
-                self.assertEqual(saved["memory_policy"]["overrides"][group][name], override)
-                self.assertFalse(saved["memory_policy"]["sample"]["automatic_host_cache"])
+                self.assertEqual(runtime["memory_policy"]["overrides"][group][name], override)
+                self.assertFalse(runtime["memory_policy"]["sample"]["automatic_host_cache"])
 
     def test_noncache_overrides_do_not_bypass_automatic_admission(self):
         cfg = self.make_config({"args": {"--vram-reserve-mib": "0"},
@@ -695,7 +754,7 @@ class PortableProfiles(unittest.TestCase):
             self.config.write_bytes(b"concurrent edit")
         with patch.object(prep, "check_ready", side_effect=edit), patch.object(prep.subprocess, "run") as run:
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Configuration changed"):
-                prep.launch(self.config)
+                prep.prepare_launch(self.config)
         run.assert_not_called()
         self.assertEqual(self.config.read_bytes(), b"concurrent edit")
 
@@ -740,9 +799,15 @@ class PortableProfiles(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"fixture")
         Path(cfg["build_metadata"]).write_text(json.dumps({"sha256": "wrong"}))
-        with patch.object(prep, "missing_shards", return_value=[]):
+        self.config.write_bytes(prep.json_bytes(cfg))
+        original = self.config.read_bytes()
+        with patch.object(prep, "missing_shards", return_value=[]), patch.object(prep, "atomic_files") as publish, \
+                patch.object(prep.subprocess, "run") as run:
             with self.assertRaisesRegex(ValueError, "Engine SHA-256 differs"):
-                prep.check_ready(cfg)
+                prep.prepare_launch(self.config)
+        publish.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), original)
 
     def test_build_uses_requested_directory_and_installs_matching_identity(self):
         build_dir = self.root / "existing-build"

@@ -9,13 +9,18 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import sys
 import tempfile
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from serve import runconfig
+from serve import server
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, MockEngine, Service, serve
 
@@ -75,6 +80,236 @@ class Apply(unittest.TestCase):
         self.assertEqual(got["anthropic_thinking"]["choices"], ["model", "on_request"])
         self.assertNotIn("api_key", got)
         self.assertNotIn("mcp_servers", got)
+
+
+class Startup(unittest.TestCase):
+    """Exercise public startup without opening a socket or launching an engine."""
+
+    def run_main(self, path, extra=(), before_engine=None):
+        engine = MockEngine(ByteTokenizer(), "ok", max_context=131072)
+        engine.info, engine.spawn = {}, (None, [])
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config",
+                                                           str(path), *extra]))
+            stack.enter_context(patch.object(server, "Server"))
+            stack.enter_context(patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(
+                Tokenizer=lambda *args: ByteTokenizer())}))
+            stack.enter_context(patch.object(server, "effort_end_args", return_value=None))
+            stack.enter_context(patch.object(server, "warn_budget_over_ram"))
+            stack.enter_context(patch.object(server, "warn_tight_ram"))
+            stack.enter_context(patch.object(server, "desktop_vram_note", return_value=None))
+            stack.enter_context(patch.object(server, "linux_desktop", return_value=False))
+            stack.enter_context(patch.object(server, "hub_from_config", return_value=None))
+            stack.enter_context(patch.object(server, "lan_addresses", return_value=[]))
+            stack.enter_context(patch.object(server.signal, "signal"))
+            stack.enter_context(patch.object(server.time, "sleep", side_effect=KeyboardInterrupt))
+            stack.enter_context(patch.object(server.Service, "start_idle_unload"))
+            def create_engine(*args, **kwargs):
+                if before_engine:
+                    before_engine()
+                return engine
+            create = stack.enter_context(patch.object(server, "StrataEngine", side_effect=create_engine))
+            http = stack.enter_context(patch.object(server, "serve"))
+            browser = stack.enter_context(patch("webbrowser.open"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(server.main(), 0)
+        return create, http, browser
+
+    def fixture(self, root, prep):
+        tokenizer = root / "tokenizer"
+        tokenizer.mkdir()
+        for name, content in (("vocab.json", "{}"), ("merges.txt", ""), ("token_type.json", "[]")):
+            (tokenizer / name).write_text(content)
+        cfg = prep.config_for(root / "source", root / "pack", 131072, None)
+        cfg.update(tokenizer=str(tokenizer), gpu=0, host="0.0.0.0", port=8182, open_browser=True)
+        cfg["env"]["STRATA_DECODE_TIMING"] = "explicit"
+        path = root / "profile.json"
+        path.write_bytes(prep.json_bytes(cfg))
+        return path, cfg
+
+    def test_direct_and_helper_sample_once_before_engine_with_effective_gpu(self):
+        from tools import prepare_unsloth_q2 as prep
+        for helper in (False, True):
+            for ram, available, vram, budget in ((30.88, 27, 15.99, "12"), (63.7, 58, 6, "30")):
+                with self.subTest(helper=helper, vram=vram), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": ram,
+                            "available_gib": available, "commit_available_gib": 70, "windows_commit": True}) as sample, \
+                        patch.object(prep, "detected_gpu", side_effect=lambda pick=None: {
+                            "vram_gb": vram, "index": 0 if pick is None else pick}) as gpu, \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready") as ready, \
+                        patch.dict(os.environ, {"STRATA_API_KEY": "inherited", "STRATA_FETCH_PROFILE": "1"}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    original = path.read_bytes()
+                    sample.reset_mock()
+                    gpu.reset_mock()
+                    observed = {}
+                    def engine_ready():
+                        self.assertEqual(sample.call_count, 1)
+                        ready.assert_called_once()
+                        gpu.assert_called_once_with(1 if not helper else 0)
+                    def invoke(command, **kwargs):
+                        with patch.dict(os.environ, kwargs["env"], clear=True):
+                            observed["main"] = self.run_main(path, command[2:], engine_ready)
+                        return SimpleNamespace(returncode=0)
+                    if helper:
+                        with patch.object(prep.subprocess, "run", side_effect=invoke):
+                            self.assertEqual(prep.launch(path), 0)
+                        create, http, browser = observed["main"]
+                    else:
+                        create, http, browser = self.run_main(path, ["--gpu", "1", "--port", "8182"], engine_ready)
+                    sample.assert_called_once()
+                    ready.assert_called_once()
+                    gpu.assert_called_once_with(0 if helper else 1)
+                    create.assert_called_once()
+                    args = create.call_args.args[1]
+                    self.assertEqual(args[args.index("--resident-budget-gib") + 1], budget)
+                    self.assertEqual(args[args.index("--max-context") + 1], "131072")
+                    env = create.call_args.kwargs["env"]
+                    self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0" if helper else "1")
+                    self.assertEqual(env["STRATA_DECODE_TIMING"], "explicit")
+                    if helper:
+                        self.assertNotIn("STRATA_FETCH_PROFILE", env)
+                    svc = http.call_args.args[0]
+                    self.assertEqual(svc.config_path, str(path))
+                    self.assertEqual(svc.shared_path, str(path.with_suffix("")) + ".shared-settings.json")
+                    self.assertEqual(svc.api_key, cfg["api_key"] if helper else "inherited")
+                    self.assertEqual(http.call_args.kwargs, {"host": "0.0.0.0", "port": 8182})
+                    self.assertEqual(browser.call_count, int(helper))
+                    saved = json.loads(path.read_text())
+                    self.assertEqual(saved["gpu"], 0)
+                    self.assertEqual((saved["host"], saved["port"], saved["api_key"]),
+                                     ("0.0.0.0", 8182, cfg["api_key"]))
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_static_main_keeps_bytes_and_skips_policy_preparation(self):
+        from tools import prepare_unsloth_q2 as prep
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                    "available_gib": 27, "commit_available_gib": 45, "windows_commit": True}), \
+                patch.object(prep, "detected_gpu", return_value={"vram_gb": 15.99, "index": 0}), \
+                patch.object(prep.setup, "find_nvcc", return_value=(None, None)), patch.dict(os.environ, {}, clear=True):
+            path, cfg = self.fixture(Path(directory), prep)
+            cfg.pop("memory_policy")
+            path.write_bytes(json.dumps(cfg, indent=3).encode())
+            original = path.read_bytes()
+            with patch.object(prep, "prepare_launch", side_effect=AssertionError("static policy preparation")):
+                for gpu in ("2", "0,2"):
+                    create, _, _ = self.run_main(path, ["--gpu", gpu])
+                    self.assertEqual(create.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], gpu)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_automatic_gpu_environment_matches_the_sampled_physical_device(self):
+        from tools import prepare_unsloth_q2 as prep
+        lower_mask = "cuda_visible_devices" if os.name == "nt" else "CUDA_VISIBLE_DEVICES"
+        for selected, explicit_env, expected in (
+                (None, {}, 2), (None, {lower_mask: "1"}, 1),
+                (1, {lower_mask: "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}, 1)):
+            with self.subTest(selected=selected, env=explicit_env), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 17, "commit_available_gib": 45, "windows_commit": True}) as memory, \
+                    patch.object(prep, "detected_gpu", side_effect=lambda pick=None: {
+                        "vram_gb": 15.99, "index": 2 if pick is None else pick}) as gpu, \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                    patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "9", "CUDA_DEVICE_ORDER": "FASTEST_FIRST"}, clear=True):
+                path, cfg = self.fixture(Path(directory), prep)
+                if selected is None:
+                    cfg.pop("gpu")
+                else:
+                    cfg["gpu"] = selected
+                cfg["env"].update(explicit_env)
+                path.write_bytes(json.dumps(cfg, indent=3).encode())
+                original = path.read_bytes()
+                gpu.reset_mock()
+                memory.reset_mock()
+                def before_engine():
+                    gpu.assert_called_once_with(expected if explicit_env or selected is not None else None)
+                    memory.assert_called_once()
+                create, _, _ = self.run_main(path, before_engine=before_engine)
+                child = create.call_args.kwargs["env"]
+                self.assertEqual(child["CUDA_VISIBLE_DEVICES"], str(expected))
+                self.assertEqual(child["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+                publish.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_automatic_invalid_gpu_environment_and_context_stop_before_sampling_or_engine(self):
+        from tools import prepare_unsloth_q2 as prep
+        lower_order = "cuda_device_order" if os.name == "nt" else "CUDA_DEVICE_ORDER"
+        cases = [({"CUDA_VISIBLE_DEVICES": value}, "131072") for value in ("1", "0,1", "", "GPU-uuid", None)]
+        cases += [({lower_order: "FASTEST_FIRST"}, "131072"),
+                  ({"CUDA_VISIBLE_DEVICES": "0", "cuda_visible_devices": "1"}, "131072")] if os.name == "nt" else [
+                      ({lower_order: "FASTEST_FIRST"}, "131072")]
+        cases += [({}, context) for context in (None, "broken", "0", "-1", "1.5", 123)]
+        for explicit_env, context in cases:
+            with self.subTest(env=explicit_env, context=context), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": 45, "windows_commit": True}) as memory, \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 15.99, "index": 0}) as gpu, \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)):
+                path, cfg = self.fixture(Path(directory), prep)
+                cfg["env"].update(explicit_env)
+                prep.set_flag(cfg["args"], "--max-context", context)
+                if isinstance(context, int):
+                    cfg["args"][cfg["args"].index("--max-context") + 1] = context
+                path.write_bytes(prep.json_bytes(cfg))
+                original = path.read_bytes()
+                memory.reset_mock()
+                gpu.reset_mock()
+                stderr = io.StringIO()
+                with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path)]), \
+                        patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as http, \
+                        patch.object(prep, "atomic_files") as publish, contextlib.redirect_stderr(stderr), \
+                        self.assertRaises(SystemExit) as error:
+                    server.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn("--max-context" if context != "131072" else "CUDA", stderr.getvalue())
+                memory.assert_not_called()
+                gpu.assert_not_called()
+                engine.assert_not_called()
+                http.assert_not_called()
+                publish.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_automatic_admission_and_readiness_failures_prevent_engine_start(self):
+        from tools import prepare_unsloth_q2 as prep
+        for available, commit, readiness in ((None, 45, None), (27, None, None),
+                                              (0, 45, None), (27, 45, "stale engine receipt")):
+            with self.subTest(available=available, commit=commit, readiness=readiness), \
+                    tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": 45, "windows_commit": True}) as memory, \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 15.99, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)):
+                path, _ = self.fixture(Path(directory), prep)
+                original = path.read_bytes()
+                memory.return_value.update(available_gib=available, commit_available_gib=commit)
+                with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path)]), \
+                        patch.object(prep, "check_ready", side_effect=ValueError(readiness) if readiness else None), \
+                        patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as http, \
+                        patch.object(prep, "atomic_files") as publish, contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as error:
+                    server.main()
+                self.assertEqual(error.exception.code, 2)
+                engine.assert_not_called()
+                http.assert_not_called()
+                publish.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_failed_automatic_preparation_stops_public_main_before_engine_or_http(self):
+        from tools import prepare_unsloth_q2 as prep
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            path.write_text('{"memory_policy": {"version": 1}}')
+            with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path)]), \
+                    patch.object(prep, "prepare_launch", side_effect=ValueError("not ready")) as prepare, \
+                    patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as http, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                server.main()
+            self.assertEqual(error.exception.code, 2)
+            prepare.assert_called_once_with(path, gpu=None)
+            engine.assert_not_called()
+            http.assert_not_called()
 
 
 class Http(unittest.TestCase):
