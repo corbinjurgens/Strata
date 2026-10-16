@@ -1078,6 +1078,43 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    // STRATA_TRACE only: this init's actual fixed-buffer inputs, as two bounded startup records - the payload and
+    // selection line (weight arena layout, dense scratch, workspace, MMQ plan, the selected chunk/loan/ring/blob)
+    // and the take-parameter line (geometry and KV stage).  bytes_needed_owned's total prints on the second record:
+    // it carries Alloc's guard and 2 MiB page rounding, so it is NOT the sum of the payload fields, and the
+    // free-MiB deltas stay in the existing stage records above/below.  Diagnostics only: no allocation, sizing or
+    // setup change, and trace-off runs no query and prints nothing.
+    if (std::getenv("STRATA_TRACE") != nullptr) {
+        const detail::WeightScratchLayout wsl = weight_scratch_layout();
+        const MmqPlan& mp = mmq_plan();
+        const bool fz = fused_layout((size_t) chunk, src != nullptr);
+        const bool f16 = prompt_f16();
+        std::fprintf(stderr,
+                     "strata trace: prefill inputs chunk=%lld borrow=%d borrow_bytes=%llu ring_slots=%d ring_cap=%d "
+                     "maxblob_bytes=%llu arena_layout_bytes=%llu dense_scratch_elems=%lld workspace_bytes=%llu "
+                     "mmq_any=%d mmq_fallback=%d mmq_gu_max=%llu mmq_d_max=%llu fused=%d f16_io=%d\n",
+                     (long long) chunk, (int) (borrow != nullptr), (unsigned long long) borrow_bytes,
+                     ring_slots((size_t) chunk), ring_cap(), (unsigned long long) MAXBLOB(),
+                     (unsigned long long) wsl.bytes, (long long) GEMM_SCRATCH, (unsigned long long) GEMM_WS,
+                     (int) mp.any, (int) mp.fallback, (unsigned long long) mp.gu_max,
+                     (unsigned long long) mp.d_max, (int) fz, (int) f16);
+        const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+        const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+        std::fprintf(stderr,
+                     "strata trace: prefill takes n_embd=%lld hc=%lld hc_lr=%lld n_expert=%lld n_layers=%lld "
+                     "stage=%lld..%lld n_head=%lld n_head_kv=%lld head_dim=%lld idx_q_heads=%lld idx_key_dim=%lld "
+                     "page_size=%lld idx_block=%lld kv_mode=%d kv_hybrid=%d kv_q4=%d kv_int8=%d n_pages=%lld "
+                     "max_cells=%lld kv_stage_own=%d bytes_needed_owned=%llu\n",
+                     (long long) g.n_embd, (long long) g.hc, (long long) g.hc_lr, (long long) g.n_expert,
+                     (long long) g.n_layers, (long long) stage_lb_, (long long) stage_le_,
+                     (long long) g.n_head, (long long) g.n_head_kv, (long long) g.head_dim,
+                     (long long) g.idx_q_heads, (long long) g.idx_key_dim, (long long) sh.page_size,
+                     (long long) sh.idx_block, (int) q0.kv_mode, (int) q0.kv_hybrid, (int) q0.kv_q4,
+                     (int) q0.kv_int8, (long long) q0.n_pages, (long long) q0.max_cells, (int) stage_own(),
+                     (unsigned long long) bytes_needed_owned(g, ss, chunk));
+    }
+#endif
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
