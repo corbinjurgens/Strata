@@ -759,6 +759,10 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
+    const char* ready = std::getenv("STRATA_FILE_COPY_READY");
+    const char* stats = std::getenv("STRATA_FILE_COPY_STATS");
+    copy_ready_ = ready != nullptr && std::strcmp(ready, "1") == 0;
+    copy_stats_ = stats != nullptr && std::strcmp(stats, "1") == 0;
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
@@ -931,6 +935,9 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 void FileExpertSource::close() {
     io_stop();
+    report_copy_stats("close");
+    copy_ready_ = copy_stats_ = false;
+    for (auto& value : copy_counts_) value.store(0, std::memory_order_relaxed);
     inputs_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
@@ -1210,6 +1217,7 @@ uint64_t FileExpertSource::set_file_cache_bytes(uint64_t bytes, bool compact, ui
 
 FileExpertSource::FileCacheStats FileExpertSource::file_cache_stats() {
     std::lock_guard<std::mutex> lk(stage_mu_);
+    report_copy_stats("cache");
     FileCacheStats stats{stage_cache_bytes_, stage_allocated_bytes_, 0, stage_compact_};
     for (const auto& b : stage_buf_) if (b) ++stats.buffers;
     return stats;
@@ -2431,21 +2439,70 @@ double FileExpertSource::cached_share(int64_t samples) const {
 #endif
 }
 
-bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
-    if ((base_ == nullptr && !direct_mappings_retired_) || dst == nullptr || layer < 0 || expert < 0 ||
-        layer >= n_layers_ || expert >= n_expert_)
-        return false;
+void FileExpertSource::report_copy_stats(const char* snapshot) const {
+    if (!copy_stats_) return;
+    static constexpr const char* names[] = {
+        "requests", "request_bytes", "resident", "resident_bytes", "ready", "ready_bytes", "busy", "busy_bytes",
+        "misses", "miss_bytes", "reused", "reused_bytes", "lock_wait_ns", "lock_hold_ns"
+    };
+    static_assert(sizeof(names) / sizeof(names[0]) == (size_t) CopyMetric::count);
+    std::ostringstream line;
+    line << "strata file copy stats: snapshot=" << snapshot << " reuse=" << (copy_ready_ ? 1 : 0);
+    for (size_t i = 0; i < copy_counts_.size(); ++i)
+        line << ' ' << names[i] << '=' << copy_counts_[i].load(std::memory_order_relaxed);
+    std::fprintf(stderr, "%s\n", line.str().c_str());
+}
+
+bool FileExpertSource::copy_without_files(int64_t layer, int64_t expert, uint8_t* dst) {
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
+    copy_add(CopyMetric::requests);
+    copy_add(CopyMetric::request_bytes, bytes);
     if (complement_ready_) {
         const uint8_t* held =
             resident_blob(index);
         if (held == nullptr && !override_.empty()) held = override_[index];
         if (held != nullptr) {
             std::memcpy(dst, held, (size_t) bytes);
+            copy_add(CopyMetric::resident);
+            copy_add(CopyMetric::resident_bytes, bytes);
             return true;
         }
     }
+    if (!copy_ready_ && !copy_stats_) return false;
+    FetchTimer wait(copy_stats_ ? &copy_counts_[(size_t) CopyMetric::lock_wait_ns] : nullptr);
+    std::lock_guard<std::mutex> lock(stage_mu_);
+    wait.finish();
+    FetchTimer hold(copy_stats_ ? &copy_counts_[(size_t) CopyMetric::lock_hold_ns] : nullptr);
+    const int64_t key = layer * n_expert_ + expert;
+    const auto it = stage_of_.find(key);
+    if (it == stage_of_.end() || it->second >= stage_buf_.size() || stage_key_[it->second] != key ||
+        !stage_buf_[it->second] || stage_capacity_[it->second] < bytes) {
+        copy_add(CopyMetric::misses);
+        copy_add(CopyMetric::miss_bytes, bytes);
+        return false;
+    }
+    const size_t v = it->second;
+    if (stage_busy_[v]) {
+        copy_add(CopyMetric::busy);
+        copy_add(CopyMetric::busy_bytes, bytes);
+        return false;
+    }
+    copy_add(CopyMetric::ready);
+    copy_add(CopyMetric::ready_bytes, bytes);
+    if (!copy_ready_) return false;
+    std::memcpy(dst, stage_buf_[v].get(), (size_t) bytes);   // ownership cannot change until the copy completes
+    copy_add(CopyMetric::reused);
+    copy_add(CopyMetric::reused_bytes, bytes);
+    return true;
+}
+
+bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if ((base_ == nullptr && !direct_mappings_retired_) || dst == nullptr || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_)
+        return false;
+    if (copy_without_files(layer, expert, dst)) return true;
+    const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
     const auto t0 = std::chrono::steady_clock::now();
     if (!copy_from_files(layer, expert, dst)) return false;
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
@@ -2465,12 +2522,7 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
         const int64_t l = layers[i], e = experts[i];
         if ((base_ == nullptr && !direct_mappings_retired_) || dst[i] == nullptr || l < 0 || e < 0 ||
             l >= n_layers_ || e >= n_expert_) return false;
-        const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
-        if (complement_ready_ &&
-            (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) {
-            if (!copy_blob(l, e, dst[i])) return false;
-            continue;
-        }
+        if (copy_without_files(l, e, dst[i])) continue;
         fills.push_back({0, l, e, dst[i]});
         bytes += layer_blob_bytes_[(size_t) l];
     }

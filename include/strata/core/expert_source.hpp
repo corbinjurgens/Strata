@@ -662,6 +662,13 @@ public:
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
     double cached_share(int64_t samples) const override;
+    /// Startup-only experiments, read by open(): STRATA_FILE_COPY_READY=1 synchronously copies already-ready
+    /// assembly buffers under their mutex, without admitting misses or changing recency. STRATA_FILE_COPY_STATS=1
+    /// observes the same opportunities independently of reuse and prints cumulative counters on file_cache_stats()
+    /// and close(). The driver's STRATA_FETCH_PROFILE=1 request summaries call file_cache_stats(); concurrent
+    /// snapshots are approximate. Only the exact value "1" enables either switch; unset, empty, "0" and other
+    /// values leave it off. Counters describe
+    /// logical copy demands, not OS submissions or physical disk traffic. Resident/exchange copies are separate.
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
@@ -715,6 +722,18 @@ private:
     friend struct detail::FileExpertSourceTestAccess;
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
+    /// Validated caller destination: resident/override first, then an optional ready-only stage copy or probe.
+    bool copy_without_files(int64_t layer, int64_t expert, uint8_t* dst);
+    void report_copy_stats(const char* snapshot) const;
+    enum class CopyMetric : size_t {
+        requests, request_bytes, resident, resident_bytes, ready, ready_bytes, busy, busy_bytes,
+        misses, miss_bytes, reused, reused_bytes, lock_wait_ns, lock_hold_ns, count
+    };
+    void copy_add(CopyMetric metric, uint64_t value = 1) {
+        if (copy_stats_) copy_counts_[(size_t) metric].fetch_add(value, std::memory_order_relaxed);
+    }
+    bool copy_ready_ = false, copy_stats_ = false;
+    std::array<std::atomic<uint64_t>, (size_t) CopyMetric::count> copy_counts_{};
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
     bool open_gguf(std::string& err);

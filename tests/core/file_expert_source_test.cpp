@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,51 @@ namespace fs = std::filesystem;
 namespace strata::core::detail {
 // Test-only access to handles/state and synthetic CPU memory snapshots, without environment fault controls.
 struct FileExpertSourceTestAccess {
+    using CM = FileExpertSource::CopyMetric;
+    static uint64_t copy_count(const FileExpertSource& s, CM metric) {
+        return s.copy_counts_[(size_t) metric].load(std::memory_order_relaxed);
+    }
+    static bool copy_ready(const FileExpertSource& s) { return s.copy_ready_; }
+    static bool copy_stats(const FileExpertSource& s) { return s.copy_stats_; }
+    static auto stage_policy(FileExpertSource& s) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        return std::make_tuple(s.stage_seq_, s.epoch_, s.stage_key_, s.stage_epoch_, s.stage_used_, s.stage_pf_,
+                               s.stage_allocated_bytes_, s.stage_of_.size());
+    }
+    static uint8_t* seed(FileExpertSource& s, int64_t layer, int64_t expert, const uint8_t* bytes, bool busy = false) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        for (uint64_t b : s.layer_blob_bytes_) s.stage_blob_ = std::max(s.stage_blob_, b);
+        size_t v = 0;
+        bool fill = false;
+        if (!s.claim_stage(layer * s.n_expert_ + expert, v, fill) && !fill)
+            throw std::runtime_error("ready-copy fixture could not claim a stage buffer");
+        std::memcpy(s.stage_buf_[v].get(), bytes, (size_t) s.layer_blob_bytes_[(size_t) layer]);
+        s.stage_busy_[v] = busy ? 1 : 0;
+        s.stage_pf_[v] = 1;
+        return s.stage_buf_[v].get();
+    }
+    static void busy_key(FileExpertSource& s, int64_t key, bool busy) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        s.stage_busy_[s.stage_of_.at(key)] = busy ? 1 : 0;
+    }
+    static int64_t exchange_stage_owner(FileExpertSource& s, int64_t key, int64_t owner) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        return std::exchange(s.stage_key_[s.stage_of_.at(key)], owner);
+    }
+    static uint64_t exchange_stage_capacity(FileExpertSource& s, int64_t key, uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        return std::exchange(s.stage_capacity_[s.stage_of_.at(key)], bytes);
+    }
+    static void resident(FileExpertSource& s, int64_t key, const uint8_t* p) {
+        s.complement_offsets_.assign((size_t) s.blobs_, FileExpertSource::kNoComplement);
+        s.complement_offsets_[(size_t) key] = 0;
+        s.complement_host_ = p;
+        s.complement_ready_ = true;
+    }
+    static void override_blob(FileExpertSource& s, int64_t key, const uint8_t* p) {
+        s.prepare_overrides();
+        s.override_[(size_t) key] = p;
+    }
 #if defined(_WIN32)
     static void* exchange_handle(FileExpertSource& s, size_t file, void* h, bool buffered) {
         void*& slot = buffered ? s.buffered_[file] : s.direct_[file];
@@ -88,6 +134,15 @@ void require(bool ok, const std::string& message) {
 }
 
 void set_env(const char* name, const char* value);
+
+struct SavedEnv {
+    const char* name;
+    bool present;
+    std::string value;
+    explicit SavedEnv(const char* n) : name(n), present(std::getenv(n) != nullptr),
+        value(present ? std::getenv(n) : "") {}
+    ~SavedEnv() { set_env(name, present ? value.c_str() : nullptr); }
+};
 
 struct TempDirectory {
     fs::path path;
@@ -397,6 +452,43 @@ void test_direct_mapping_retirement() {
     require(source.open(dir.path.string(), layers, experts, err) && source.mapped_view_bytes() == mapped &&
             !source.direct_mappings_retired() && matches(source.blob(0, 1), 0, 1), "reopen retained experimental state");
     check_batch();
+    {
+        SavedEnv saved_ready("STRATA_FILE_COPY_READY"), saved_stats("STRATA_FILE_COPY_STATS");
+        set_env("STRATA_FILE_COPY_READY", "1");
+        set_env("STRATA_FILE_COPY_STATS", "1");
+        source.close();
+        require(source.open(dir.path.string(), layers, experts, err), err);
+        set_env("STRATA_UNBUFFERED_LOAD", "1");
+        const bool enabled = source.set_unbuffered(0, why);
+        set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+        require(enabled && source.retire_direct_mappings(err), "ready fault fixture could not retire mappings");
+        require(matches(source.blob(0, 0), 0, 0) && matches(source.blob(1, 0), 1, 0),
+                "ready fault fixture could not seed entries");
+        Access::busy_key(source, experts, true);
+        const auto policy = Access::stage_policy(source);
+        const uint64_t read_before = source.file_read_bytes();
+        const auto broken_direct = Access::exchange_handle(source, 0, INVALID_HANDLE_VALUE, false);
+        const auto broken_buffered = Access::exchange_handle(source, 0, INVALID_HANDLE_VALUE, true);
+        const bool hit_ok = source.copy_blob(0, 0, copy.data());
+        const bool miss_ok = source.copy_blob(0, 1, a.data());
+        const int32_t fault_layers[] = {0, 1}, fault_experts[] = {1, 0};
+        uint8_t* fault_dst[] = {a.data(), b.data()};
+        const bool batch_ok = source.copy_blobs(fault_layers, fault_experts, fault_dst, 2);
+        Access::exchange_handle(source, 0, broken_buffered, true);
+        Access::exchange_handle(source, 0, broken_direct, false);
+        Access::busy_key(source, experts, false);
+        require(hit_ok && matches(copy.data(), 0, 0) && !miss_ok && !batch_ok,
+                "ready hit failed during I/O fault, or a busy/missing entry bypassed a failed file read");
+        require(source.file_read_bytes() == read_before && !Access::has(source, 1) &&
+                    Access::stage_policy(source) == policy,
+                "failed copy admitted cache entries, changed stage lifetime, or counted successful file bytes");
+        using CM = Access::CM;
+        require(Access::copy_count(source, CM::requests) == 4 && Access::copy_count(source, CM::ready) == 1 &&
+                    Access::copy_count(source, CM::busy) == 1 && Access::copy_count(source, CM::misses) == 2 &&
+                    Access::copy_count(source, CM::reused_bytes) == 1868800,
+                "fault-path counters treated busy data as ready or lost failed-copy demands");
+        source.close();
+    }
     std::cout << "direct mapping retirement: split/mixed bytes, live buffers, fallback/open/I/O faults, concurrency, reset PASS\n";
 #else
     std::cout << "direct mapping retirement: Windows-only experiment, not exercised on this platform\n";
@@ -666,6 +758,167 @@ void set_env(const char* name, const char* value) {
     if (value != nullptr) setenv(name, value, 1);
     else unsetenv(name);
 #endif
+}
+
+void test_ready_copy_out() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    using Access = detail::FileExpertSourceTestAccess;
+    using CM = Access::CM;
+    using FM = FileExpertSource::FetchMetric;
+    SavedEnv saved_ready("STRATA_FILE_COPY_READY"), saved_stats("STRATA_FILE_COPY_STATS"),
+             saved_unbuffered("STRATA_UNBUFFERED_LOAD");
+    constexpr int64_t layers = 2, experts = 4;
+    require(BLOB == 1382400, "ready-copy fixture geometry changed");
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+    std::vector<uint8_t> truth((size_t) (layers * experts * BLOB));
+    for (size_t i = 0; i < truth.size(); ++i)
+        truth[i] = (uint8_t) ((i * 131u + (i / BLOB) * 37u) ^ (i >> 8) ^ (i >> 17));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        out.write((const char*) truth.data(), (std::streamsize) truth.size());
+        require((bool) out, "could not write ready-copy fixture");
+    }
+    auto matches = [&](const uint8_t* p, int l, int e) {
+        return !std::memcmp(p, truth.data() + (l * experts + e) * BLOB, (size_t) BLOB);
+    };
+    auto run = [&](bool direct, const char* reuse_env, const char* stats_env, bool reuse, bool observe) {
+        set_env("STRATA_FILE_COPY_READY", reuse_env);
+        set_env("STRATA_FILE_COPY_STATS", stats_env);
+        FileExpertSource source;
+        require(source.open(dir.path.string(), layers, experts, err), err);
+        require(Access::copy_ready(source) == reuse && Access::copy_stats(source) == observe,
+                "ready-copy switches did not use exact opt-in parsing");
+        set_env("STRATA_FILE_COPY_READY", nullptr);
+        set_env("STRATA_FILE_COPY_STATS", nullptr);   // changing the environment cannot change a live source
+        if (direct) {
+            set_env("STRATA_UNBUFFERED_LOAD", "1");
+            std::string why;
+            const bool available = source.set_unbuffered(0, why);
+            set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+            if (!available) return false;
+            source.set_file_cache_bytes(3 * BLOB);
+        }
+        Access::seed(source, 0, 0, truth.data());
+        Access::seed(source, 0, 1, truth.data() + BLOB, true);
+        Access::seed(source, 1, 0, truth.data() + experts * BLOB);
+        const auto policy = Access::stage_policy(source);
+        source.set_fetch_profiling(true);
+        std::vector<uint8_t> copy((size_t) BLOB, 0xFF);
+        require(source.copy_blob(0, 0, copy.data()) && matches(copy.data(), 0, 0),
+                "ready scalar copy returned the wrong expert");
+        const int32_t batch_layers[] = {0, 0, 1, 0, 0};
+        const int32_t batch_experts[] = {0, 1, 0, 2, 0};
+        std::vector<std::vector<uint8_t>> copies(5, std::vector<uint8_t>((size_t) BLOB, 0xFF));
+        uint8_t* destinations[] = {copies[0].data(), copies[1].data(), copies[2].data(), copies[3].data(), copies[4].data()};
+        require(source.copy_blobs(batch_layers, batch_experts, destinations, 5), "mixed ready/busy/miss batch failed");
+        for (size_t i = 0; i < 5; ++i)
+            require(matches(copies[i].data(), batch_layers[i], batch_experts[i]), "mixed batch copied the wrong bytes");
+        require(Access::stage_policy(source) == policy && !Access::has(source, 2),
+                "copy-out admitted a miss, changed recency, or consumed a prefetch marker");
+        const uint64_t expected_reads = reuse ? 2764800 : 8294400;
+        const auto fetched = source.fetch_stats();
+        require(source.file_read_bytes() == expected_reads &&
+                    fetched.get(direct ? FM::direct_copy_bytes : FM::mapped_copy_bytes) == expected_reads,
+                "ready-copy bytes matched but the source still re-read cached experts");
+        if (direct) require(fetched.get(FM::read_batches) == (reuse ? 1 : 2) && source.direct_fallbacks() == 0,
+                            "ready-copy batch failed to preserve direct reads for only the remaining experts");
+        Access::busy_key(source, 1, false);
+        require(source.copy_blob(0, 1, copy.data()) && matches(copy.data(), 0, 1),
+                "a published busy entry did not become copyable");
+        require(source.file_read_bytes() == (reuse ? 2764800 : 9676800), "published ready entry was re-read");
+
+        // Resident and exchange bytes deliberately disagree with the old stage entry: precedence must win.
+        std::vector<uint8_t> resident((size_t) BLOB, 0xA7), exchanged((size_t) BLOB, 0xD2);
+        Access::resident(source, 0, resident.data());
+        Access::override_blob(source, experts, exchanged.data());
+        const int32_t held_layers[] = {0, 1}, held_experts[] = {0, 0};
+        uint8_t* held_dst[] = {copies[0].data(), copies[1].data()};
+        require(source.copy_blobs(held_layers, held_experts, held_dst, 2) && copies[0] == resident && copies[1] == exchanged,
+                "recent-cache lookup bypassed the resident or exchange override");
+        require(Access::stage_policy(source) == policy, "resident/busy copies changed stage policy");
+        require(!source.copy_blob(-1, 0, copy.data()) && !source.copy_blob(0, experts, copy.data()) &&
+                    !source.copy_blob(0, 0, nullptr), "copy-out accepted invalid input");
+        auto count = [&](CM m) { return Access::copy_count(source, m); };
+        if (observe) {
+            require(count(CM::requests) == 9 && count(CM::request_bytes) == 12441600 &&
+                        count(CM::resident) == 2 && count(CM::resident_bytes) == 2764800 &&
+                        count(CM::ready) == 5 && count(CM::ready_bytes) == 6912000 &&
+                        count(CM::busy) == 1 && count(CM::busy_bytes) == 1382400 &&
+                        count(CM::misses) == 1 && count(CM::miss_bytes) == 1382400 &&
+                        count(CM::reused) == (reuse ? 5 : 0) && count(CM::reused_bytes) == (reuse ? 6912000 : 0),
+                    "copy opportunity counters include resident entries, busy entries, or incorrect byte sizes");
+            require(count(CM::lock_hold_ns) > 0, "copy opportunity lock time was not observed");
+        } else {
+            for (size_t i = 0; i < (size_t) CM::count; ++i)
+                require(count((CM) i) == 0, "disabled opportunity counters collected observations");
+        }
+        source.close();
+        require(!Access::copy_ready(source) && !Access::copy_stats(source), "close retained copy-out switches");
+        for (size_t i = 0; i < (size_t) CM::count; ++i)
+            require(count((CM) i) == 0, "close retained copy opportunity counters");
+        require(source.open(dir.path.string(), layers, experts, err), err);
+        require(!Access::copy_ready(source) && !Access::copy_stats(source) && !Access::has(source, 0),
+                "reopen retained copy-out state");
+        return true;
+    };
+    for (bool direct : {false, true}) {
+        if (!run(direct, nullptr, nullptr, false, false)) {
+            std::cout << "ready copy-out: direct branch skipped (unbuffered reads unavailable)\n";
+            break;
+        }
+        require(run(direct, "0", "0", false, false), "disabled ready-copy fixture reopen failed");
+        require(run(direct, "true", "01", false, false), "nonexact ready-copy fixture reopen failed");
+        require(run(direct, "", "", false, false), "empty ready-copy fixture reopen failed");
+        require(run(direct, "0", "1", false, true), "observe-only ready-copy fixture reopen failed");
+        require(run(direct, "1", "0", true, false), "unobserved ready-copy fixture reopen failed");
+        require(run(direct, "1", "1", true, true), "observed ready-copy fixture reopen failed");
+    }
+
+    set_env("STRATA_FILE_COPY_READY", "1");
+    set_env("STRATA_FILE_COPY_STATS", "1");
+    FileExpertSource source;
+    require(source.open(dir.path.string(), layers, experts, err), err);
+    const uint8_t* first = Access::seed(source, 0, 0, truth.data());
+    Access::age(source);   // already eligible: a copy hit must not renew its lifetime
+    const auto policy = Access::stage_policy(source);
+    std::vector<uint8_t> owned((size_t) BLOB);
+    require(source.copy_blob(0, 0, owned.data()) && matches(owned.data(), 0, 0) &&
+                Access::stage_policy(source) == policy, "copy hit promoted an aged entry");
+    const uint8_t* replacement = Access::seed(source, 0, 1, truth.data() + BLOB);
+    require(first == replacement && !Access::has(source, 0) && matches(owned.data(), 0, 0),
+            "synchronous copy retained a cache pointer or prevented safe replacement");
+    const auto ready_owned = owned;
+    const auto original_owner = Access::exchange_stage_owner(source, 1, -1);
+    const bool bad_owner = source.copy_blob(0, 1, owned.data());
+    Access::exchange_stage_owner(source, 1, original_owner);
+    require(bad_owner && matches(owned.data(), 0, 1) && Access::copy_count(source, CM::misses) == 1 &&
+                source.file_read_bytes() == 1382400, "copy-out trusted a stage index without matching ownership");
+    const auto original_capacity = Access::exchange_stage_capacity(source, 1, 1);
+    const bool short_buffer = source.copy_blob(0, 1, owned.data());
+    Access::exchange_stage_capacity(source, 1, original_capacity);
+    require(short_buffer && matches(owned.data(), 0, 1) && Access::copy_count(source, CM::misses) == 2 &&
+                source.file_read_bytes() == 2764800, "copy-out used a buffer smaller than the exact layer blob");
+    bool concurrent_ok = true;
+    std::thread pressure([&] {
+        for (int i = 0; i < 64; ++i) {
+            Access::age(source);
+            Access::seed(source, 0, 0, truth.data());
+            Access::age(source);
+            Access::seed(source, 0, 1, truth.data() + BLOB);
+        }
+    });
+    for (int i = 0; i < 128; ++i)
+        if (!source.copy_blob(0, 0, owned.data()) || !matches(owned.data(), 0, 0)) concurrent_ok = false;
+    pressure.join();
+    require(concurrent_ok && source.file_cache_stats().buffers == 1,
+            "concurrent stage replacement corrupted a synchronous copy or copy misses populated new buffers");
+    source.close();
+    require(matches(ready_owned.data(), 0, 0) && matches(owned.data(), 0, 0),
+            "caller-owned destination changed after source closure");
+    std::cout << "ready copy-out: parsing, scalar/batch bytes, observed/actual reads, busy/miss, resident, no promotion, reset PASS\n";
 }
 
 // #286: the unbuffered file tier (Windows: FILE_FLAG_NO_BUFFERING; Linux: O_DIRECT + io_submit) hands out the same
@@ -1018,6 +1271,41 @@ void test_compact_file_cache() {
             "zero target enabled compact storage");
     get(0, 0);
     check(large, 1);
+    {
+        using Access = detail::FileExpertSourceTestAccess;
+        using CM = Access::CM;
+        SavedEnv saved_ready("STRATA_FILE_COPY_READY"), saved_stats("STRATA_FILE_COPY_STATS");
+        set_env("STRATA_FILE_COPY_READY", "1");
+        set_env("STRATA_FILE_COPY_STATS", "1");
+        source.close();
+        require(open(), "mixed ready-copy reopen failed");
+        source.set_file_cache_bytes(small + large, true);
+        get(0, 0);
+        get(2, 1);
+        const auto policy = Access::stage_policy(source);
+        const uint64_t read_before = source.file_read_bytes();
+        source.set_fetch_profiling(true);
+        std::vector<uint8_t> scalar((size_t) small + 16, 0xEC);
+        require(source.copy_blob(0, 0, scalar.data() + 8) && bytes_match(scalar.data() + 8, 0, 0),
+                "mixed-size scalar ready copy changed bytes");
+        const int32_t copy_layers[] = {2, 0, 2}, copy_experts[] = {1, 0, 1};
+        std::vector<uint8_t> a((size_t) large + 16, 0xEC), b((size_t) small + 16, 0xEC), c((size_t) large + 16, 0xEC);
+        uint8_t* destinations[] = {a.data() + 8, b.data() + 8, c.data() + 8};
+        require(source.copy_blobs(copy_layers, copy_experts, destinations, 3), "mixed-size ready batch failed");
+        require(bytes_match(a.data() + 8, 2, 1) && bytes_match(b.data() + 8, 0, 0) && bytes_match(c.data() + 8, 2, 1),
+                "mixed-size ready batch copied a neighbouring expert");
+        for (const auto* copy : {&scalar, &a, &b, &c})
+            for (size_t i = 0; i < 8; ++i)
+                require((*copy)[i] == 0xEC && (*copy)[copy->size() - 1 - i] == 0xEC,
+                        "ready copy wrote beyond the layer's exact blob size");
+        require(source.file_read_bytes() == read_before && source.fetch_stats().get(FileExpertSource::FetchMetric::read_batches) == 0 &&
+                    Access::stage_policy(source) == policy, "mixed-size ready hit re-read files or promoted stage entries");
+        require(Access::copy_count(source, CM::requests) == 4 && Access::copy_count(source, CM::ready) == 4 &&
+                    Access::copy_count(source, CM::ready_bytes) == 8089600 &&
+                    Access::copy_count(source, CM::reused_bytes) == 8089600,
+                "mixed-size opportunity accounting used maximum buffer capacity instead of exact blob bytes");
+        source.close();
+    }
     std::cout << "compact file cache: mixed bytes, byte budget, cross-size reuse, live overflow, recovery, reset PASS\n";
 }
 #endif
@@ -1371,6 +1659,7 @@ int main(int argc, char** argv) {
         test_canonical_layout();
         test_unbuffered_reads();
         test_fetch_profiling();
+        test_ready_copy_out();
         test_recent_file_cache();
         test_io_prefetch();
         test_file_cache_headroom();
