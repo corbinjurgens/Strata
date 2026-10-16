@@ -1023,6 +1023,119 @@ the arms. This comparison did not record free space at each arm's start, so the 
 are not established. The change must not be used to explain a particular stall. Further read-service
 attribution and ready-copy opportunity measurement remain open.
 
+### Ready-copy reuse and remaining optimization routes, 2026-10-16
+
+The next pass kept UD-Q2_K_XL, the verified contiguous pack, 131072 capacity, int8 KV,
+eager CUDA and shipped placement. On the same RTX 4080 SUPER / Ryzen 7 9800X3D / 32 GB
+Windows desktop, the frozen automatic baseline requested 8 GiB pinned experts, 4051 MiB
+recent cache and 4 GiB host headroom. Measurements used host stager threads 32, ring 128,
+batch 1, GPU prefill ring 96, stream threshold 1024 and prefill CPU share disabled.
+These controls were held fixed unless named below. The working installation was not switched.
+
+The source now offers independent startup experiments, all disabled by default:
+
+- `STRATA_FILE_COPY_READY=1` synchronously copies an already-ready recent-cache entry under
+  its mutex before falling back to file copying. It does not admit misses, promote entries
+  or lend recyclable pointers to asynchronous DMA. Resident/exchange bytes retain precedence.
+  Only the exact value `1` enables this flag.
+- `STRATA_FILE_COPY_STATS=1` observes logical copy opportunities independently of reuse.
+  Cumulative snapshots appear at `file_cache_stats()` and close; request-end snapshots require
+  fetch profiling. Only the exact value `1` enables it. These counts are not OS submissions
+  or physical SSD traffic; concurrent snapshots are approximate.
+- `STRATA_PREFILL_DEMAND_ONLY=1` selects routed-only prefill while retaining the original
+  threshold and allocated ring. It needs full fallback scratch and can select different kernels;
+  this is a whole-configuration experiment, not a pure scheduling comparison.
+- `STRATA_PREFILL_DEMAND_STATS=1` reports scheduled, routed, unused, unclassified and submitted
+  H2D payload without introducing GPU readbacks. Fused GPU-only routing remains unclassified.
+  The two prefill flags use the existing leading-`1` convention.
+
+An instrumented 8K prompt exposed 1972 ready blobs / 3.45 GiB of useful copy-out payload.
+Reuse served those bytes from ready buffers. Stream-all prefill scheduled 37.15 GiB of payload,
+including 3.15 GiB not selected by routing; unclassified payload was zero in this measured chunk.
+The engine chunk was 8185 tokens within the 8192-token API prompt. Demand-only eliminated the
+unused payload but took 21.60 seconds versus 20.53 seconds for the instrumented control.
+The clean demand-only pilot took 21.52 seconds. Moving fewer bytes was not sufficient to win.
+
+Clean ready-reuse confirmation used off/on/on/off order with identical requested workloads,
+engine and effective settings except the explicit reuse flag:
+
+| Arm | Reuse | 8K prefill, seconds | Full 8K request, seconds | Decode tokens/s | Cached follow-ups, seconds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 13 | Off | 20.4298 | 23.204 | 23.47 | 8.396 |
+| 14 | On | 18.9222 | 21.729 | 13.05 | 16.465 |
+| 15 | On | 18.9218 | 21.697 | 23.61 | 8.349 |
+| 16 | Off | 20.5188 | 23.333 | 23.51 | 8.364 |
+
+Both enabled repeats reduced prefill latency by 7.38% against the faster disabled control,
+passing the predeclared 5% criterion. Screen text hashes matched. Decode and cached replies
+did not show a repeated gain: arm 14 stalled, while arm 15 returned to baseline speed.
+This is a measured prefill improvement, not a general decode or stall fix.
+
+Other clean pilots compared against the faster same-day baseline rather than a slow outlier:
+
+| Arm | Changed control | 8K prefill, seconds | Decode tokens/s | Cached follow-ups, seconds |
+| --- | --- | ---: | ---: | ---: |
+| 08 | Pinned 7 GiB / recent 5075 MiB | 87.55 | 21.93 | 8.439 |
+| 09 | Pinned 9 GiB / recent 3027 MiB | 19.97 | 20.99 | 7.969 |
+| 10 | Stager sleep enabled | 20.48 | 23.38 | 8.415 |
+| 11 | Unchanged fresh baseline | 20.46 | 23.57 | 8.367 |
+| 12 | GPU prefill ring 48 | 20.33 | 13.91 | 18.255 |
+
+None passed the 5% screen. Equal requested host-cache totals do not imply identical physical
+placement or arithmetic paths. The RAM splits realized 7167/9214 MiB pinned arenas and the
+requested recent targets; GPU expert slots remained 5270. No combination of these negative
+pilots was promoted. Aggregate opportunities do not establish reuse distance or avoidable
+eviction, so a new retention policy was not justified.
+
+Existing reads already submit batches before waiting; prefill already overlaps bounded owned
+host buffers, an issuer and event-controlled GPU slot reuse. No additional exposed interval
+with safe source ownership was demonstrated for a pipeline rewrite. Request-boundary timing
+without verifier profiling still localizes substantial decode host time to read completion
+waiting. Summed concurrent/nested counters are not additive wall-time components. WPR DiskIO
+and FileIO capture failed with access denied `0x80070005`; no trace started. Historical global
+disk counters and WDDM allocation budgets cannot identify a process/file-level storage cause,
+prove paging, or attribute a stall to free space, antivirus or the SSD.
+
+Arms 01–16 passed correctness, retrieval, protected-file and owned-process cleanup
+checks without a guard stop. Across these arms, minimum available RAM was 4.439 GiB, available
+Windows commit 16.154 GiB and logged CUDA-free VRAM 683 MiB. CUDA observations are stage
+samples, not continuous minima. These were unattended runs and do not establish responsiveness.
+The implementation has CUDA build and focused C++/Python coverage; HIP/SYCL and laptop runtime
+behavior remain unverified. Shared defaults and the selected working profile remain unchanged.
+Local evidence is under `.claude/plan-runs/4080s-remaining-optimization-20261016/`, including
+`reuse-comparison.json` and the per-arm manifests, settings, logs and telemetry.
+
+The retained reuse candidate was rebuilt separately after a diagnostic-only line-order correction.
+The r2 binary SHA-256 is `869c44ee0510bc72e61482664c288aee5f601066ede8ae7daad0a23cf48586b0`;
+the measured clean path is unchanged by that correction. CUDA build, 131 helper/benchmark Python
+tests, 11 C++ checks and the real request-end diagnostic framing probe passed.
+
+Held-out task transitions passed Python aliasing, generator evaluation and dependency scheduling,
+but interval union returned 17 instead of 20. A matched reuse-disabled r2 control produced exactly
+the same answers and pass/fail flags. Both attempts correctly stopped before long retrieval and
+remain failed quality runs. This does not establish broad model quality or a full acceptance pass.
+
+Retrieval was then tested separately, explicitly preserving the quality failure. A fresh
+130880-token prompt returned all three distributed codes; prefill took 253.983 seconds and the
+full request 256.507 seconds. The follow-up reused 130903 tokens and returned the final code plus
+391 in 3.044 seconds. This is a single retrieval/reuse validation, not a matched long-context speed
+comparison. Minimum available RAM was 4.407 GiB, available Windows commit 16.028 GiB and logged
+CUDA-free VRAM 677 MiB, without a guard stop. Frozen settings, working files and owned-process
+cleanup checks passed. Evidence: `heldout-equivalence.json`, `retrieval-invocation.json` and
+`experiment/arms/20-reuse-retrieval-only/` in the local run directory.
+
+A separate local automatic candidate is available through
+`run-unsloth-ready-reuse-auto-20261016.bat`, using the r2 engine, reuse enabled and the controlled
+staging settings above. It retains automatic memory policy with empty memory overrides;
+its server resamples at startup. In the actual automatic-start check it requested 9 GiB pinned
+and 4040 MiB recent, with the same 5270 GPU slots. Arithmetic, code recall and cached reuse passed.
+Minimum available RAM was 4.251 GiB, available commit 16.337 GiB and logged CUDA-free memory
+731 MiB. The profile and launcher stayed unchanged, protected originals matched and cleanup
+passed. These different automatic budgets have a short startup check, not a matched speed or
+near128K result. Evidence is `automatic-startup/` and `automatic-candidate-receipt.json` locally.
+The candidate remains unselected and authenticated on loopback. Its machine paths and saved
+credential remain local; another PC should rebuild locally and generate its own automatic profile.
+
 ## Earlier RTX 4080 SUPER desktop validation at 128K
 
 Measured on 2026-10-09: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM, a 24 GiB Windows pagefile,

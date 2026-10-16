@@ -10924,11 +10924,11 @@ int main(int argc, char** argv) {
                 };
                 static_assert(sizeof(names) / sizeof(names[0]) == (size_t) FM::count);
                 const auto fetch1 = src.fetch_stats();
+                const auto cache = src.file_cache_stats();
                 std::fprintf(stderr, "strata fetch profile decode: tokens=%lld decode_wall_ms=%.3f summed_thread_deltas=1",
                              (long long) produced_n, decode_ms);
                 for (size_t i = 0; i < fetch1.values.size(); ++i)
                     std::fprintf(stderr, " %s=%llu", names[i], (unsigned long long) (fetch1.values[i] - fetch0.values[i]));
-                const auto cache = src.file_cache_stats();
                 std::fprintf(stderr, " cache_target_bytes=%llu cache_allocated_bytes=%llu cache_buffers=%zu\n",
                              (unsigned long long) cache.target_bytes, (unsigned long long) cache.allocated_bytes,
                              cache.buffers);
