@@ -31,7 +31,8 @@ int main() {
    for(int i=0;i<T*YSTRIDE;i++)y[i]=7;
    g.bf16(xb,w,y,T,N,K,YSTRIDE,float(beta),pad?stride:0);check("bf16");
    for(int rows: {1,N}){
-    g.rebind(scratch,rows*K,nullptr,0);for(int i=0;i<T*YSTRIDE;i++)y[i]=7;
+    if(!g.rebind(scratch,rows*K,nullptr,0,err))return 2;
+    for(int i=0;i<T*YSTRIDE;i++)y[i]=7;
     g.native(xh,8,qw,y,T,N,K,YSTRIDE,float(beta),pad?stride:0);check("native-q8");
    }
   }

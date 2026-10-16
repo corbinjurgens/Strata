@@ -413,11 +413,15 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     return true;
 }
 
-void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes) {
+bool Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes, std::string& err) {
+    if (const cublasStatus_t s = cublasSetWorkspace((cublasHandle_t) handle_, workspace, ws_bytes);
+        s != CUBLAS_STATUS_SUCCESS) {
+        err = "prefill gemm: cublasSetWorkspace: cuBLAS status " + std::to_string((int) s);
+        return false;
+    }
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
-    cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (hipblaslt_state_) {
         auto* state = static_cast<HipLtState*>(hipblaslt_state_);
@@ -425,6 +429,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
         state->workspace_bytes = ws_bytes;
     }
 #endif
+    return true;
 }
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {

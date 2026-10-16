@@ -52,8 +52,9 @@ public:
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
     void set_f16_io(bool on) { f16_io_ = on; }
 
-    /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
-    void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
+    /// Caller-owned buffers only: move the scratch and workspace after workspace binding succeeds.
+    /// Returns false with err on binding failure, leaving this object's buffer fields unchanged.
+    bool rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes, std::string& err);
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }

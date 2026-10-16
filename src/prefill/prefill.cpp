@@ -1349,7 +1349,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.owned = &m.owned;
     uint16_t* gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
-    if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
+    if (ok && !m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
     if (!ok || !carve((size_t) chunk, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
