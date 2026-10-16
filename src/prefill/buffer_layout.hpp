@@ -29,4 +29,16 @@ constexpr WeightScratchLayout weight_scratch_layout(uint64_t dense_bytes, uint64
     return {std::max({dense_bytes, group_bytes, pairs * fallback_pair}), group_down, fallback_down, fallback_pair};
 }
 
+// Weight arena and workspace coexist; the KV stage reuses their complete extent later. The stage extent
+// already includes its buffers' guards and alignment. Alloc::take adds the separate outer guard; no page rounding here.
+struct SharedGemmStageLayout {
+    uint64_t workspace_offset_bytes, gemm_extent_bytes, shared_payload_bytes;
+};
+constexpr SharedGemmStageLayout shared_gemm_stage_layout(uint64_t weight_arena_payload_bytes,
+                                                        uint64_t workspace_payload_bytes, uint64_t stage_extent_bytes) {
+    const uint64_t workspace_offset_bytes = buffer_bytes(weight_arena_payload_bytes);
+    const uint64_t gemm_extent_bytes = workspace_offset_bytes + buffer_bytes(workspace_payload_bytes);
+    return {workspace_offset_bytes, gemm_extent_bytes, std::max(gemm_extent_bytes, stage_extent_bytes)};
+}
+
 }  // namespace strata::prefill::detail
