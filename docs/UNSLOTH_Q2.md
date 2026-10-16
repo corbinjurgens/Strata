@@ -10,9 +10,9 @@ for this experiment. Images are disabled; AMD use is unvalidated.
 Use `origin/main` from `https://github.com/corbinjurgens/Strata.git` on both the RTX 4050 laptop and
 RTX 4080 SUPER desktop. The shared source combines the laptop allocation and memory-safety work with
 the desktop cache work. Hardware differences belong in each PC's generated profile, rather than in
-separate source branches. The dated results below describe their original engines and conditions;
-they predate acceptance of the merged engine and do not establish a new speedup or merged-engine
-runtime acceptance on either PC.
+separate source branches. The dated results below describe their original engines and conditions.
+The 2026-10-16 desktop experiments use the merged engine; earlier measurements do not establish
+runtime acceptance of that engine, and the laptop still needs its own merged-engine acceptance.
 
 Build and prepare locally using the [hardware-aware preparation steps](#hardware-aware-preparation-for-both-pcs).
 Each PC needs its own executable and build receipt, model paths and native pack, runtime libraries,
@@ -754,6 +754,229 @@ remained and port 8081 was free. The local `summary.json` and `post-snapshot.jso
 measurements and preservation checks. The shared defaults and selected working profile remain
 unchanged. This separate candidate uses the dedicated desktop conditions and has no new watched
 responsiveness acceptance; its short-request latency outlier remains unresolved.
+
+## Merged-engine desktop performance experiments, 2026-10-16
+
+These measurements use shared `main` source `c197d915`, engine 0.1.41 built for sm_89, on the
+RTX 4080 SUPER 16 GB / Ryzen 7 9800X3D / 30.88 GiB usable-RAM desktop. The isolated executable's
+SHA-256 is `68e4ea7aa7c814d12474ac761a7e5ad3656383e97bd82a77ec8f171bb41a5de8`.
+The starting automatic sample had about 20.5 GiB available RAM and 47.5 GiB available Windows
+commit. Model files are on the Crucial CT2000P3SSD8 NVMe drive. Keep the earlier dedicated-use
+numbers separate: those runs started with more available RAM and used a different workload/build.
+
+All screens retain UD-Q2_K_XL, 131072-token capacity, int8 KV with 32768 resident cells, eager CUDA,
+the shipped placement unless explicitly varied, and authenticated loopback. A frozen copy of the
+effective automatic profile supplies the control; each trial starts its own server. Existing engines,
+profiles, launchers and selected working profile are preserved. These are automated runs without a
+new watched responsiveness assessment.
+
+The first screen generates 384 tokens for each of three prompts: a database tutorial, a web-request
+walkthrough and Python LRU-cache code. The table aggregates decode tokens divided by decode time,
+excluding prefill. Each generation has an exact arithmetic cached follow-up; separate arithmetic,
+history and complete inventory-reconciliation checks also run. Token-budget completion is not a
+code-quality test. Fresh 8192-token distributed-code retrieval also passed in these full screens.
+
+| Trial | Change from the frozen automatic control | Aggregate decode tokens/s |
+| --- | --- | ---: |
+| 01 | 8 GiB pinned, 3909 MiB recent, 4 GiB requested host headroom | 13.07 |
+| 02 | 11 GiB pinned, 2048 MiB recent, 2.5 GiB requested headroom | 14.05 |
+| 03 | Trial 02 plus the existing canonical MTP pack, window 2 | 10.86 |
+| 04 | Trial 02 with `--short-read 0` | 7.15 |
+| 05 | Trial 02 with verifier window 8, without a drafter | 6.73 |
+
+These single comparisons do not establish a reliable gain. Trial 02's database decode was
+13.0 tokens/s; an unchanged database-only repeat later measured 7.1, then another measured 12.3.
+The 13.0 and 7.1 runs returned byte-identical database output and had identical GPU hits, PCIe share,
+RAM/file blob demand and adaptive exchange counts. Logical file bytes differed by only 2.5%.
+The first 8192-token prefill pair was 121.55 versus 65.15 seconds, but the changing controls also
+prevent treating that as a repeatable RAM-setting speedup.
+
+The following direction tests use only the same database prompt and its cached arithmetic follow-up,
+with Trial 02's RAM settings. Their decode rates are not comparable to the three-prompt aggregate.
+
+| Trial | Setting | Database decode tokens/s | Cached follow-up wall seconds |
+| --- | --- | ---: | ---: |
+| 06 | Unchanged control | 7.14 | 5.18 |
+| 08 | VRAM reserve 2048 MiB instead of 1024 | 7.78 | 20.00 |
+| 09 | Existing desktop-trained placement | 13.94 | 11.66 |
+| 10 | Explicit `--pcie-frac 1.0` | 11.65 | 11.96 |
+| 11 | Unchanged control again | 12.31 | 5.17 |
+
+The larger VRAM reserve and higher PCIe share do not show a dependable overall improvement here.
+The placement result remains workload-specific and its follow-up is slower. None of these settings
+has been promoted into the shared defaults or selected working profile.
+
+The aggressive screens used about 15.1 GiB according to NVML and generally left 2.6-3.0 GiB
+physical RAM available. Trial 04 briefly sampled 2.455 GiB; it did not remain below 2.5 GiB for five
+samples. The guard stops immediately below 2 GiB physical RAM or available commit, after five samples
+below 2.5 GiB physical RAM or 4 GiB available commit, or when an enforced CUDA-stage sample is below
+256 MiB. Available commit stayed above 13.5 GiB in these screens.
+CUDA-free readings are engine-stage samples, not continuous telemetry; the separate NVML counters
+do not replace them. No completed screen triggered the guard, and owned-process cleanup passed.
+
+### Read-completion diagnosis
+
+A separate instrumented database run (07) measured 81.697 seconds decoding 384 tokens.
+Expert-job preparation was about 71.7 seconds (186.72 ms/window), versus about 1.32 seconds of
+CPU expert arithmetic (3.44 ms/window). The fetch report recorded 70.254 seconds of read-completion
+service across 7786 stage misses, or about 9.02 ms per miss, and 23227 read requests: 2.983 requests
+per missed expert. Submitted bytes were 14.789 GB versus 14.636 GB copied into expert buffers.
+Cache victim scanning took only 11.6 ms. Counters include nested and summed thread regions; do not
+add them together or interpret their ratios as independent critical-path percentages. Instrumented
+throughput is not an unprofiled tuning comparison.
+
+The supported reader already submits a layer's batch before waiting. In-place GGUF storage normally
+needs separate gate/up/down reads. A contiguous `experts.bin` instead stores those same slices together.
+This changes both layout and the reader path, and costs an additional 42.92 GiB of expert storage.
+The local experiment prepares a separate pack while the model is stopped, verifies all expert bytes
+against the GGUF and compares the dense/index/layout hashes before any inference test. Preparation
+and full verification alter storage/cache state; the first following request is not a cold-cache test.
+
+The Windows GPU-budget snapshot stayed below its reported local and nonlocal budgets, and an NVMe
+SMART sample reported 42.85 degrees C composite temperature with no temperature warning. Neither
+snapshot establishes the cause of the changing read delays. Current evidence localizes the measured
+delay to read completion; it does not establish a WDDM eviction or SSD-throttling explanation.
+
+Per-request outputs, frozen local configurations, telemetry, guard results and engine logs are under
+`.claude/4080s-perf-20261016/`. Local configurations contain credentials and are not publication artifacts.
+The existing selected launcher and shared automatic policy remain unchanged.
+
+### Contiguous expert storage
+
+The isolated contiguous pack subsequently completed full verification: all 46084915200 expert bytes
+match their original GGUF slices in canonical per-expert order, across all layers. Its SHA-256 is
+`5a71d41249331ac874f97f998e0ec807c13318ca0e0b8a334a9c0ca4e600cc07`.
+The dense weights, index, expert layout, tokenizer vocabulary, merges and chat template also match
+the original pack. The first preparation attempt stopped at its conservative 6 GiB RAM floor;
+the scratch writer resumed only after validating the completed prefix, and released its own mapped
+file pages between layers. A separate process then verified the entire expert output. Neither source
+GGUFs nor the installed pack changed.
+
+The same three-prompt screen and 8192-token retrieval sequence then ran with only the pack path
+changed, retaining 11 GiB pinned, 2048 MiB recent and 2.5 GiB requested headroom:
+
+| Trial | Expert storage | Decode tokens/s | Three cached follow-ups, seconds | 8192-token prefill, seconds |
+| --- | --- | ---: | ---: | ---: |
+| 02 | In-place GGUF, earlier faster control | 14.05 | 14.58 | 65.15 |
+| 12 | Contiguous | 21.77 | 8.76 | 20.73 |
+| 13 | In-place GGUF, fresh control | 8.52 | 15.92 | 64.98 |
+| 14 | Contiguous repeat | 21.63 | 16.82 | 38.09 |
+
+Sustained decode repeats within about 1% and is 54-55% faster than the faster original-layout
+control. The fresh control also contains a slow code-generation case, so comparing only against
+its 8.52 tokens/s would overstate the dependable gain. The two 8192-token prefill times are 41-68%
+lower than the original-layout controls. Short-response latency still varies: the contiguous repeat
+includes a 10.96-second cached code follow-up. This is a repeatable sustained-generation benefit,
+not a uniform conversation-latency improvement.
+
+The timed tutorial/code responses and retrieval answers are byte-identical across the layout
+comparisons. The repeated inventory response uses different JSON formatting but reconciles to the
+same expected values. Correctness, reuse and cleanup checks pass, with no guard trigger. Trials
+12 and 14 logged at least 681 MiB CUDA-free and 2.719 GiB available physical RAM; GPU cache
+capacity and RAM requests are unchanged. The speedup therefore does not require larger requested
+host-cache budgets or GPU expert-cache capacity.
+
+Keeping the contiguous expert file mapped (`STRATA_KEEP_MAPPING=1`, Trial 15) measured 20.49
+tokens/s on the database-only case, versus 20.2/20.9 without it. This does not establish closing
+that mapping as the main cause. The experiment changes on-disk layout and the reader path together;
+the in-place role reader and the contiguous blob reader issue different request patterns.
+Trial 16 added the existing MTP pack, verifier window 4 and `--spec-min-p 0.5`; aggregate decode was
+20.86 tokens/s, below both contiguous controls. MTP remains off.
+
+The matching contiguous diagnostic (17) recorded 7535 reads for 7552 stage misses, about one
+request per miss, versus about three in diagnostic 07. Read-completion service was 11.353 seconds,
+or 1.50 ms per miss, and expert-job preparation was about 12.44 seconds; CPU expert arithmetic
+remained about 1.23 seconds. Submission (0.319 seconds), direct copy (0.645 seconds), completion
+and cache claiming (0.101 seconds) account for almost all that preparation phase without adding
+the nested totals again. Useful bytes differed by about 3%; the actual recent-cache allocation
+was 2.147 GB versus 1.922 GB in 07, despite identical 2048 MiB requests. This is evidence of a
+read-path improvement, not a standalone SSD latency benchmark. The unprofiled layout repeats
+above establish the practical speed gain.
+
+### Automatic sizing with the contiguous pack
+
+A fresh automatic sample selected 8 GiB pinned, 4051 MiB recent and 4 GiB requested host headroom.
+The policy was then frozen for a matched comparison, changing only the pack path. Both runs retained
+the same GPU expert-cache capacity and logged at least 683 MiB CUDA-free memory.
+
+| Trial | Expert storage | Decode tokens/s | Three cached follow-ups, seconds | 8192-token prefill, seconds | Minimum available RAM, GiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 18 | Contiguous | 22.27 | 9.03 | 22.15 | 4.102 |
+| 19 | In-place GGUF | 13.28 | 16.95 | 70.24 | 4.202 |
+
+In this pair the contiguous run decoded about 68% faster and reduced fresh prefill time by about
+68%. It matched the aggressive contiguous screens' roughly 22 tokens/s while retaining more physical
+RAM headroom. Minimum available commit was 15.317 GiB versus 15.419 GiB. All arithmetic, history,
+inventory and retrieval checks passed, as did frozen-profile and original-file preservation checks.
+However, an unchanged later repeat (23) fell to 12.58 tokens/s overall: database and systems decode
+were 18.3 and 24.8 tokens/s, but code decode fell to 7.0. Its code prefill took 17.40 seconds and
+the three cached follow-ups totaled 20.25 seconds, including an 11.98-second systems follow-up.
+Fresh 8192-token prefill remained fast at 22.88 seconds. Memory admission, correctness and cleanup
+still passed, with at least 4.164 GiB RAM and 683 MiB CUDA-free. Thus the 68% decode gain is a measured
+pair, not a dependable automatic-profile guarantee. The candidate retains automatic sizing for its
+memory headroom; the layout does not eliminate the remaining latency variability.
+
+The separate local candidate is `run-unsloth-contiguous-auto-20261016.bat`, with
+`strata-unsloth-contiguous-auto-20261016.json`. Its automatic policy has no fixed memory overrides;
+each launch samples that PC again. It uses the existing isolated merged engine and the verified pack
+at `packs/unsloth-ud-q2_k_xl-contiguous-20261016`, with authenticated loopback on port 8081.
+The existing selected working launcher is unchanged. The pack adds about 44 GiB including its other
+files, leaving about 20 GiB free on this desktop's model drive after preparation. This layout is an
+opt-in local artifact, not a change to setup's storage-saving default or a bundle of machine-specific
+paths and credentials to copy onto the laptop.
+
+The same frozen automatic candidate then passed the functional smoke checks, context fitting,
+fresh near-limit retrieval and history reuse in a separate 522.652-second run (20). The fresh
+request retained all 130880 input tokens and returned the three reference codes in order. Prefill
+took 437.669 seconds and the request 440.390 seconds. The follow-up retained its full 130941-token
+history, reused 130903 tokens, processed 38 new tokens and returned the correct code and arithmetic
+result in 3.759 seconds. Its prefill took 2.554 seconds. The answers contained only 24 and 14 tokens;
+their 9.2 and 12.6 tokens/s do not establish sustained near-128K decode performance.
+
+Minimum available physical RAM was 3.659 GiB, available Windows commit 15.196 GiB, and logged
+CUDA-free memory 681 MiB. The requested 4 GiB headroom is not a runtime floor. NVML peaked at
+15110 MiB used; its counters are distinct from actual CUDA-free queries. No guard triggered,
+the frozen profile and protected working files were unchanged, and owned-process cleanup passed.
+The new engine's long-context result does not replace the still-unverified laptop, external-display
+and HIP/SYCL conditions, or establish the cause of historical desktop stalls.
+
+Two final combinations kept the same automatic budgets and contiguous storage. The existing
+desktop-trained placement (21) measured 22.10 tokens/s overall, with 8.46 seconds across the three
+cached follow-ups and 22.22 seconds for 8192-token prefill. Disabling adaptive swaps with
+`--adapt-swaps 0` under the shipped placement (22) measured 22.37 tokens/s, 7.61 seconds and
+22.70 seconds respectively. Both passed the full screen and preservation checks. Neither establishes
+an additional sustained-decode gain over 22.27 tokens/s, so the candidate keeps shipped placement
+and adaptation enabled. The existing packer/Unsloth packing unit suites also passed (26 tests).
+
+A final instrumented replay (24) captured another slowdown. Code decode took 69.248 seconds,
+with 61.011 seconds of summed direct-read completion service over 5661 batches. Expert-job
+preparation was about 62.24 seconds, versus 1.16 seconds of CPU arithmetic. GPU-reach wait stayed
+near 9.3-9.4 ms/window across database, systems and code. Submitted code bytes were 13.71 GiB,
+less than the database case's 17.97 GiB, while completion waiting rose from 15.416 to 61.011 seconds.
+The counters overlap other regions and are not independent additive wall-time components.
+
+One-second physical-drive sampling covered systems and code, with median read latency increasing
+from 4.66 to 12.98 ms and median read throughput falling from 352 to 214 MB/s. These drive counters
+include other processes. WDDM nonlocal usage stayed at 10.906 GiB against a 14.690 GiB budget;
+local usage stayed at 14.219 GiB. The telemetry does not measure individual eviction events.
+Coverage began after database, so its fast phase has no matching external disk samples. The latest
+NVMe SMART snapshot reported 40.85 degrees C and no temperature warning, without proving the
+thermal state during every request.
+
+This diagnostic used the same requested settings, but the engine's post-verifier memory check
+reclamped the recent cache from 4051 to 2713.1 MiB; actual buffers varied below that target.
+Instrumentation and different realized cache capacity prevent a clean speed comparison with 18/23.
+The supported conclusion is a reproduced read-service slowdown, accompanied by worsening physical
+disk latency and stable GPU-reach timing and budget accounting. It does not prove that the exact
+same event caused 23 or earlier desktop stalls. Further OS/storage attribution remains open;
+changing CPU pool workers would not directly change this fetch concurrency, because blobs are
+fetched before CPU expert arithmetic starts.
+
+The final idle check found no Strata server, port 8081 free, and the original protected files
+unchanged. The automatic candidate still matched its frozen measurement copy after removing only
+the policy metadata, with empty memory overrides and an unchanged generated launcher. NVIDIA
+reported 513 MiB used and 15533 MiB free after cleanup. The model drive then had about 17 GiB free;
+the additional pack remains local, and no existing model or working configuration was removed.
 
 ## Earlier RTX 4080 SUPER desktop validation at 128K
 
