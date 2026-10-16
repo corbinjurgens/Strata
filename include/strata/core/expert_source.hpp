@@ -87,6 +87,9 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& self_cgroup = "/proc/self/cgroup",
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
+/// Convert finite nonnegative GiB to bytes, saturating at UINT64_MAX. A positive budget must not become the zero sentinel.
+uint64_t resident_gib_bytes(double gib, bool keep_positive = false);
+
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
@@ -580,8 +583,9 @@ public:
     /// Optional recent-file cache in the existing assembly buffers. Startup only; allocates lazily and returns
     /// the retention target (rounded to largest-blob slots unless compact). Compact buffers use each layer's
     /// exact size. Live/in-flight buffers obey the original lifetime rules and may exceed the target. Zero keeps
-    /// the original staging policy. Caller budgets the extra host RAM; this does not resize live buffers.
-    uint64_t set_file_cache_bytes(uint64_t bytes, bool compact = false);
+    /// the original staging policy. An explicit headroom rechecks RAM and commit before optional retention
+    /// allocations; UINT64_MAX preserves the caller-budgeted policy. Mandatory live staging may still exceed it.
+    uint64_t set_file_cache_bytes(uint64_t bytes, bool compact = false, uint64_t headroom = ~uint64_t{0});
     struct FileCacheStats {
         uint64_t target_bytes = 0, allocated_bytes = 0;
         size_t buffers = 0;
@@ -715,7 +719,8 @@ private:
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
-    bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
+    bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false,
+                     const detail::HostMemory* memory = nullptr);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
@@ -786,6 +791,7 @@ private:
     uint64_t stage_blob_ = 0;
     size_t stage_cache_slots_ = 0;
     uint64_t stage_cache_bytes_ = 0, stage_allocated_bytes_ = 0;
+    uint64_t stage_headroom_ = ~uint64_t{0};
     bool stage_compact_ = false;
     uint64_t stage_seq_ = 0;
     uint64_t epoch_ = 0;

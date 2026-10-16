@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import shlex
 import subprocess
@@ -22,6 +23,12 @@ MODEL = "UD-Q2_K_XL"
 TAG = "unsloth-ud-q2_k_xl"
 PROFILE = "unsloth-portable-128k"
 POLICY_VERSION = 1
+MIN_PINNED_GIB = 0.25
+MAX_RECENT_MIB = (2**64 - 1) >> 20
+C_SPACE = r"[ \t\n\r\f\v]*"
+C_NUMBER = re.compile(C_SPACE + r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?" + C_SPACE)
+C_INTEGER_PREFIX = re.compile(C_SPACE + r"([+-]?[0-9]+)")
+C_RECENT_MIB = re.compile(C_SPACE + r"\+?[0-9]+")
 MEMORY_FLAGS = ("--expert-cache", "--max-context", "--kv", "--kv-resident", "--spec",
                 "--suffix-draft", "--lookup-chain", "--resident-budget-gib", "--prefill",
                 "--vram-reserve-mib", "--no-prefill-borrow")
@@ -65,6 +72,53 @@ def detected_gpu(pick=None) -> dict:
     return gpu
 
 
+def memory_number(value, name: str, positive: bool = False) -> float:
+    message = f"{name} must be finite and {'positive' if positive else 'nonnegative'}, using decimal/scientific syntax."
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)) or not C_NUMBER.fullmatch(str(value)):
+        raise ValueError(message)
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise ValueError(message) from None
+    if not math.isfinite(number) or number < 0 or (positive and number == 0):
+        raise ValueError(message)
+    return number
+
+
+def effective_vram_reserve_mib(value) -> int:
+    """Match the engine's atoi integer prefix without its undefined signed-int overflow."""
+    memory_number(value, "--vram-reserve-mib")
+    prefix = C_INTEGER_PREFIX.match(str(value))
+    number = int(prefix[1]) if prefix else 0
+    if not 0 <= number <= 2**31 - 1:
+        raise ValueError("--vram-reserve-mib effective integer prefix must be between 0 and 2147483647 MiB.")
+    return number
+
+
+def validate_memory_overrides(overrides: dict) -> None:
+    for values, name, positive in (
+            (overrides.get("args", {}), "--resident-budget-gib", True),
+            (overrides.get("env", {}), "STRATA_RESIDENT_HEADROOM_GIB", False)):
+        value = values.get(name)
+        if value is not None:  # None records an explicit removal.
+            memory_number(value, name, positive)
+    reserve = overrides.get("args", {}).get("--vram-reserve-mib")
+    if reserve is not None:
+        effective_vram_reserve_mib(reserve)
+    recent = overrides.get("env", {}).get("STRATA_FILE_CACHE_MIB")
+    if recent is not None:
+        message = f"STRATA_FILE_CACHE_MIB must be a nonnegative integer between 0 and {MAX_RECENT_MIB} MiB."
+        if (isinstance(recent, bool) or not isinstance(recent, (str, int)) or
+                (isinstance(recent, str) and not C_RECENT_MIB.fullmatch(recent))):
+            raise ValueError(message)
+        try:
+            number = int(recent)
+        except ValueError:
+            raise ValueError(message) from None
+        if not 0 <= number <= MAX_RECENT_MIB:
+            raise ValueError(message)
+
+
 def memory_plan(ram: float, vram: float, context: int, available_gib: float | None = None,
                 commit_available_gib: float | None = None, windows_commit: bool = True,
                 overrides: dict | None = None) -> dict:
@@ -75,6 +129,7 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         raise ValueError("Unsupported context; the helper never reduces the requested context.")
     small_gpu = vram < 8
     overrides = overrides or {}
+    validate_memory_overrides(overrides)
     arg_overrides, env_overrides = overrides.get("args", {}), overrides.get("env", {})
     kv = arg_overrides.get("--kv", "q4_0" if small_gpu and context >= 65536 else "int8") or "fp16"
     if kv not in KV_CELL_BYTES:
@@ -88,7 +143,8 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
     fixed = 2.0
     # Match the measured laptop GPU settings: 448 MiB at 64K, 400 MiB at 128K.
     default_reserve_mib = (400 if context > 65536 else 448) if small_gpu else 1024
-    reserve_mib = float(arg_overrides.get("--vram-reserve-mib", default_reserve_mib) or 0)
+    reserve_value = arg_overrides.get("--vram-reserve-mib", default_reserve_mib)
+    reserve_mib = effective_vram_reserve_mib(reserve_value) if reserve_value is not None else 0
     gpu_commit = max(0, vram - reserve_mib / 1024) if windows_commit else 0
     fallback = available_gib is None
     available = min(ram, available_gib if available_gib is not None else ram * 0.65)
@@ -102,10 +158,10 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         budget = min(budget, math.floor(pool - int(env_overrides["STRATA_FILE_CACHE_MIB"] or 0) / 1024))
     # A positive budget selects the partial resident/file path. With no safe whole GiB left,
     # request a small clamped budget instead of accidentally selecting full residency.
-    budget = max(0.25, budget)
+    budget = max(MIN_PINNED_GIB, budget)
     if "--resident-budget-gib" in arg_overrides:
         budget = float(arg_overrides["--resident-budget-gib"] or 0)
-    recent_mib = max(0, min(16384, math.floor((pool - budget) * 1024)))
+    recent_mib = min(16384, math.floor(max(0, pool - budget) * 1024))
     if "STRATA_FILE_CACHE_MIB" in env_overrides:
         recent_mib = int(env_overrides["STRATA_FILE_CACHE_MIB"] or 0)
     args = ["--expert-cache", "auto", "--max-context", str(context), "--kv", kv,
@@ -123,13 +179,16 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         args += ["--prefill", "auto"]
     if streamed:
         args += ["--kv-resident", str(resident_cells)]
-    for flag, value in arg_overrides.items():
-        set_flag(args, flag, value)
-    env.update(env_overrides)
+    apply_overrides({"args": args, "env": env}, overrides)
     return {"args": args, "env": env, "ram_gib": ram, "vram_gib": vram,
             "available_gib": available_gib, "commit_available_gib": commit_available_gib,
+            "windows_commit": windows_commit,
+            "automatic_host_cache": "--resident-budget-gib" not in arg_overrides and
+                                    "STRATA_FILE_CACHE_MIB" not in env_overrides,
             "available_fallback_gib": available if fallback else None, "kv_ram_gib": kv_ram,
             "cpu_server_gib": fixed, "later_startup_gib": later, "headroom_gib": headroom,
+            "vram_reserve_requested_mib": float(reserve_value) if reserve_value is not None else 0,
+            "vram_reserve_mib": reserve_mib,
             "gpu_commit_gib": gpu_commit, "expert_pool_gib": pool, "pinned_gib": budget,
             "recent_mib": recent_mib, "low_memory": pool < 2,
             "over_budget": budget + recent_mib / 1024 > pool}
@@ -141,6 +200,8 @@ def memory_settings(ram: float, vram: float, context: int, **kwargs) -> tuple[li
 
 
 def flag_value(args: list[str], flag: str):
+    if flag in MEMORY_FLAGS and args.count(flag) > 1:
+        raise ValueError(f"Duplicate managed flag {flag}; the saved memory policy is ambiguous.")
     if flag not in args:
         return None
     if flag == "--no-prefill-borrow":
@@ -170,10 +231,16 @@ def report_memory(plan: dict, cfg: dict, sampled_now: bool = True) -> None:
     print(f"Requests: pinned {flag_value(cfg['args'], '--resident-budget-gib')} GiB; compact recent "
           f"{cfg['env'].get('STRATA_FILE_CACHE_MIB', '0')} MiB; "
           f"context {flag_value(cfg['args'], '--max-context')}; KV {flag_value(cfg['args'], '--kv')}.")
-    print("Requests are startup ceilings; engine clamps may be lower. Later workload allocations remain estimates. "
-          "The launcher resamples memory; explicit settings are preserved. Laptop runtime is untested.")
+    if plan.get("vram_reserve_requested_mib") != plan.get("vram_reserve_mib"):
+        print(f"VRAM reserve request {flag_value(cfg['args'], '--vram-reserve-mib')!r} MiB; "
+              f"engine effective {plan['vram_reserve_mib']} MiB (integer-prefix parsing).")
+    print("Profile requests are startup ceilings subject to allocation checks. Recent retention is a target; "
+          "protected entries and replacement storage may exceed it. The launcher resamples memory; explicit settings "
+          "are preserved. Neither PC has passed full-model acceptance of the combined automatic policy.")
     if plan["available_fallback_gib"] is not None:
-        print("Available-memory telemetry unavailable: using 65% of physical RAM as a conservative estimate.")
+        print("Unverified plan: available-memory telemetry unavailable; using 65% of physical RAM as an estimate.")
+    if plan.get("windows_commit", os.name == "nt") and plan["commit_available_gib"] is None:
+        print("Unverified plan: Windows commit telemetry unavailable; the physical-memory fallback cannot establish fit.")
     if plan["low_memory"]:
         print("Little memory remains for experts; recent cache is reduced. Close this model and other apps before launch.")
     if plan["over_budget"]:
@@ -428,7 +495,11 @@ def config_for(folder: Path, pack: Path, context: int, key_config: Path | None,
 def apply_overrides(cfg: dict, overrides: dict) -> None:
     for flag, value in overrides.get("args", {}).items():
         set_flag(cfg["args"], flag, value)
-    cfg["env"].update(overrides.get("env", {}))
+    for key, value in overrides.get("env", {}).items():
+        if value is None:
+            cfg["env"].pop(key, None)
+        else:
+            cfg["env"][key] = value
 
 
 def refreshed_config(cfg: dict) -> dict:
@@ -439,6 +510,9 @@ def refreshed_config(cfg: dict) -> dict:
         return cfg
     if policy.get("version") != POLICY_VERSION:
         raise ValueError("Unknown memory policy version; update the preparation helper before launching.")
+    validate_memory_overrides({"args": {flag: flag_value(cfg["args"], flag)
+                                        for flag in ("--resident-budget-gib", "--vram-reserve-mib")},
+                               "env": cfg.get("env", {})})
     explicit = copy.deepcopy(policy.get("overrides", {}))
     explicit.setdefault("args", {})
     explicit.setdefault("env", {})
@@ -446,7 +520,8 @@ def refreshed_config(cfg: dict) -> dict:
         if flag_value(cfg["args"], flag) != flag_value(policy["generated_args"], flag):
             explicit["args"][flag] = flag_value(cfg["args"], flag)
     for key in MEMORY_ENV:
-        if cfg.get("env", {}).get(key) != policy["generated_env"].get(key):
+        if (cfg.get("env", {}).get(key) != policy["generated_env"].get(key) or
+                (key in cfg.get("env", {}) and cfg["env"][key] is None)):
             explicit["env"][key] = cfg.get("env", {}).get(key)
     gpu, memory = detected_gpu(cfg.get("gpu")), dict(detected_memory())
     plan = memory_plan(ram=memory.pop("ram_gib"), vram=gpu["vram_gb"],
@@ -459,6 +534,8 @@ def refreshed_config(cfg: dict) -> dict:
     env = cfg.setdefault("env", {})
     for key in MEMORY_ENV:
         if key in explicit.get("env", {}):
+            if explicit["env"][key] is None:
+                env.pop(key, None)
             continue
         if env.get(key) == policy["generated_env"].get(key):
             if key in plan["env"]:
@@ -518,9 +595,23 @@ def write_profile(config: Path, cfg: dict, create_config: bool) -> Path:
     return script
 
 
+def admit_automatic_launch(plan: dict) -> None:
+    if not plan["automatic_host_cache"]:
+        return
+    if plan["available_gib"] is None:
+        raise ValueError("Automatic launch requires current available physical-memory telemetry; plan is unverified.")
+    if plan["windows_commit"] and plan["commit_available_gib"] is None:
+        raise ValueError("Automatic launch requires current Windows commit telemetry; plan is unverified.")
+    if plan["expert_pool_gib"] < MIN_PINNED_GIB:
+        raise ValueError(f"Automatic launch needs at least {MIN_PINNED_GIB:g} GiB in the expert pool; "
+                         f"only {plan['expert_pool_gib']:g} GiB remains after policy allowances.")
+
+
 def launch(config: Path) -> int:
     original = config.read_bytes()
     cfg = refreshed_config(json.loads(original.decode("utf-8-sig")))
+    if cfg.get("memory_policy"):
+        admit_automatic_launch(cfg["memory_policy"]["sample"])
     check_ready(cfg)
     if cfg.get("memory_policy"):
         report_memory(cfg["memory_policy"]["sample"], cfg)
@@ -561,17 +652,13 @@ def main(argv=None) -> int:
     try:
         a.config, a.engine, a.build_dir = a.config.resolve(), a.engine.resolve(), a.build_dir.resolve()
         overrides = {"args": {}, "env": {}}
-        for asked, positive, name in ((a.resident_budget_gib, True, "--resident-budget-gib"),
-                                     (a.file_cache_mib, False, "--file-cache-mib"),
-                                     (a.resident_headroom_gib, False, "--resident-headroom-gib")):
-            if asked is not None and (not math.isfinite(asked) or asked < 0 or (positive and asked == 0)):
-                raise ValueError(f"{name} must be finite and {'positive' if positive else 'nonnegative'}.")
         if a.resident_budget_gib is not None:
             overrides["args"]["--resident-budget-gib"] = f"{a.resident_budget_gib:g}"
         if a.file_cache_mib is not None:
             overrides["env"]["STRATA_FILE_CACHE_MIB"] = str(a.file_cache_mib)
         if a.resident_headroom_gib is not None:
             overrides["env"]["STRATA_RESIDENT_HEADROOM_GIB"] = f"{a.resident_headroom_gib:g}"
+        validate_memory_overrides(overrides)
         if a.build_engine:
             if a.jobs < 1:
                 raise ValueError("--jobs must be positive.")

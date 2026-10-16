@@ -1,0 +1,139 @@
+{
+  "time": "2026-10-15T14:48:43.689776+09:00",
+  "original_head": "411ee5409c75e10ec6e280a16b85649c69285d56",
+  "original_branch": "codex/unsloth-file-cache",
+  "files": {
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-q2_0.json": {
+      "bytes": 1232,
+      "sha256": "1955d90b699f3921f2cca63825a147b5d47624477eee963ae98978ee7260e2e8"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-compact-128k.json": {
+      "bytes": 1540,
+      "sha256": "fde11b96bb859c96b01a9e1c16d62f29d04d2edeab7149b26ffa2749c85fd0df"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-desktop-128k.json": {
+      "bytes": 1623,
+      "sha256": "a74e58358d1e237390a9221e886f5c0ef6ef208911fc2390734f41388e4d09b7"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-desktop-async-128k.json": {
+      "bytes": 1661,
+      "sha256": "ac700700e02757ca71a3f7c5be882e3d0411e77a07fe99edb13449a1b724d182"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-desktop-gpu-128k.json": {
+      "bytes": 1659,
+      "sha256": "964c08c0d4ef0be70f513bd9b138ac1ba79655a84618fe0920ec3f98e6ef827d"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-desktop-trained-128k.json": {
+      "bytes": 3528,
+      "sha256": "ef013d62fa861ab705526bc612779c2482419c69e0c670d9542b2e141d7c7c17"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-fast-128k.json": {
+      "bytes": 1503,
+      "sha256": "5f8fc8a074f9b1f1a3fa1033ae3aca09236be1480595b9d819d07d828459cf15"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-portable-128k.json": {
+      "bytes": 3403,
+      "sha256": "46b0392e37d1f0197ea109714a10aee7f606668eb2b82eed8f71ec8d989c164e"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-ud-q2_k_xl-128k.json": {
+      "bytes": 1462,
+      "sha256": "efac9e95b2cd38f9e111980baa3ce7d8d5f856497526f4927d17c985014ca109"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\strata-unsloth-ud-q2_k_xl.json": {
+      "bytes": 1423,
+      "sha256": "9a5f0ce07f5d3ebe6eff85d91044ec936b078c3d1d3e6367417e61d3e055c221"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-q2_0.bat": {
+      "bytes": 292,
+      "sha256": "6b742f3fe65d9d80dbb0c5e6779ceb68ecd5ddc4dd1255138b39ebc30efe41c4"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-compact-128k.bat": {
+      "bytes": 607,
+      "sha256": "c72579e0983c9ed3d388cdc2098f9503c84487190e27efcd4c9a36d6061cc474"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-desktop-128k.bat": {
+      "bytes": 759,
+      "sha256": "85e55fa4ecbf275253ed99f2315af65e515195db17f227d2c84c0826411ae253"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-desktop-async-128k.bat": {
+      "bytes": 828,
+      "sha256": "99d490e3af0e50eb00861d3fe4e64dcf75ff466b751fd903992ac8e5a8cad75b"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-desktop-gpu-128k.bat": {
+      "bytes": 771,
+      "sha256": "ed8bdd2ba689531abeaa261de3cdf99a32841497ada5daaf24a375d3f7574744"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-desktop-trained-128k.bat": {
+      "bytes": 344,
+      "sha256": "21882beece489b9cda650573830c8ca035de99fbbc997a126594679d4b9ea78b"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-fast-128k.bat": {
+      "bytes": 539,
+      "sha256": "8bb5195447a65c72040bdac4d35aec4eca61013610e5babd6e2ad5184a05324b"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-portable-128k.bat": {
+      "bytes": 330,
+      "sha256": "42533e4bcbeeb2a0e55d17c4c61a39feaa9732e3c6e1a4ce31e04e1f7a0caafa"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-ud-q2_k_xl-128k.bat": {
+      "bytes": 503,
+      "sha256": "0cf39a1ff63be5079639e7a424c74ce30ba886c02cf7cdf274d3c8ec6030d0b9"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\run-unsloth-ud-q2_k_xl.bat": {
+      "bytes": 542,
+      "sha256": "3c2b53dd90c7309a16db28060094b7c7139b6a1d8e9ae046a6d9f0bbbdc43765"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\START-HERE.bat": {
+      "bytes": 2422,
+      "sha256": "2c3c21e8d379a672e0fdca59ef5546c9bd50a2b741817fe39ed16a61dbe049d1"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\start-strata-lan.bat": {
+      "bytes": 735,
+      "sha256": "d8b19009437eeea4f9508c47c9020304d152ab9ea0d5c214eece745659dfdc20"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\BUILD-unsloth-compact.json": {
+      "bytes": 352,
+      "sha256": "1cbc29f4cacff03d8932992a31c2c13d831f873a88f092783da09d7ed1468d3a"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\BUILD-unsloth-file-cache.json": {
+      "bytes": 355,
+      "sha256": "c73b05f8a105e9436ec1ed282fd889a581a39769a0788d5a3f7313da2acc9e91"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\BUILD-unsloth-portable.json": {
+      "bytes": 9249,
+      "sha256": "2521535ff83f4bd13b07c242d7e098d0956ab6a94ba49a7f13332bef889bc9bf"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\BUILD-unsloth.json": {
+      "bytes": 307,
+      "sha256": "78cd046670281bae196b440416ed3179f5672e37384196194dc0129ae65bfee1"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-compact.exe": {
+      "bytes": 46202368,
+      "sha256": "46f22bebde5517a880c7e3605095dc5df72f1c10219f53ea5197943ac3404082"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-file-cache.exe": {
+      "bytes": 46199808,
+      "sha256": "204674c9ba60a8b8f4e0e5096c5e3004de06cb1a7dcdbed634bbf440f2d983f2"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth-portable.exe": {
+      "bytes": 46220288,
+      "sha256": "fc0ae8c0e97ad501e6c1a994ee51f571d486e1b9e4fae73da9e84a82f7f17b4b"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\engine\\strata-unsloth.exe": {
+      "bytes": 46197760,
+      "sha256": "edd7e1efbbfcb4e860da5e1793171400070d38fe397b6126c1678395c09b6c31"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\data\\expert-profile-coder.bin": {
+      "bytes": 98328,
+      "sha256": "a514661124d5305effe9c1bcecff7dc069af398b2b19ff9d11628a2cad0a8915"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\data\\expert-profile-unsloth-desktop-20261010.bin": {
+      "bytes": 196632,
+      "sha256": "3c6b35a8f063bf439f5864582e1eb7c07a9c019930a7bb365ac2bea94e217027"
+    },
+    "C:\\Users\\Joes\\Tools\\Strata\\data\\expert-profile.bin": {
+      "bytes": 196632,
+      "sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf"
+    }
+  }
+}

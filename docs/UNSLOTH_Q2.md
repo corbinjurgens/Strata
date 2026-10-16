@@ -328,13 +328,17 @@ context limit alone does not establish that a prompt of that length fits or runs
 **131072-token context capacity by default**. It detects RAM, available physical memory, Windows available
 commit and GPU VRAM, then reports its allocation requests and reserved allowances. It enables the compact
 recent-file cache from this branch. This is an explained startup policy, not a guarantee of optimal speed or
-of fit for every workload. The new laptop policy has offline simulated-hardware coverage; it has not been
-runtime tested on the RTX 4050. The historical laptop measurements above used their stated manual settings.
+of fit for every workload. The guarded RTX 4080 SUPER workload below passed on 2026-10-15. Full laptop
+128K and Linux acceptance remain unverified.
+The historical laptop and desktop measurements used their stated manual settings.
 
-The helper builds `engine/strata-unsloth-portable.exe` and writes `engine/BUILD-unsloth-portable.json`,
-`strata-unsloth-portable-128k.json` and `run-unsloth-portable-128k.bat`. These names are separate from the
-working desktop launcher and rollback engines described below. Generate the configuration on each PC;
-copying a desktop JSON would carry that machine's paths and budgets to the laptop.
+The helper defaults to `engine/strata-unsloth-portable.exe`, `engine/BUILD-unsloth-portable.json`,
+`strata-unsloth-portable-128k.json` and `run-unsloth-portable-128k.bat`. That executable is also the historically
+selected desktop engine below, so its name does not establish isolation. For this candidate, use
+`engine/strata-shared-memory-safety.exe`, its matching `engine/BUILD-shared-memory-safety.json` receipt and
+`strata-unsloth-shared-memory-safety-128k.json`. Check the executable paths in locally selected configs before
+building; if this candidate path is selected, choose an unused numeric suffix before the extension. Generate
+the configuration on each PC; copying a desktop JSON would carry its paths and budgets to the laptop.
 
 ### Reproduce from source and existing model files
 
@@ -352,11 +356,10 @@ receipt hashes the actual selected files, rather than treating that version labe
 With those prerequisites ready, run from the checkout:
 
 ```bat
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --build-engine
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --plan --gguf-dir "D:\Models\UD-Q2_K_XL"
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --prepare --gguf-dir "D:\Models\UD-Q2_K_XL"
-.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --check-ready
-run-unsloth-portable-128k.bat
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --build-engine --engine engine/strata-shared-memory-safety.exe
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --plan --engine engine/strata-shared-memory-safety.exe --config strata-unsloth-shared-memory-safety-128k.json --gguf-dir "D:\Models\UD-Q2_K_XL"
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --prepare --engine engine/strata-shared-memory-safety.exe --config strata-unsloth-shared-memory-safety-128k.json --gguf-dir "D:\Models\UD-Q2_K_XL"
+.venv\Scripts\python.exe tools\prepare_unsloth_q2.py --check-ready --config strata-unsloth-shared-memory-safety-128k.json
 ```
 
 Replace the model folder with the existing three-shard folder. Omit `--gguf-dir` to discover a complete
@@ -380,8 +383,10 @@ new random key and defaults to `127.0.0.1:8080`. Keys are saved only in the igno
 printed. Existing keyed host/port settings are preserved; readiness refuses an unkeyed non-loopback host.
 
 `--plan`, `--prepare`, `--write-config` and `--check-ready` do not start a server. The generated launcher
-uses `--launch --config strata-unsloth-portable-128k.json`; that is the explicit launch step. Close an
-existing Strata server before starting another profile. For another experiment, pass a distinct `--config`
+for these candidate commands is `run-unsloth-shared-memory-safety-128k.bat`; it uses
+`--launch --config strata-unsloth-shared-memory-safety-128k.json`. Running it is the separate full-model launch
+step, after offline preparation. Close an existing Strata server before starting another profile.
+For another experiment, pass a distinct `--config`
 filename consistently. `--context` affects a new profile only, accepts 8192/ 32768/65536/131072, and is never
 reduced automatically. Existing configurations are preserved during preparation.
 
@@ -407,14 +412,35 @@ desktop, streamed KV storage for 13 layers at the selected context/precision, an
 8 GiB on systems with at least 48 GiB RAM or 4 GiB below that. The Windows commit calculation also reserves
 GPU memory less the configured VRAM reserve; this GPU allowance is not subtracted again from physical RAM.
 If available-memory telemetry is missing, the helper discloses its fallback estimate of 65% of total RAM.
-These are policy allowances, not measured worst-case memory requirements.
+Missing Windows commit telemetry falls back to the physical pool for planning. These fallbacks are labelled
+unverified: read-only planning and preparation remain available, but cannot establish launch feasibility.
+These are policy allowances, not measured worst-case memory requirements. The laptop's 8 GiB headroom applies
+to system RAM; its 400 MiB GPU reserve is separate and has not been validated for normal external-monitor use.
+Everyday laptop acceptance keeps the external monitor connected and normal applications open, and samples
+actual free VRAM rather than assuming all 6 GB is available.
 
 The pinned profile-cache request is 70% of that pool, rounded down to whole GiB and capped at 30 GiB on the
 larger-RAM machine or 12 GiB below 48 GiB RAM. The remainder requests compact recent-cache storage, capped at
 16384 MiB. Under severe pressure the helper requests a small positive 0.25 GiB pinned budget and can reduce
 the recent cache to zero; it reports the low-memory condition. The engine still clamps requests at startup.
-Both caches allocate according to their own runtime rules; protected live entries may exceed recent
-retention, and budgets do not continuously resize after launch.
+Profile requests are ceilings subject to allocation checks. The engine finalizes the recent target after
+required startup buffers and checks current physical RAM and Windows commit on retention misses. Optional
+growth always leaves the existing 256 MiB clamp margin above the requested headroom, including when the
+configured target itself fits. Under pressure it reuses fitting safe buffers and releases only eligible cold
+entries; existing capacities are already charged to the memory sample. Recent retention is a lazy target: protected live entries and mandatory
+staging may exceed it. The pinned expert budget remains fixed after launch. These checks cannot reserve
+memory against later allocations or other applications.
+
+On Windows/NVIDIA, automatic expert-cache startup with a requested reserve of at least 256 MiB also checks
+the final CUDA allocation budget before serving. It refuses startup below the existing 256 MiB stall-warning
+floor, or when that memory query fails. An explicit cache size or a deliberately smaller reserve retains
+its existing warning behavior. This final check includes runtime/library allocations absent from the early
+cache forecast; increasing the reserve cannot create room when fixed allocations already fill the GPU.
+
+After resampling, a launch with both host-cache requests still automatic requires current available physical
+memory, available Windows commit on Windows, and at least 0.25 GiB in the computed expert pool. A measured zero
+is insufficient capacity, rather than unknown telemetry. Linux does not require Windows commit. Rejection
+preserves the saved config and does not start the server. The below-2-GiB warning alone does not reject a plan.
 
 The launcher samples hardware and memory again before each start. The saved `memory_policy` records which
 values are automatic. Manual changes to its managed arguments/environment become persistent overrides;
@@ -424,6 +450,37 @@ deliberate new-profile overrides even when they equal the current automatic choi
 `--resident-budget-gib`, `--file-cache-mib` or `--resident-headroom-gib` during creation. Oversized explicit
 requests remain explicit and are reported; this does not bypass engine safety clamps. Remove `memory_policy`
 only when a completely static configuration is intended.
+
+An explicit override or removal of either `--resident-budget-gib` or `STRATA_FILE_CACHE_MIB` retains the manual
+launch path and its warnings, including across repeated refreshes. Profile requests, when present, must be
+finite and positive; recent MiB must be a nonnegative integer; host headroom and VRAM reserve must be finite
+and nonnegative. Zero recent retention and zero headroom remain valid. The same validation applies to new
+CLI overrides and edited policy configs before publication or launch.
+JSON null in a managed environment setting means removal: the saved environment omits that key while the
+policy retains the explicit removal across refreshes. It is never passed to the engine as the string `None`.
+The engine saturates oversized finite GiB-to-byte requests before allocation checks. A positive profile
+request below one byte keeps a one-byte budget, so it cannot select the zero/full-complement sentinel;
+such a budget can still fail allocation because no expert fits it.
+
+Each managed memory-policy argument must appear at most once, including context, KV and boolean switches.
+Duplicate managed arguments are rejected before config publication or server startup; the helper preserves
+the saved bytes so the ambiguous argument list can be corrected explicitly.
+
+Numeric strings use ASCII decimal or scientific syntax; separators such as underscores and non-ASCII
+digits are rejected. Recent MiB must be a complete integer with no trailing whitespace and cannot exceed
+17592186044415 MiB, the engine's byte-counter limit. Larger ordinary requests within that range remain
+explicit and subject to allocation checks.
+
+The engine reads `--vram-reserve-mib` with an integer-prefix parser: `1e3` means 1 MiB and `1024.5` means
+1024 MiB. The helper preserves those manual argument spellings, uses the effective integer in its commit
+allowance, and reports any requested/effective difference. An effective prefix above 2147483647 MiB is
+rejected before launch to avoid signed-integer overflow. Removing the argument retains the conservative
+zero-reserve allowance used by the planner.
+
+`tools/benchmark_compact_cache.py` consumes the saved effective settings without refreshing the portable
+policy. For comparisons, refresh and save the effective config once, then freeze and record those settings
+alongside actual residency. `--plan` previews a refresh without saving it. Historical benchmark results do
+not validate a later automatic policy.
 
 New profiles set `fit_max_tokens=true` and `open_browser=false`. Output-budget fitting shortens a client's
 requested output allowance to the remaining context; it does not truncate the prompt or increase capacity.
@@ -435,8 +492,48 @@ config's `env` remain explicit diagnostic opt-ins.
 The engine source includes Windows and Linux paths, and the helper can generate a shell launcher, but its
 `--build-engine` wrapper currently supports Windows/NVIDIA only. On Linux, use the repository's normal
 `setup.sh --build`/CMake path and local paths/configuration; the Windows build commands above are not a
-validated Linux recipe. Neither this new helper policy nor the read-path experiment below has laptop or
-Linux runtime measurements in this work.
+validated Linux recipe. The laptop startup/cache-warmup checks below are partial runtime measurements;
+Linux and the read-path experiment remain unmeasured here.
+
+### Laptop startup and cache warmup, 2026-10-14 to 2026-10-15
+
+An isolated candidate was tested on the RTX 4050 Laptop 6 GB with 63.71 GiB usable RAM, Windows, no pagefile,
+CUDA 13.4 and driver 617.42. Normal applications stayed open; only the internal display was active. Context
+capacity remained 131072, with q4_0 KV, 20480 resident cells, 64-token prefill chunks, and the unchanged automatic
+host-cache split. The original engines and saved configurations were retained.
+
+Before the runtime admission correction, available Windows commit reached 7.20 GiB during cache warmup,
+despite the 8 GiB startup headroom request. The corrected watched run kept available commit above 8 GiB;
+the user reported responsive typing, window switching and scrolling throughout.
+
+With the experimental lazy-loading profile, a subsequent fresh 32767-token prompt returned all three codes
+distributed through the input; the follow-up reused 32792 tokens and returned the final code plus the correct
+integer. Fresh prefill took 1586.4 seconds (20.7 tokens/s). This approximately 30-minute run preceded the final
+margin refinement: available commit briefly reached 7.88 GiB, with 14 one-second samples below 8 GiB.
+That result prompted applying the existing 256 MiB margin consistently to optional cache growth.
+
+The final candidate then completed three 512-token generations, correct cached follow-ups after each, and
+121 seconds of idle monitoring. Across 282 seconds of telemetry, available physical RAM stayed above
+17.58 GiB and available commit above 8.39 GiB, with no sample below 8 GiB. The sustained generations decoded
+at 13.0 to 13.5 tokens/s. CUDA reported 424 MiB free at startup and 392 MiB after every completed request.
+This final run validates the margin on that workload; the 32K retrieval run was on the preceding candidate,
+and a near-full 128K laptop prompt remains untested.
+
+GPU tracing separated the host-complement mapping from prompt initialization. With the engine's default
+eager CUDA module loading, cuBLAS creation cost 220 MiB in an isolated library probe, versus 12 MiB with lazy
+loading. The full model's startup CUDA-free memory was 214 MiB under eager loading and 424 MiB in a separate
+profile with `CUDA_MODULE_LOADING=LAZY`. The user also reported responsiveness during that comparison.
+NVIDIA documents that lazy loading postpones kernel loading; the startup saving alone does not verify all
+first-use kernels or near-full-context stability. The engine's eager default remains unchanged, and the lazy
+setting is an explicit experimental profile override. See [CUDA module loading](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html#cuda-module-loading).
+On the final candidate, direct startup probes confirmed that the eager profile was refused before `READY`,
+while the lazy profile reached `READY` and exited cleanly on `QUIT`.
+
+Local raw evidence is under `.claude/laptop-headroom-correction-20261014/`: `watched-startup`,
+`lazy-comparison`, `long-retrieval`, `margin-stress`, `startup-checks-final`, and `eager-cublas-probe.json`.
+Responsiveness was observed by the user during the two watched short runs; the longer automated runs were
+not watched for responsiveness. These measurements do not establish external-monitor fit, RTX 4080 SUPER
+acceptance, Linux runtime behavior, or desktop-stall causation.
 
 Offline checks for policy choices, physical/commit limits, credentials, explicit overrides, repeated refresh,
 publication failures, command quoting and build receipts are in
@@ -451,7 +548,175 @@ driver 617.14, CUDA 13.4.92 and MSVC 19.44.35229. Its sm_89 engine built and ran
 model hashes passed, and `--compat-bf16` packing produced the 1.38 GiB arena. Those checks establish that
 preparation step, not the performance of the newer automatic policy.
 
-## RTX 4080 SUPER desktop validation at 128K
+## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
+
+Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
+30.88 GiB usable RAM, Windows, driver 617.14 and CUDA 13.4.92. Windows had a 28 GiB pagefile and a
+58.88 GiB commit limit. The isolated engine used eager CUDA loading and the existing UD-Q2_K_XL model.
+The working engine, profiles and selected launcher were preserved.
+
+The policy was refreshed once immediately before testing and then frozen. It requested 5 GiB pinned
+experts, 3486 MiB compact recent cache, 4 GiB host headroom and a 1024 MiB GPU reserve. Capacity remained
+131072 tokens, with int8 KV, 32768 resident cells, automatic prefill, verifier window 2 and parallel 1.
+These are the desktop's sampled automatic settings, not recommended fixed budgets for other starts.
+
+Short exact answers, cached follow-ups, three 512-token generations and a 60-second idle check passed.
+The sustained generations decoded at 7.1, 8.2 and 8.2 tokens/s. During this watched phase the user reported
+"responsive throughout". Its 390 seconds of one-second monitoring found at least 4.249 GiB available
+physical RAM and 15.037 GiB available commit, with at most 26.631 GiB physical RAM used and 43.843 GiB
+system commit. CUDA reported 761 MiB free at serving and 731 MiB after completed requests.
+
+All six smoke checks then passed on a separate owned server using the same frozen profile. A fresh
+130880-token prompt returned all three reference codes in order and passed output-budget fitting.
+Prefill took 1160.49 seconds; total request wall time was 1166.83 seconds. The follow-up retained 130944
+prompt tokens, reused 130906 tokens, processed 38 new prompt tokens and returned the correct code and
+arithmetic answer in 9.33 seconds. Over this 1385-second phase, available RAM stayed above 8.583 GiB,
+available commit above 18.730 GiB, and logged CUDA-free samples at or above 677 MiB.
+
+CUDA figures are engine queries at startup and request stages, not continuous VRAM minima. No guard
+triggered. Both servers exited, port 8081 was released, and hashes of all 33 preserved working files
+were unchanged. The user was away during the long phase, so its desktop responsiveness was unobserved.
+These checks do not explain the earlier desktop stalls or establish broad model quality. Laptop external
+display, full laptop 128K and Linux acceptance remain separate.
+
+See the [desktop report and sanitized results](../bench/results/2026-10-15-4080s-shared-policy/README.md).
+
+## Desktop cache and placement comparisons, 2026-10-15
+
+The same desktop and `563c136c` executable were then tested with more available RAM. The comparison
+profiles were frozen with 22.18 GiB physical RAM and 48.75 GiB commit available, versus 17.08 and
+43.47 GiB at the earlier acceptance freeze. Idle nvidia-smi free memory was still 16036 MiB; the GPU
+already had similar availability. Capacity, int8 KV, 32768 resident cells, eager CUDA loading,
+automatic prefill, parallel 1 and the 1024 MiB GPU reserve stayed unchanged.
+
+Each comparison used the same three technical prompts twice with 160-token output limits, then
+the fixed broader coding, arithmetic and note-writing prompts. The technical answers generated
+960 tokens per run. Rates below are completion tokens divided by engine decode time; startup,
+prefill and idle time are excluded. They are not comparable to the 512-token tutorial rates alone.
+All comparison profiles requested 4 GiB host headroom. Pinned/recent requests and measured decode
+rates, listed as technical / broader, were:
+
+- Shipped placement, 5 GiB / 3486 MiB: 7.67 / 4.80 tokens/s; repeated after the other profiles,
+  7.43 / 4.16 tokens/s.
+- Refreshed automatic budgets, shipped placement, 9 GiB / 4609 MiB: 9.18 / 6.56 tokens/s.
+- The same budgets with the existing desktop-trained placement: 19.35 / 4.87 tokens/s.
+- Trained placement, 12 GiB / 1537 MiB: 24.24 / 5.66 tokens/s.
+- Shipped placement, 12 GiB / 1537 MiB: 14.01 / 5.56 tokens/s.
+
+The 9/4609 and 12/1537 pairs requested the same total host-cache bytes. Actual allocation still
+depends on admission and protected buffers. Starting placements were copied and hashed, with profile
+saving disabled. These results support a technical-workload placement benefit and a budget-split
+tradeoff; the large technical gain did not carry over consistently to the broader workload. The
+original/repeated control and per-request records retain the variability. One refreshed-profile
+technical response fell to 3.4 tokens/s, and the initial control's inventory prompt took 69.59 seconds
+in prefill.
+
+For the first technical request, engine-reported logical expert-file payload fell from 8934.6 MB in
+the control to 1630.7 MB with the trained 12 GiB profile. These counters are not physical SSD traffic.
+All these runs completed without an emergency guard trigger, with logged CUDA-free samples at or
+above 673 MiB. The trained 9 GiB profile briefly reached 3.797 GiB available RAM, below its requested
+4 GiB headroom. Its sharpest dip occurred with nearly unchanged owned RSS/private memory, consistent
+with global memory variation but insufficient to identify its owner. Headroom is an allocation
+policy, not a guaranteed system floor. These automated comparisons had no new responsiveness observation.
+
+The broader answers retained quality limitations: the code cases passed review, but inventory
+reconciliation was incomplete at the 160-token budget and the status paragraph omitted the explicit
+derived count of 593 scans. They are performance workloads, not a claim that all output requirements passed.
+
+A separate candidate therefore requested 6 GiB headroom. With shipped placement and an equal
+11.5 GiB total cache request, 11 GiB pinned / 512 MiB recent decoded three 512-token tutorials at
+9.1, 10.2 and 9.3 tokens/s, but cached follow-ups took 13.77-15.27 seconds. Moving 2 GiB from pinned
+to recent storage, for 9 GiB / 2560 MiB, gave 10.8, 12.5 and 12.8 tokens/s and 6.34-6.52 second
+follow-ups. All reused their 560-token prefix and processed 29 new prompt tokens. The balanced
+candidate also passed idle monitoring and a complete 256-token-budget JSON inventory check,
+including the 320-unit reconciliation. Minimum available RAM was 6.017 GiB, available commit
+16.069 GiB, and logged CUDA-free memory 731 MiB over this 332-second run.
+
+Without refreshing that balanced profile, a separate 1259-second run passed the API smoke checks,
+fresh near-limit retrieval, context fitting and prefix reuse. The fresh request retained all
+130880 prompt tokens and returned the three reference codes in order. Prefill took 1079.271 seconds
+and request wall time was 1099.079 seconds, versus 1160.493 and 1166.828 seconds in the earlier
+acceptance. Its short 27-token answer decoded at 1.4 tokens/s versus 4.5 earlier, so the faster
+prefill does not establish a large-context decode improvement. The follow-up retained its full
+130944-token history, reused 130906 tokens, processed 38 new tokens and correctly returned the code
+and arithmetic result in 8.204 seconds, versus 9.333 earlier.
+
+Minimum available RAM in that long run was 5.856 GiB, available commit 15.574 GiB, and logged
+CUDA-free memory 677 MiB. No guard triggered. The requested 6 GiB headroom was again a soft target;
+the sampled RAM minimum was slightly below it. CUDA figures are engine stage samples, not continuous
+VRAM monitoring. These single-run comparisons combine changed cache budgets and current machine
+conditions, and do not establish desktop responsiveness while unattended. After cleanup, the
+working files and original checkout still matched their baseline, frozen configurations and engine
+hashes were unchanged, no Strata process remained and loopback port 8081 was free.
+
+These are separate experimental configurations; the shared defaults and working profile selection
+were not changed. Local per-request results, frozen nonsecret settings and telemetry are under
+`.claude/4080s-performance-20261015/`; the new artifacts are not included in the repository.
+
+### Dedicated-use follow-up
+
+The user then confirmed the desktop was in its intended Strata-only state, with normal applications
+closed. At the comparison freeze, available physical RAM was 22.741 GiB and available commit was
+48.651 GiB. The executable, shipped expert placement, 131072-token capacity, int8 KV, 32768 resident
+cells, eager loading, prefill and speculation settings stayed unchanged. These were automated runs;
+desktop responsiveness was not observed. Each profile generated the same three 512-token tutorials,
+their cached arithmetic follow-ups, a complete inventory answer and idle checks.
+
+The rates below count only those 1536 tutorial completion tokens divided by their summed engine
+decode time. They exclude prefill and startup, and differ from the earlier 160-token technical set:
+
+- Control, 9 GiB pinned / 2560 MiB recent / 6 GiB headroom: 11.93 tokens/s, with individual rates
+  10.7, 12.5 and 12.8. Cached follow-ups took 6.28-6.53 seconds.
+- More recent storage, 9 GiB / 4608 MiB / 4 GiB headroom: 11.01 tokens/s, with rates 9.5, 11.9 and
+  12.0. Follow-ups took 6.80-7.37 seconds. The complete inventory answer took 26.29 seconds versus
+  the initial control's 82.45 seconds; a later control repeat took 31.21 seconds. That variation
+  prevents attributing the inventory improvement to recent-cache capacity alone.
+- More pinned storage, 11 GiB / 2560 MiB / 4 GiB headroom: 13.34 tokens/s, with rates 10.5, 15.5 and
+  15.2. Follow-ups took 26.49, 5.28 and 5.65 seconds; the first was a substantial latency outlier.
+- That same host allocation with GPU reserve reduced from 1024 to 768 MiB: 8.73 tokens/s, with
+  rates 6.4, 10.2 and 11.1. Actual GPU expert storage grew from 5272 slots / 9.21 GiB to 5415 slots /
+  9.46 GiB, and logged CUDA-free memory fell from 731 to 475 MiB. Spending that extra VRAM did not
+  improve this run; its follow-ups took 7.33, 6.11 and 6.95 seconds. Remaining trials retained the
+  1024 MiB reserve.
+- After those runs, 12 GiB / 2560 MiB / 3 GiB headroom: 15.85 tokens/s, with rates 15.4, 16.1 and
+  16.1. Follow-ups took 4.78, 4.67 and 24.37 seconds. This increased requested host expert storage
+  from the control's 11.5 GiB to 14.5 GiB and confirmed 12.00 GiB actually pinned. It improved
+  tutorial throughput but did not eliminate latency outliers. Minimum available RAM was 3.587 GiB,
+  available commit 14.114 GiB and logged CUDA-free memory 731 MiB over 250.887 seconds.
+
+Repeating the control after those candidates measured 11.91 tokens/s overall, again with individual
+rates of 10.7, 12.5 and 12.8 and follow-ups at 6.26-6.62 seconds. The 12 GiB-pinned candidate's
+aggregate tutorial decode rate was about 33% higher than the controls, while its 24.37-second
+follow-up prevents a claim of uniformly lower interactive latency. These measurements do not
+identify the cause of the latency outliers.
+
+All these short runs passed the exact, reuse, inventory-reconciliation and idle checks without a
+guard trigger. Before the 3 GiB-headroom trial, fresh planning admitted its 14.5 GiB request with
+22.882 GiB RAM available. The local guard was tightened for that trial: stop immediately below
+2 GiB available RAM, or below 2.5 GiB for five consecutive samples, while retaining commit and
+stage-CUDA checks. Injected checks exercised the actual guard's immediate stop, sustained stop,
+boundary reset and opt-in behavior. Admission and headroom still do not guarantee a runtime floor.
+Per-request records and frozen settings are local under `.claude/4080s-performance-20261015/dedicated/`.
+
+The frozen 12 GiB-pinned candidate then passed smoke, fresh near-limit retrieval, context fitting
+and reuse in a separate 1033.891-second run. A fresh admission check found 22.924 GiB available RAM;
+the profile itself was not refreshed. The fresh request retained all 130880 prompt tokens and
+returned the three reference codes in order. Prefill took 849.223 seconds and request wall time
+was 853.728 seconds, versus the balanced candidate's 1079.271 and 1099.079 seconds. That is about
+21% less prefill time in this measured pair. The follow-up retained its full 130944-token history,
+reused 130906 tokens, processed 38 new tokens and returned the correct code and arithmetic result
+in 5.325 seconds, versus 8.204 seconds. The near-limit answers decoded at 6.5 and 9.4 tokens/s,
+but contained only 27 and 14 tokens; they do not establish sustained near-128K decode throughput.
+
+Minimum available RAM was 3.196 GiB, available commit 12.999 GiB, and logged CUDA-free memory
+677 MiB. No guard triggered. After cleanup, the baseline working files, original checkout,
+frozen configurations, shipped placement and engine hashes were unchanged; no Strata process
+remained and port 8081 was free. The local `summary.json` and `post-snapshot.json` retain the
+measurements and preservation checks. The shared defaults and selected working profile remain
+unchanged. This separate candidate uses the dedicated desktop conditions and has no new watched
+responsiveness acceptance; its short-request latency outlier remains unresolved.
+
+## Earlier RTX 4080 SUPER desktop validation at 128K
 
 Measured on 2026-10-09: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM, a 24 GiB Windows pagefile,
 and model files on a Crucial CT2000P3SSD8 NVMe drive. The source-built engine is commit `6794d90` for sm_89.

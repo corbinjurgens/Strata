@@ -1,0 +1,737 @@
+{
+  "recorded_at": "2026-10-15T15:24:36.800540+09:00",
+  "candidate_head": "563c136c1df98ae416022e595e606b963c7f2d22",
+  "preparation": {
+    "recorded_at": "2026-10-15T14:50:40.466399+09:00",
+    "candidate_root": "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom",
+    "candidate_head": "563c136c1df98ae416022e595e606b963c7f2d22",
+    "origin_handoff_head": "563c136c1df98ae416022e595e606b963c7f2d22",
+    "original_root": "C:\\Users\\Joes\\Tools\\Strata",
+    "transfer_resolved": true,
+    "model": "UD-Q2_K_XL",
+    "context": 131072,
+    "profile": "strata-unsloth-4080s-headroom-128k.json",
+    "engine": "engine/strata-4080s-headroom.exe",
+    "build_jobs": 2,
+    "cuda_module_loading": "EAGER",
+    "python_tests": {
+      "count": 127,
+      "passed": true
+    },
+    "original_profile_selection_changed": false,
+    "watched_ready_received": true,
+    "vault_deferred_status": "Handoff path and exact deferred entry absent from local vault; do not create duplicate entry.",
+    "build_passed": true,
+    "engine_sha256": "f815d5590c92689341e846d963322780d6e70f40cf6d1d951ff41f0165dabd67",
+    "targeted_ctest": {
+      "count": 2,
+      "passed": true
+    },
+    "monitor_self_check_passed": true,
+    "check_ready_passed": true,
+    "baseline_files_unchanged": 33,
+    "awaiting_explicit_ready": false,
+    "watched_started_at": "2026-10-15T14:53:28.757492+09:00",
+    "user_responsiveness": "Responsive throughout",
+    "observation_recorded_at": "2026-10-15T14:58:19.426336+09:00",
+    "long_phase_responsiveness": "Unobserved: user away from PC after 64K progress update",
+    "cleanup_verified": true,
+    "desktop_automated_acceptance_passed": true,
+    "completed_at": "2026-10-15T15:23:37.518765+09:00"
+  },
+  "hardware": {
+    "recorded_at": "2026-10-15T15:04:46.562967+09:00",
+    "cpu": {
+      "Name": "AMD Ryzen 7 9800X3D 8-Core Processor           ",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 16
+    },
+    "pagefile": {
+      "Name": "C:\\pagefile.sys",
+      "AllocatedBaseSize": 28672,
+      "CurrentUsage": 73,
+      "PeakUsage": 74
+    },
+    "nvidia_smi_supplemental": "NVIDIA GeForce RTX 4080 SUPER, 617.14, 16376 MiB, 12 %, 14611 MiB",
+    "note": "nvidia-smi memory is supplemental; actual CUDA-free figures are engine stage samples."
+  },
+  "effective_profile": {
+    "exe": "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom\\engine\\strata-4080s-headroom.exe",
+    "build_metadata": "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom\\engine\\BUILD-4080s-headroom.json",
+    "cwd": "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom",
+    "args": [
+      "--pack",
+      "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom\\packs\\unsloth-ud-q2_k_xl",
+      "--native",
+      "C:\\Users\\Joes\\.cache\\huggingface\\hub\\models--unsloth--Qwen3.8-Flash-Next-GGUF\\snapshots\\766911a6b7369840a91dbcd95f9f997acaab6cd6\\UD-Q2_K_XL\\Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+      "--expert-profile",
+      "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom\\data\\expert-profile.bin",
+      "--expert-cache",
+      "auto",
+      "--max-context",
+      "131072",
+      "--kv",
+      "int8",
+      "--kv-resident",
+      "32768",
+      "--spec",
+      "2",
+      "--suffix-draft",
+      "0",
+      "--lookup-chain",
+      "0",
+      "--resident-budget-gib",
+      "5",
+      "--prefill",
+      "auto",
+      "--vram-reserve-mib",
+      "1024"
+    ],
+    "tokenizer": "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom\\packs\\unsloth-ud-q2_k_xl\\tokenizer",
+    "model_name": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
+    "log": "C:\\Users\\Joes\\Tools\\Strata-4080s-headroom\\strata-unsloth-4080s-headroom-128k.log",
+    "lib_dirs": [
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin\\x64"
+    ],
+    "env": {
+      "STRATA_RESIDENT_HEADROOM_GIB": "4",
+      "STRATA_FILE_CACHE_MIB": "3486",
+      "STRATA_FILE_CACHE_COMPACT": "1",
+      "STRATA_TRACE": "1",
+      "CUDA_MODULE_LOADING": "EAGER"
+    },
+    "gpu": 0,
+    "gpus_asked": true,
+    "parallel": 1,
+    "port": 8081,
+    "host": "127.0.0.1",
+    "fit_max_tokens": true,
+    "open_browser": false,
+    "memory_policy": {
+      "version": 1,
+      "generated_args": [
+        "--expert-cache",
+        "auto",
+        "--max-context",
+        "131072",
+        "--kv",
+        "int8",
+        "--spec",
+        "2",
+        "--suffix-draft",
+        "0",
+        "--lookup-chain",
+        "0",
+        "--resident-budget-gib",
+        "5",
+        "--vram-reserve-mib",
+        "1024",
+        "--prefill",
+        "auto",
+        "--kv-resident",
+        "32768"
+      ],
+      "generated_env": {
+        "STRATA_RESIDENT_HEADROOM_GIB": "4",
+        "STRATA_FILE_CACHE_MIB": "3486",
+        "STRATA_FILE_CACHE_COMPACT": "1"
+      },
+      "overrides": {
+        "args": {},
+        "env": {}
+      },
+      "sample": {
+        "args": [
+          "--expert-cache",
+          "auto",
+          "--max-context",
+          "131072",
+          "--kv",
+          "int8",
+          "--spec",
+          "2",
+          "--suffix-draft",
+          "0",
+          "--lookup-chain",
+          "0",
+          "--resident-budget-gib",
+          "5",
+          "--vram-reserve-mib",
+          "1024",
+          "--prefill",
+          "auto",
+          "--kv-resident",
+          "32768"
+        ],
+        "env": {
+          "STRATA_RESIDENT_HEADROOM_GIB": "4",
+          "STRATA_FILE_CACHE_MIB": "3486",
+          "STRATA_FILE_CACHE_COMPACT": "1"
+        },
+        "ram_gib": 30.88027572631836,
+        "vram_gib": 15.9921875,
+        "available_gib": 17.080684661865234,
+        "commit_available_gib": 43.46826171875,
+        "windows_commit": true,
+        "automatic_host_cache": true,
+        "available_fallback_gib": null,
+        "kv_ram_gib": 1.67578125,
+        "cpu_server_gib": 2.0,
+        "later_startup_gib": 1.0,
+        "headroom_gib": 4.0,
+        "vram_reserve_requested_mib": 1024.0,
+        "vram_reserve_mib": 1024,
+        "gpu_commit_gib": 14.9921875,
+        "expert_pool_gib": 8.404903411865234,
+        "pinned_gib": 5,
+        "recent_mib": 3486,
+        "low_memory": false,
+        "over_budget": false
+      }
+    },
+    "api_key_enabled": true,
+    "frozen_at": "2026-10-15T14:53:10.075660+09:00",
+    "profile_sha256": "4a251e5fef7dcc20f096f55c681003f724339dbe03f3a875af2993023ea6a333"
+  },
+  "phases": {
+    "short-01": {
+      "status": "complete",
+      "error": null,
+      "smoke_passed": true,
+      "watched_short_passed": true,
+      "long_context_passed": null,
+      "long_context_checks": [],
+      "watched_checks": [
+        {
+          "label": "short-exact",
+          "checks": {
+            "nonempty": true,
+            "exact_answer": true
+          },
+          "passed": true
+        },
+        {
+          "label": "short-cached-followup",
+          "checks": {
+            "nonempty": true,
+            "exact_answer": true,
+            "prefix_cache_used": true
+          },
+          "passed": true
+        },
+        {
+          "label": "sustained-1",
+          "checks": {
+            "nonempty": true,
+            "generated_512_tokens": true
+          },
+          "passed": true
+        },
+        {
+          "label": "sustained-1-followup",
+          "checks": {
+            "nonempty": true,
+            "exact_answer": true,
+            "prefix_cache_used": true
+          },
+          "passed": true
+        },
+        {
+          "label": "sustained-2",
+          "checks": {
+            "nonempty": true,
+            "generated_512_tokens": true
+          },
+          "passed": true
+        },
+        {
+          "label": "sustained-2-followup",
+          "checks": {
+            "nonempty": true,
+            "exact_answer": true,
+            "prefix_cache_used": true
+          },
+          "passed": true
+        },
+        {
+          "label": "sustained-3",
+          "checks": {
+            "nonempty": true,
+            "generated_512_tokens": true
+          },
+          "passed": true
+        },
+        {
+          "label": "sustained-3-followup",
+          "checks": {
+            "nonempty": true,
+            "exact_answer": true,
+            "prefix_cache_used": true
+          },
+          "passed": true
+        }
+      ],
+      "memory": {
+        "minimum_available_physical_gib": 4.249290466308594,
+        "maximum_used_physical_gib": 26.630985260009766,
+        "minimum_available_commit_gib": 15.036834716796875,
+        "maximum_system_commit_gib": 43.843441009521484,
+        "minimum_commit_limit_gib": 58.88027572631836,
+        "maximum_commit_limit_gib": 58.88027572631836,
+        "peak_owned_rss_gib": 11.076759338378906,
+        "peak_owned_private_gib": 28.30797576904297,
+        "first_sample": {
+          "physical_available_bytes": 18296741888,
+          "physical_used_bytes": 14860701696,
+          "commit_total_bytes": 16564080640,
+          "commit_limit_bytes": 63222214656,
+          "commit_available_bytes": 46658134016,
+          "gpi_physical_available_bytes": 18296741888,
+          "kind": "memory",
+          "unix": 1792043590.543204,
+          "elapsed_seconds": 0.2086538999997174,
+          "owned_processes": [
+            {
+              "pid": 10404,
+              "created": 1792043590.523924,
+              "rss_bytes": 2789376,
+              "private_bytes": 466944
+            },
+            {
+              "pid": 25648,
+              "created": 1792043590.537922,
+              "rss_bytes": 6684672,
+              "private_bytes": 1069056
+            }
+          ],
+          "owned_rss_bytes": 9474048,
+          "owned_private_bytes": 1536000
+        },
+        "last_sample": {
+          "physical_available_bytes": 9982050304,
+          "physical_used_bytes": 23175393280,
+          "commit_total_bytes": 41204408320,
+          "commit_limit_bytes": 63222214656,
+          "commit_available_bytes": 22017806336,
+          "gpi_physical_available_bytes": 9982050304,
+          "kind": "memory",
+          "unix": 1792043980.0282857,
+          "elapsed_seconds": 389.69373510000014,
+          "owned_processes": [
+            {
+              "pid": 19672,
+              "created": 1792043591.1158123,
+              "rss_bytes": 11667271680,
+              "private_bytes": 30161129472
+            },
+            {
+              "pid": 25032,
+              "created": 1792043590.548042,
+              "rss_bytes": 213774336,
+              "private_bytes": 198696960
+            },
+            {
+              "pid": 10404,
+              "created": 1792043590.523924,
+              "rss_bytes": 4358144,
+              "private_bytes": 843776
+            },
+            {
+              "pid": 25648,
+              "created": 1792043590.537922,
+              "rss_bytes": 7770112,
+              "private_bytes": 1302528
+            }
+          ],
+          "owned_rss_bytes": 11893174272,
+          "owned_private_bytes": 30361972736
+        }
+      },
+      "guard": {
+        "samples": 387,
+        "min_available_gib": 4.249290466308594,
+        "max_pagefile_used_gib": null,
+        "pagefile_available": false,
+        "pagefile_unavailable_reason": "No pagefile sample was collected.",
+        "stop_reason": null,
+        "min_commit_available_gib": 15.036834716796875,
+        "max_owned_rss_bytes": 11893579776,
+        "max_owned_private_bytes": 30395457536,
+        "cuda_stage_samples": 23,
+        "last_cuda_stage": {
+          "cuda_free_mib": 731,
+          "stage": "the completed request",
+          "enforced": true,
+          "observed_unix": 1792043920.261841,
+          "source": "engine-log"
+        },
+        "min_enforced_cuda_free_mib": 731,
+        "cuda_coverage": "Engine stage samples only; no continuous VRAM telemetry",
+        "commit_source": "GetPerformanceInfo CommitLimit minus CommitTotal; not swap usage",
+        "elapsed_seconds": 389.6942584999997
+      },
+      "requests": [
+        {
+          "label": "startup-exact",
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 27,
+          "prefill_seconds": 8.3772,
+          "decode_tokens_per_second": 3.8,
+          "wall_seconds": 9.476540088653564,
+          "error": null
+        },
+        {
+          "label": "short-exact",
+          "prompt_tokens": 27,
+          "completion_tokens": 4,
+          "cached_tokens": 20,
+          "new_prompt_tokens": 7,
+          "prefill_seconds": 0.1362,
+          "decode_tokens_per_second": 20.1,
+          "wall_seconds": 0.36678051948547363,
+          "error": null
+        },
+        {
+          "label": "short-cached-followup",
+          "prompt_tokens": 57,
+          "completion_tokens": 4,
+          "cached_tokens": 30,
+          "new_prompt_tokens": 27,
+          "prefill_seconds": 5.644699999999999,
+          "decode_tokens_per_second": 3.5,
+          "wall_seconds": 6.842559099197388,
+          "error": null
+        },
+        {
+          "label": "sustained-1",
+          "prompt_tokens": 49,
+          "completion_tokens": 512,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 49,
+          "prefill_seconds": 9.0095,
+          "decode_tokens_per_second": 7.1,
+          "wall_seconds": 81.00904130935669,
+          "error": null
+        },
+        {
+          "label": "sustained-1-followup",
+          "prompt_tokens": 589,
+          "completion_tokens": 4,
+          "cached_tokens": 560,
+          "new_prompt_tokens": 29,
+          "prefill_seconds": 7.995100000000001,
+          "decode_tokens_per_second": 3.7,
+          "wall_seconds": 9.1347815990448,
+          "error": null
+        },
+        {
+          "label": "sustained-2",
+          "prompt_tokens": 49,
+          "completion_tokens": 512,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 49,
+          "prefill_seconds": 11.842,
+          "decode_tokens_per_second": 8.2,
+          "wall_seconds": 74.30590033531189,
+          "error": null
+        },
+        {
+          "label": "sustained-2-followup",
+          "prompt_tokens": 589,
+          "completion_tokens": 4,
+          "cached_tokens": 560,
+          "new_prompt_tokens": 29,
+          "prefill_seconds": 8.303799999999999,
+          "decode_tokens_per_second": 3.3,
+          "wall_seconds": 9.581134557723999,
+          "error": null
+        },
+        {
+          "label": "sustained-3",
+          "prompt_tokens": 49,
+          "completion_tokens": 512,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 49,
+          "prefill_seconds": 11.1983,
+          "decode_tokens_per_second": 8.2,
+          "wall_seconds": 73.44817781448364,
+          "error": null
+        },
+        {
+          "label": "sustained-3-followup",
+          "prompt_tokens": 589,
+          "completion_tokens": 4,
+          "cached_tokens": 560,
+          "new_prompt_tokens": 29,
+          "prefill_seconds": 8.1123,
+          "decode_tokens_per_second": 3.3,
+          "wall_seconds": 9.375428915023804,
+          "error": null
+        }
+      ]
+    },
+    "long-01": {
+      "status": "complete",
+      "error": null,
+      "smoke_passed": true,
+      "watched_short_passed": null,
+      "long_context_passed": true,
+      "long_context_checks": [
+        {
+          "case": "fresh-near-128k-and-fit",
+          "checks": {
+            "all_codes_in_order": true,
+            "full_prompt_retained": true,
+            "fresh_prefill": true,
+            "fit_request_exceeds_capacity": true,
+            "completion_fits": true
+          },
+          "passed": true
+        },
+        {
+          "case": "near-128k-reuse",
+          "checks": {
+            "retrieval_and_arithmetic": true,
+            "long_prefix_reused": true,
+            "small_new_prefill": true,
+            "full_history_retained": true,
+            "completion_fits": true
+          },
+          "passed": true
+        }
+      ],
+      "watched_checks": [],
+      "memory": {
+        "minimum_available_physical_gib": 8.583515167236328,
+        "maximum_used_physical_gib": 22.29676055908203,
+        "minimum_available_commit_gib": 18.730636596679688,
+        "maximum_system_commit_gib": 40.14963912963867,
+        "minimum_commit_limit_gib": 58.88027572631836,
+        "maximum_commit_limit_gib": 58.88027572631836,
+        "peak_owned_rss_gib": 11.522884368896484,
+        "peak_owned_private_gib": 29.139629364013672,
+        "first_sample": {
+          "physical_available_bytes": 24200495104,
+          "physical_used_bytes": 8956948480,
+          "commit_total_bytes": 10780868608,
+          "commit_limit_bytes": 63222214656,
+          "commit_available_bytes": 52441346048,
+          "gpi_physical_available_bytes": 24200495104,
+          "kind": "memory",
+          "unix": 1792043985.5423977,
+          "elapsed_seconds": 1.442680399999972,
+          "owned_processes": [
+            {
+              "pid": 23516,
+              "created": 1792043985.534128,
+              "rss_bytes": 2789376,
+              "private_bytes": 471040
+            },
+            {
+              "pid": 27192,
+              "created": 1792043985.5394418,
+              "rss_bytes": 4636672,
+              "private_bytes": 729088
+            }
+          ],
+          "owned_rss_bytes": 7426048,
+          "owned_private_bytes": 1200128
+        },
+        "last_sample": {
+          "physical_available_bytes": 10371481600,
+          "physical_used_bytes": 22785961984,
+          "commit_total_bytes": 41431416832,
+          "commit_limit_bytes": 63222214656,
+          "commit_available_bytes": 21790797824,
+          "gpi_physical_available_bytes": 10371481600,
+          "kind": "memory",
+          "unix": 1792045369.4821932,
+          "elapsed_seconds": 1385.3824760999996,
+          "owned_processes": [
+            {
+              "pid": 26328,
+              "created": 1792043986.0094323,
+              "rss_bytes": 12156563456,
+              "private_bytes": 31037124608
+            },
+            {
+              "pid": 23516,
+              "created": 1792043985.534128,
+              "rss_bytes": 4104192,
+              "private_bytes": 811008
+            },
+            {
+              "pid": 27192,
+              "created": 1792043985.5394418,
+              "rss_bytes": 7708672,
+              "private_bytes": 1224704
+            },
+            {
+              "pid": 14772,
+              "created": 1792043985.54797,
+              "rss_bytes": 191709184,
+              "private_bytes": 202940416
+            }
+          ],
+          "owned_rss_bytes": 12360085504,
+          "owned_private_bytes": 31242100736
+        }
+      },
+      "guard": {
+        "samples": 1371,
+        "min_available_gib": 8.583515167236328,
+        "max_pagefile_used_gib": null,
+        "pagefile_available": false,
+        "pagefile_unavailable_reason": "No pagefile sample was collected.",
+        "stop_reason": null,
+        "min_commit_available_gib": 18.730636596679688,
+        "max_owned_rss_bytes": 12372602880,
+        "max_owned_private_bytes": 31288438784,
+        "cuda_stage_samples": 23,
+        "last_cuda_stage": {
+          "cuda_free_mib": 677,
+          "stage": "the completed request",
+          "enforced": true,
+          "observed_unix": 1792045359.7853577,
+          "source": "engine-log"
+        },
+        "min_enforced_cuda_free_mib": 677,
+        "cuda_coverage": "Engine stage samples only; no continuous VRAM telemetry",
+        "commit_source": "GetPerformanceInfo CommitLimit minus CommitTotal; not swap usage",
+        "elapsed_seconds": 1385.3830406999996
+      },
+      "requests": [
+        {
+          "label": "warmup",
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 24,
+          "prefill_seconds": 6.7271,
+          "decode_tokens_per_second": 7.2,
+          "wall_seconds": 15.63343858718872,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 26,
+          "completion_tokens": 9,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 26,
+          "prefill_seconds": 7.025,
+          "decode_tokens_per_second": 3.2,
+          "wall_seconds": 9.838569402694702,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 28,
+          "completion_tokens": 4,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 28,
+          "prefill_seconds": 6.3357,
+          "decode_tokens_per_second": 3.7,
+          "wall_seconds": 7.468116998672485,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 27,
+          "completion_tokens": 2,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 27,
+          "prefill_seconds": 6.259399999999999,
+          "decode_tokens_per_second": 8.3,
+          "wall_seconds": 6.54740047454834,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 56,
+          "completion_tokens": 9,
+          "cached_tokens": 28,
+          "new_prompt_tokens": 28,
+          "prefill_seconds": 3.5196,
+          "decode_tokens_per_second": 3.5,
+          "wall_seconds": 6.1238744258880615,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 40,
+          "completion_tokens": 54,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 40,
+          "prefill_seconds": 7.12,
+          "decode_tokens_per_second": 1.6,
+          "wall_seconds": 40.66591930389404,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 275,
+          "completion_tokens": 29,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 275,
+          "prefill_seconds": 65.8357,
+          "decode_tokens_per_second": 4.0,
+          "wall_seconds": 73.13995885848999,
+          "error": null
+        },
+        {
+          "label": "smoke",
+          "prompt_tokens": 342,
+          "completion_tokens": 53,
+          "cached_tokens": 303,
+          "new_prompt_tokens": 39,
+          "prefill_seconds": 7.2113000000000005,
+          "decode_tokens_per_second": 5.5,
+          "wall_seconds": 16.894323587417603,
+          "error": null
+        },
+        {
+          "label": "long-fresh-fit",
+          "prompt_tokens": 130880,
+          "completion_tokens": 27,
+          "cached_tokens": 0,
+          "new_prompt_tokens": 130880,
+          "prefill_seconds": 1160.4925,
+          "decode_tokens_per_second": 4.5,
+          "wall_seconds": 1166.8279838562012,
+          "error": null
+        },
+        {
+          "label": "long-reuse",
+          "prompt_tokens": 130944,
+          "completion_tokens": 14,
+          "cached_tokens": 130906,
+          "new_prompt_tokens": 38,
+          "prefill_seconds": 6.6385,
+          "decode_tokens_per_second": 5.9,
+          "wall_seconds": 9.333234310150146,
+          "error": null
+        }
+      ]
+    }
+  },
+  "post_cleanup": {
+    "recorded_at": "2026-10-15T15:23:37.733372+09:00",
+    "windows_memory": {
+      "physical_available_bytes": 24289636352,
+      "physical_used_bytes": 8867807232,
+      "commit_total_bytes": 10645258240,
+      "commit_limit_bytes": 63222214656,
+      "commit_available_bytes": 52576956416
+    },
+    "physical_available_gib": 22.62148666381836,
+    "nvidia_smi_supplemental": "10 MiB, 16036 MiB",
+    "no_strata_process": true,
+    "actual_cuda_free_after_exit": "Unavailable: owned engine context exited; no extra context created."
+  },
+  "baseline_changed_files": [],
+  "profile_still_frozen": true,
+  "desktop_acceptance_passed": true
+}

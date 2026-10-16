@@ -12,6 +12,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,10 +42,10 @@
 
 namespace fs = std::filesystem;
 
-#if defined(_WIN32)
 namespace strata::core::detail {
-// Test-only access to existing handles/state: no production fault-injection flag or hot-path branch.
+// Test-only access to handles/state and synthetic CPU memory snapshots, without environment fault controls.
 struct FileExpertSourceTestAccess {
+#if defined(_WIN32)
     static void* exchange_handle(FileExpertSource& s, size_t file, void* h, bool buffered) {
         void*& slot = buffered ? s.buffered_[file] : s.direct_[file];
         return std::exchange(slot, h);
@@ -53,9 +54,32 @@ struct FileExpertSourceTestAccess {
         return std::exchange(s.paths_[file], std::move(path));
     }
     static void set_busy(FileExpertSource& s, size_t slot, bool busy) { s.stage_busy_[slot] = busy ? 1 : 0; }
+#endif
+    static void stage_geometry(FileExpertSource& s, uint64_t small, uint64_t large) {
+        s.n_layers_ = 2;
+        s.n_expert_ = 32;
+        s.blobs_ = 64;
+        s.role_ptr_.resize(6, nullptr);
+        s.layer_blob_bytes_ = {small, large};
+        s.stage_blob_ = large;
+    }
+    static const uint8_t* claim(FileExpertSource& s, int64_t key, const HostMemory& memory,
+                                uint8_t value, bool publish = true) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        size_t slot = 0;
+        bool fill = false;
+        if (!s.claim_stage(key, slot, fill, false, &memory) && !fill)
+            throw std::runtime_error("synthetic stage claim failed");
+        if (fill) {
+            std::memset(s.stage_buf_[slot].get(), value, (size_t) s.stage_capacity_[slot]);
+            s.stage_busy_[slot] = publish ? 0 : 1;
+        }
+        return s.stage_buf_[slot].get();
+    }
+    static void age(FileExpertSource& s) { s.epoch_ += FileExpertSource::kStageAge; }
+    static bool has(FileExpertSource& s, int64_t key) { return s.stage_of_.count(key) != 0; }
 };
 }
-#endif
 
 namespace {
 
@@ -534,8 +558,23 @@ void test_pin_pacing() {
 
 void test_resident_memory_budget() {
     using strata::core::detail::clamp_resident_budget;
+    using strata::core::detail::resident_gib_bytes;
     constexpr uint64_t GiB = 1ull << 30, margin = 256ull << 20, headroom = 4 * GiB;
     constexpr uint64_t unlimited = std::numeric_limits<uint64_t>::max();
+    require(resident_gib_bytes(0) == 0 && resident_gib_bytes(4) == 4 * GiB && resident_gib_bytes(0.25, true) == GiB / 4,
+            "ordinary GiB requests changed during byte conversion");
+    require(resident_gib_bytes(1e-20, true) == 1 && resident_gib_bytes(std::numeric_limits<double>::denorm_min(), true) == 1,
+            "a positive sub-byte budget became the zero/full-complement sentinel");
+    require(resident_gib_bytes(1.0 / GiB, true) == 1 && resident_gib_bytes(1e-20) == 0,
+            "one-byte budget or sub-byte headroom conversion changed");
+    require(resident_gib_bytes(1e308, true) == unlimited && resident_gib_bytes(1e308) == unlimited &&
+                resident_gib_bytes(17179869184.0, true) == unlimited,
+            "an oversized finite GiB request did not saturate safely");
+    require(resident_gib_bytes(std::nextafter(17179869184.0, 0.0), true) == unlimited - 2047,
+            "the representable value below the uint64 boundary was cast out of range");
+    require(clamp_resident_budget(resident_gib_bytes(1e308, true), 10 * GiB, 10 * GiB, 8 * GiB) == 2 * GiB - margin &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 10 * GiB, resident_gib_bytes(1e308)) == 0,
+            "saturated budgets or headroom bypassed allocation checks");
     // #730: RAM can hold the requested cache, but Windows cannot commit it.
     require(clamp_resident_budget(66 * GiB, 69 * GiB, 47 * GiB, headroom) == 43 * GiB - margin,
             "a RAM budget exceeded available commit capacity");
@@ -559,6 +598,30 @@ void test_resident_memory_budget() {
     require(clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin - 1, headroom) == 0 &&
                 clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin, headroom) == 0,
             "subtracting the clamping margin underflowed");
+
+    // The recent cache must leave the resident policy's resolved floor after the RAM arena is allocated.
+    constexpr uint64_t resident_headroom = 8 * GiB;
+    require(clamp_resident_budget(6 * GiB, 10 * GiB, 10 * GiB, resident_headroom) == 2 * GiB - margin,
+            "a recent cache request consumed the resident policy's headroom");
+    require(clamp_resident_budget(6 * GiB, 10 * GiB, 12 * GiB, resident_headroom) == 2 * GiB - margin,
+            "a recent cache request exceeded physical memory above the resident floor");
+    require(clamp_resident_budget(6 * GiB, 12 * GiB, 10 * GiB, resident_headroom) == 2 * GiB - margin,
+            "a recent cache request exceeded commit capacity above the resident floor");
+    require(clamp_resident_budget(1 * GiB, 10 * GiB, 10 * GiB, resident_headroom) == 1 * GiB,
+            "a smaller recent cache request received a clamping margin");
+    require(clamp_resident_budget(2 * GiB, 10 * GiB, 10 * GiB, resident_headroom) == 2 * GiB,
+            "a recent cache request exactly above the resident floor was reduced");
+    require(clamp_resident_budget(6 * GiB, 8 * GiB, 10 * GiB, resident_headroom) == 0 &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 8 * GiB, resident_headroom) == 0,
+            "a recent cache request was admitted at the resident floor");
+    require(clamp_resident_budget(6 * GiB, 10 * GiB, 10 * GiB, 0) == 6 * GiB,
+            "a zero headroom override reduced a fitting recent cache request");
+    require(clamp_resident_budget(6 * GiB, 2 * GiB, 10 * GiB, 0) == 2 * GiB - margin &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 2 * GiB, 0) == 2 * GiB - margin,
+            "a zero headroom override ignored the memory limits");
+    require(clamp_resident_budget(6 * GiB, 0, 10 * GiB, 0) == 0 &&
+                clamp_resident_budget(6 * GiB, 10 * GiB, 0, 0) == 0,
+            "a zero headroom override admitted a cache with no available memory");
 }
 
 void test_cgroup_memory_budget() {
@@ -959,6 +1022,120 @@ void test_compact_file_cache() {
 }
 #endif
 
+void test_file_cache_headroom() {
+    using namespace strata::core;
+    using Access = detail::FileExpertSourceTestAccess;
+    constexpr uint64_t small = 32ull << 10, large = 64ull << 10, headroom = 1ull << 20;
+    constexpr uint64_t margin = 256ull << 20;
+    const uint64_t unlimited = ~uint64_t{0};
+    auto memory = [&](uint64_t physical, uint64_t commit) {
+        detail::HostMemory m;
+        m.available = physical;
+        m.commit = commit;
+        return m;
+    };
+    FileExpertSource source;
+    auto reset = [&](bool compact = true, uint64_t floor = 1ull << 20) {
+        source.close();
+        Access::stage_geometry(source, small, large);
+        source.set_file_cache_bytes(4 * large, compact, floor);
+    };
+    auto check = [&](uint64_t bytes, size_t buffers) {
+        const auto stats = source.file_cache_stats();
+        require(stats.allocated_bytes == bytes && stats.buffers == buffers,
+                "headroom cache capacity accounting changed");
+    };
+
+    // A late startup allocation lowers commit after initial admission. Growth uses the fresh reading,
+    // and existing charged capacities are not subtracted from that reading a second time.
+    reset();
+    source.set_file_cache_bytes(2 * small, true, headroom);
+    const uint8_t* first = Access::claim(source, 0, memory(unlimited, headroom + margin + 2 * small), 11);
+    Access::age(source);
+    Access::claim(source, 1, memory(unlimited, headroom + margin + small), 22);
+    check(2 * small, 2);
+    require(first[0] == 11, "room for one additional expert failed to retain the aged expert");
+    source.set_file_cache_bytes(4 * small, true, headroom);
+    Access::age(source);
+    const uint8_t* reused = Access::claim(source, 2, memory(unlimited, headroom + margin + small - 1), 32);
+    check(2 * small, 2);
+    require(reused == first, "one byte below replacement margin admitted optional growth");
+    Access::age(source);
+    Access::claim(source, 3, memory(unlimited, headroom + margin + small), 34);
+    check(3 * small, 3);
+    require(first[0] == 32, "exact allocation-margin boundary failed to grow without eviction");
+    Access::age(source);
+    reused = Access::claim(source, 4, memory(unlimited, headroom), 33);
+    check(small, 1);
+    require(!Access::has(source, 0) && reused[0] == 33, "commit pressure did not reuse safe storage and reclaim cold buffers");
+
+    // Physical RAM independently limits optional retention, including the largest-blob policy.
+    reset(false);
+    first = Access::claim(source, 0, memory(headroom + margin + large, unlimited), 44);
+    Access::age(source);
+    reused = Access::claim(source, 1, memory(headroom, unlimited), 55);
+    check(large, 1);
+    require(reused == first, "physical pressure grew the largest-blob cache");
+
+    // Prefer a fitting capacity even when a smaller, older victim cannot hold the requested bytes.
+    reset();
+    Access::claim(source, 0, memory(unlimited, unlimited), 66);
+    const uint8_t* fitting = Access::claim(source, 32, memory(unlimited, unlimited), 77);
+    Access::age(source);
+    reused = Access::claim(source, 33, memory(headroom, headroom), 88);
+    require(reused == fitting && reused[large - 1] == 88,
+            "pressure allocated a replacement instead of reusing an oversized capacity");
+    check(large, 1);
+    require(!Access::has(source, 0), "pressure failed to reclaim excess eligible retention");
+    // A compact shrink would allocate before freeing the old capacity. Keep the charged larger buffer.
+    reset();
+    source.set_file_cache_bytes(large, true, headroom);
+    fitting = Access::claim(source, 32, memory(unlimited, unlimited), 89);
+    Access::age(source);
+    reused = Access::claim(source, 0, memory(headroom, headroom), 90);
+    require(reused == fitting && reused[large - 1] == 90, "compact shrink allocated under pressure");
+    check(large, 1);
+
+    // Other applications can take memory after retention grows. Reclaim only aged entries; buffers
+    // still inside their layer lifetime and pending fills remain valid even if mandatory staging grows.
+    reset();
+    first = Access::claim(source, 0, memory(unlimited, unlimited), 99, false);
+    const uint8_t* live = Access::claim(source, 1, memory(unlimited, unlimited), 100);
+    Access::claim(source, 32, memory(0, 0), 101);
+    check(2 * small + large, 3);
+    require(first[0] == 99 && live[0] == 100, "mandatory staging overwrote protected buffers");
+    Access::age(source);
+    Access::claim(source, 2, memory(0, 0), 102);
+    check(2 * small, 2);
+    require(first[0] == 99 && Access::has(source, 0), "pressure reclaimed an in-flight buffer");
+
+    // Saturated readings and Linux's absent commit limit do not wrap the retained-capacity allowance.
+    reset();
+    Access::claim(source, 0, memory(unlimited - small, unlimited), 103);
+    Access::age(source);
+    Access::claim(source, 1, memory(unlimited - small, unlimited), 104);
+    check(2 * small, 2);
+    Access::age(source);
+    Access::claim(source, 2, memory(unlimited - small, unlimited), 105);
+    check(3 * small, 3);
+    reset(true, 0);
+    first = Access::claim(source, 0, memory(small, small), 105);
+    Access::age(source);
+    reused = Access::claim(source, 1, memory(0, 0), 106);
+    require(reused == first, "zero headroom ignored exhausted memory");
+    check(small, 1);
+
+    // Existing callers retain their original caller-budgeted growth behavior.
+    source.close();
+    Access::stage_geometry(source, small, large);
+    source.set_file_cache_bytes(4 * large, true);
+    Access::claim(source, 0, memory(0, 0), 107);
+    Access::age(source);
+    Access::claim(source, 1, memory(0, 0), 108);
+    check(2 * small, 2);
+    std::cout << "recent cache headroom: fresh RAM/commit, charged capacities, safe reuse, protected staging, reset PASS\n";
+}
+
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
 void test_host_memory() {
@@ -1196,6 +1373,7 @@ int main(int argc, char** argv) {
         test_fetch_profiling();
         test_recent_file_cache();
         test_io_prefetch();
+        test_file_cache_headroom();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
         test_direct_mapping_retirement();
