@@ -966,6 +966,10 @@ thermal state during every request.
 This diagnostic used the same requested settings, but the engine's post-verifier memory check
 reclamped the recent cache from 4051 to 2713.1 MiB; actual buffers varied below that target.
 Instrumentation and different realized cache capacity prevent a clean speed comparison with 18/23.
+Subsequent source verification also found that this diagnostic bundle enables
+`STRATA_VERIFY_PROFILE`: its presence sets `prof_on_`, which disables shared-expert overlap in
+the verifier. Setting it to `0` still enables it. Its effect is more than timer overhead;
+future phase diagnostics should leave that variable absent unless specifically measuring this path.
 The supported conclusion is a reproduced read-service slowdown, accompanied by worsening physical
 disk latency and stable GPU-reach timing and budget accounting. It does not prove that the exact
 same event caused 23 or earlier desktop stalls. Further OS/storage attribution remains open;
@@ -977,6 +981,47 @@ unchanged. The automatic candidate still matched its frozen measurement copy aft
 the policy metadata, with empty memory overrides and an unchanged generated launcher. NVIDIA
 reported 513 MiB used and 15533 MiB free after cleanup. The model drive then had about 17 GiB free;
 the additional pack remains local, and no existing model or working configuration was removed.
+
+### Returned research: stager-thread comparison
+
+Source checks confirmed that `copy_blob()` and `copy_blobs()` bypass ready entries in the recent
+cache, but the current 27/38-token text suffixes use verifier windows at the default short-read
+threshold of 64. Ready-copy reuse therefore needs an opportunity measurement on batched prefill;
+it is not a demonstrated fix for those cached-response stalls. The stream-all prefill path schedules
+non-GPU experts before routing, while its fallback filters actual demand. The amount of unnecessary
+cold file traffic is unmeasured; selecting the fallback also changes buffer and kernel conditions.
+
+The existing stager controls were then compared in A-B-B-A order, with only
+`STRATA_STAGER_THREADS` changing between 32 and 16. Both arms explicitly used host ring 128,
+batch 1, the same frozen 8 GiB pinned/4051 MiB recent/4 GiB headroom requests, and no verifier
+profiling. Capacity remained 131072, KV int8, eager CUDA and shipped placement. These are
+unattended screens, not watched responsiveness acceptance or new 128K tests.
+
+| Trial | Stager threads | 8192-token prefill, seconds | Full 8K request, seconds | Three-prompt decode tokens/s | Three cached follow-ups, seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 25 | 32 | 59.55 | 62.68 | 12.83 | 23.03 |
+| 26 | 16 | 23.36 | 26.49 | 16.80 | 13.16 |
+| 27 | 16 | 22.84 | 26.29 | 17.43 | 13.38 |
+| 28 | 32 | 23.62 | 31.15 | 17.48 | 12.95 |
+
+The final control returned close to the candidates' prefill times. Neither candidate's prefill time
+beat that control by the predeclared 5% screening margin; the apparent mean gain is driven by the slow
+first control. These results do not establish a dependable stager-thread speedup. The decode
+cases precede the batched 8K prompt and are not evidence that fewer stager threads accelerated
+direct decode reads. The candidate and shared defaults remain unchanged.
+
+Effective settings matched apart from thread count, all engine metadata matched, GPU expert slots
+remained 5270, and both cache-sizing reports retained 4051 MiB in every arm. All correctness,
+retrieval, frozen-profile, protected-file and owned-process cleanup checks passed, with no guard
+trigger. Across these screens minimum available RAM was 4.253 GiB, available Windows commit
+15.803 GiB and logged CUDA-free memory 679 MiB. Results and final preservation checks are local
+in `.claude/4080s-perf-20261016/stager-comparison.json`; the earlier sweep's summary is preserved.
+
+At cleanup the model volume had about 172.5 GiB free, compared with 16.8 GiB in the earlier
+snapshot. The user confirmed clearing space manually, without establishing its timing relative to
+the arms. This comparison did not record free space at each arm's start, so the timing and effect
+are not established. The change must not be used to explain a particular stall. Further read-service
+attribution and ready-copy opportunity measurement remain open.
 
 ## Earlier RTX 4080 SUPER desktop validation at 128K
 
