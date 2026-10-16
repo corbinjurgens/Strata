@@ -4588,7 +4588,23 @@ int main(int argc, char** argv) {
                 why = std::string("expert cache auto: cudaDeviceSynchronize failed: ") + cudaGetErrorString(status);
                 return false;
             },
-            [&]() -> int64_t { return (int64_t) strata::core::device_free_bytes(); },
+            [&](int64_t& available, std::string& why) -> bool {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+                // Windows CUDA only: device_free_bytes ignores the cudaMemGetInfo status and returns 0 on failure,
+                // which a failed query would then hand to readiness arithmetic as if it were a real reading
+                // (accepted at a 64 MiB reserve, shrunk at 512 MiB).
+                size_t query_free = 0, query_total = 0;
+                if (const cudaError_t status = cudaMemGetInfo(&query_free, &query_total); status != cudaSuccess) {
+                    why = std::string("expert cache auto: cudaMemGetInfo failed: ") + cudaGetErrorString(status);
+                    return false;
+                }
+                available = (int64_t) query_free;
+#else
+                (void) why;   // checked only on Windows CUDA: HIP/SYCL/non-Windows keep device_free_bytes unchanged
+                available = (int64_t) strata::core::device_free_bytes();
+#endif
+                return true;
+            },
             [&]() -> bool {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
                 // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
