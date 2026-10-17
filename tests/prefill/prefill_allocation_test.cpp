@@ -5,10 +5,16 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/prefill/kernels.hpp"
+#include "strata/core/peer_experts.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +74,7 @@ void allocation_layouts() {
         err.clear();
         require(prefill.init(wt, g, ss, nullptr, nullptr, nullptr, chunk, nullptr, err), err);
         require(prefill.chunk() == chunk, "owned chunk capacity changed");
+        require(!prefill.shared_stage(), "default/manual init selected the private layout");
         prefill.reset();
     }
     const uint64_t borrowed = pf::Prefill::bytes_needed(g, ss, 257);
@@ -85,6 +92,80 @@ void allocation_layouts() {
     prefill.reset();
     require(pf::Prefill::bytes_needed(g, ss, 0) == 0, "zero chunk must not price a huge layout");
     require(!prefill.init(wt, g, ss, nullptr, nullptr, nullptr, 0, nullptr, err), "zero chunk accepted");
+}
+
+void shared_owner_layouts() {
+    strata::core::ModelGeometry g;
+    strata::core::WeightTable wt;
+    strata::core::QsaState q;
+    q.kv_mode = 1;
+    strata::core::SessionState ss;
+    ss.qsa_states = &q;
+    std::string err;
+    const char* prefetch = std::getenv("STRATA_KV_PREFETCH");
+    const bool excluded = std::getenv("STRATA_KV_STAGE_OWN") != nullptr || (prefetch && std::atoi(prefetch) != 0);
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    const bool expect_shared = !excluded;
+#else
+    const bool expect_shared = false;
+    (void) excluded;
+#endif
+    pf::Prefill shared, normal;
+    for (int64_t cells : {65536, 131072}) {
+        q.max_cells = cells; q.n_pages = cells / 4;
+        q.kv_mode = 0;
+        const uint64_t no_stage = pf::Prefill::bytes_needed_owned(g, ss, 17);
+        q.kv_mode = 1;
+        // Independent expected page-rounded staging prices: q4, int8, fp16 and K8V4, in that order.
+        const uint64_t prices64[] = {40, 72, 132, 56}, prices128[] = {76, 140, 260, 108};
+        for (int format = 0; format < 4; ++format) {
+            q.kv_q4 = format == 0; q.kv_int8 = format == 1; q.kv_hybrid = format == 3;
+            const uint64_t owned = pf::Prefill::bytes_needed_owned(g, ss, 17);
+            const uint64_t loan = pf::Prefill::bytes_needed(g, ss, 17);
+            if (std::getenv("STRATA_KV_STAGE_OWN") == nullptr)
+                require(owned - no_stage == (cells == 65536 ? prices64[format] : prices128[format]) * (1ull << 20),
+                        "format-aware unshared stage price changed");
+            // A maximal remaining-priced hint forces pressure without a production query/fault hook.
+            require(shared.init(wt, g, ss, nullptr, nullptr, nullptr, 17, nullptr, err,
+                                nullptr, 0, true, UINT64_MAX), err);
+            require(shared.shared_stage() == expect_shared, "private pressure/backend/prefetch/stage-own admission differs");
+            require(pf::Prefill::bytes_needed_owned(g, ss, 17) == owned && pf::Prefill::bytes_needed(g, ss, 17) == loan,
+                    "selecting a physical shared slab changed the conservative prices");
+            if (expect_shared) {
+                require(!shared.set_stage_helper(&normal, err), "shared owner accepted a helper");
+                require(!normal.set_stage_helper(&shared, err), "normal owner accepted a shared helper");
+                require(!shared.set_stage_helper(nullptr, err), "shared owner accepted helper detachment");
+                require(!shared.set_stage_helper(&shared, err), "shared owner accepted helper no-op");
+                strata::core::PeerExperts invalid;
+                require(!shared.set_peer(nullptr, 1, err), "shared owner accepted null peer detachment");
+                require(!shared.set_peer(&invalid, 1, err), "shared owner accepted invalid peer detachment");
+                require(shared.shared_stage() && shared.chunk() == 17 && !normal.shared_stage() && normal.chunk() == 0,
+                        "rejected attachments changed either participant's selected layout/chunk");
+            }
+            shared.reset();
+            require(!shared.shared_stage() && shared.chunk() == 0, "reset retained the shared layout");
+            err.clear();
+        }
+    }
+    q.kv_hybrid = false; q.kv_q4 = true;
+    const uint64_t borrowed = pf::Prefill::bytes_needed(g, ss, 17);
+    Dev arena((size_t) borrowed);
+    require(shared.init(wt, g, ss, nullptr, nullptr, nullptr, 17, nullptr, err,
+                        arena.p, borrowed, true, UINT64_MAX), err);
+    require(!shared.shared_stage(), "borrowed arena selected sharing");
+    shared.reset();
+    q.kv_mode = 0;
+    require(shared.init(wt, g, ss, nullptr, nullptr, nullptr, 17, nullptr, err,
+                        nullptr, 0, true, UINT64_MAX), err);
+    require(!shared.shared_stage(), "resident KV selected sharing");
+    shared.reset();
+    q.kv_mode = 1;
+    shared.set_stage(1, -1, nullptr);
+    require(shared.init(wt, g, ss, nullptr, nullptr, nullptr, 17, nullptr, err,
+                        nullptr, 0, true, UINT64_MAX), err);
+    require(!shared.shared_stage(), "partial layer stage selected sharing");
+    shared.reset();
+    arena.guard();
 }
 
 // Run separately with STRATA_PREFILL_DEMAND_ONLY=1 and STRATA_PREFILL_STREAM_MIN=1024. A 96-slot allocation
@@ -196,6 +277,134 @@ void selection_bounds(int64_t queries, bool tensor_core) {
     require(a == b, "selection differs with exact-sized scratch");
 }
 
+// Exercise the real stage DMA and append into a previously used GEMM slab. Only the old prefix and appended
+// cells become finite; the rest of each full-capacity pool stays NaN-poisoned, including a partial last page.
+void staged_attention_bounds(int64_t queries, bool q4, int64_t cells, int64_t prefix) {
+    const auto s = k::qsa_real_shapes();
+    const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
+    const size_t stride = (size_t) k::qsa_decode_attn_scratch_floats(cap, s);
+    const size_t row_bytes = q4 ? 144 : 512;
+    const size_t plane = (size_t) cells * s.n_head_kv * row_bytes;
+    const size_t v_offset = (size_t) pf::detail::buffer_bytes(plane);
+    const size_t stage_bytes = 2 * v_offset;
+    const auto layout = pf::detail::shared_gemm_stage_layout(64ull << 20, 8ull << 20, stage_bytes);
+    Dev shared((size_t) layout.shared_payload_bytes), separate(stage_bytes);
+    ck(cudaMemset(shared.p, 0xff, shared.bytes), "poison old GEMM image and workspace");
+    ck(cudaMemset(separate.p, 0x7f, separate.bytes), "poison separate staging image differently");
+    struct Host {
+        unsigned char* p = nullptr;
+        explicit Host(size_t bytes) {
+            ck(cudaHostAlloc((void**) &p, bytes, cudaHostAllocMapped), "allocate stage host prefix");
+            std::memset(p, 0xff, bytes);
+        }
+        ~Host() { cudaFreeHost(p); }
+    } host(stage_bytes);
+    for (int64_t cell = 0; cell < prefix; ++cell) for (int64_t h = 0; h < s.n_head_kv; ++h) {
+        const size_t row = (size_t) ((cell / s.page_size * s.n_head_kv + h) * s.page_size + cell % s.page_size);
+        for (size_t off : {size_t(0), v_offset}) {
+            unsigned char* dst = host.p + off + row * row_bytes;
+            if (q4) for (size_t b = 0; b < row_bytes; b += 18) {
+                const uint16_t scale = 0x3000;
+                std::memcpy(dst + b, &scale, 2);
+                std::memset(dst + b + 2, (int) (0x65 + (cell + h) % 5), 16);
+            } else for (size_t d = 0; d < row_bytes; d += 2) {
+                const uint16_t value = (uint16_t) (0x3400 + (cell + h + d) % 5 * 0x100);
+                std::memcpy(dst + d, &value, 2);
+            }
+        }
+    }
+    auto host_pools = [&](unsigned char* base) {
+        k::KvHostPools p;
+        if (q4) { p.k_q4 = base; p.v_q4 = base + v_offset; }
+        else { p.k_pool = reinterpret_cast<uint16_t*>(base); p.v_pool = reinterpret_cast<uint16_t*>(base + v_offset); }
+        return p;
+    };
+    const auto hp = host_pools(host.p);
+    const auto a = host_pools(shared.as<unsigned char>()), b = host_pools(separate.as<unsigned char>());
+    std::vector<int32_t> table((size_t) cells / s.page_size), missing(table.size(), -1);
+    for (size_t i = 0; i < table.size(); ++i) table[i] = (int32_t) i;
+    std::vector<int32_t> steps((size_t) queries * k::kStepCount), ids((size_t) queries * cap, -1);
+    for (int64_t i = 0; i < queries; ++i) {
+        k::qsa_step_fill(steps.data() + i * k::kStepCount, prefix + i, s);
+        // A partial 32-cell tensor tile and 64-cell decode tile, reading the new tail as well as the old prefix.
+        const int64_t width = std::min<int64_t>(prefix + i + 1, 65 + i % 4);
+        steps[(size_t) i * k::kStepCount + k::kStepWidth] = (int32_t) width;
+        for (int64_t j = 0; j < width; ++j)
+            ids[(size_t) (i * cap + j)] = (int32_t) (prefix + i + 1 - width + j);
+    }
+    std::vector<float> x((size_t) queries * s.n_head * s.head_dim), current((size_t) queries * 512);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = ((int) (i % 37) - 18) * 0.025f;
+    for (size_t i = 0; i < current.size(); ++i) current[i] = ((int) (i % 29) - 14) * 0.0625f;
+    Dev dt(table.size() * 4), dm(missing.size() * 4), ds(steps.size() * 4), di(ids.size() * 4),
+        dx(x.size() * 4), dc(current.size() * 4), scratch((size_t) queries * stride * 4),
+        out(x.size() * 4), ref(x.size() * 4);
+    dt.upload(table); dm.upload(missing); ds.upload(steps); di.upload(ids); dx.upload(x); dc.upload(current);
+    auto pools = [&](const k::KvHostPools& p) {
+        k::QsaAttnPools r;
+        r.k_pool = p.k_pool; r.v_pool = p.v_pool; r.k_q4 = p.k_q4; r.v_q4 = p.v_q4;
+        r.page_table = dt.as<int32_t>();
+        return r;
+    };
+    for (const auto& p : {a, b}) {
+        unsigned char* base = q4 ? p.k_q4 : reinterpret_cast<unsigned char*>(p.k_pool);
+        ck(cudaMemset(base + plane, 0xa5, 256), "set K slice guard");
+        ck(cudaMemset(base + v_offset + plane, 0xa5, 256), "set V slice guard");
+        k::kv_stage_from_host(pools(p), hp, q4 ? k::kKvQ4 : k::kKvF16,
+                             (prefix + s.page_size - 1) / s.page_size, s, nullptr);
+        if (q4) k::kv_append_q4(p.k_q4, p.v_q4, dm.as<int32_t>(), prefix, queries,
+                                dc.as<float>(), dc.as<float>(), s, nullptr, nullptr, &p);
+        else pf::kv_append(dc.as<float>(), dc.as<float>(), queries, prefix, dm.as<int32_t>(), s.page_size,
+                           p.k_pool, p.v_pool, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &p);
+    }
+    auto compare = [&](bool tensor) {
+        const bool launched_a = tensor && k::qsa_prompt_attn_batch(dx.as<float>(), pools(a), di.as<int32_t>(),
+            ds.as<int32_t>(), cap, s, out.as<float>(), queries, nullptr);
+        const bool launched_b = tensor && k::qsa_prompt_attn_batch(dx.as<float>(), pools(b), di.as<int32_t>(),
+            ds.as<int32_t>(), cap, s, ref.as<float>(), queries, nullptr);
+        require(launched_a == launched_b, "shared pool changed tensor attention dispatch");
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+        if (tensor && q4) {
+            int device = 0, major = 0;
+            ck(cudaGetDevice(&device), "tensor fixture device");
+            ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device), "tensor fixture capability");
+            const char* warp = std::getenv("STRATA_QSA_WARP");
+            const char* q4_mode = std::getenv("STRATA_PROMPT_ATTN_Q4");
+            const bool forced_warp = warp && (!std::strcmp(warp, "1") || !std::strcmp(warp, "attn"));
+            if (major >= 8 && !forced_warp && !(q4_mode && q4_mode[0] == '0'))
+                require(launched_a, "supported default q4 tensor attention was not exercised");
+        }
+#endif
+        if (!launched_a) {
+            k::qsa_decode_attn_batch(dx.as<float>(), pools(a), di.as<int32_t>(), ds.as<int32_t>(), cap, s,
+                                    scratch.as<float>(), out.as<float>(), queries, nullptr);
+            k::qsa_decode_attn_batch(dx.as<float>(), pools(b), di.as<int32_t>(), ds.as<int32_t>(), cap, s,
+                                    scratch.as<float>(), ref.as<float>(), queries, nullptr);
+        }
+        ck(cudaDeviceSynchronize(), "poisoned stage attention sync");
+        std::vector<float> av(x.size()), bv(x.size());
+        ck(cudaMemcpy(av.data(), out.p, av.size() * 4, cudaMemcpyDeviceToHost), "shared poisoned attention result");
+        ck(cudaMemcpy(bv.data(), ref.p, bv.size() * 4, cudaMemcpyDeviceToHost), "separate poisoned attention result");
+        require(std::all_of(av.begin(), av.end(), [](float v) { return std::isfinite(v); }) &&
+                std::all_of(bv.begin(), bv.end(), [](float v) { return std::isfinite(v); }),
+                "attention read poisoned unwritten cells");
+        require(std::memcmp(av.data(), bv.data(), av.size() * 4) == 0, "shared and separate staged attention differ");
+        std::printf("staged attention: cells=%lld prefix=%lld queries=%lld q4=%d tensor=%d\n",
+                    (long long) cells, (long long) prefix, (long long) queries, (int) q4, (int) launched_a);
+    };
+    compare(false);   // Forced decode fallback, regardless of tensor availability.
+    compare(true);
+    for (Dev* image : {&shared, &separate}) {
+        for (size_t offset : {plane, v_offset + plane}) {
+            std::vector<unsigned char> guard(256);
+            ck(cudaMemcpy(guard.data(), image->as<unsigned char>() + offset, guard.size(), cudaMemcpyDeviceToHost),
+               "read stage slice guard");
+            require(std::all_of(guard.begin(), guard.end(), [](auto v) { return v == 0xa5; }), "stage exceeded a plane guard");
+        }
+        image->guard();
+    }
+    scratch.guard(); out.guard(); ref.guard(); dt.guard(); dm.guard(); ds.guard(); di.guard(); dc.guard(); dx.guard();
+}
+
 void attention_bounds(int64_t queries, bool q4) {
     const auto s = k::qsa_real_shapes();
     constexpr int64_t cells = 128, width = 68;
@@ -236,6 +445,9 @@ void attention_bounds(int64_t queries, bool q4) {
     ck(cudaMemcpy(a.data(), out.p, a.size() * 4, cudaMemcpyDeviceToHost), "attention results");
     ck(cudaMemcpy(b.data(), ref.p, b.size() * 4, cudaMemcpyDeviceToHost), "attention reference");
     require(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "attention differs with exact-sized scratch");
+    if (queries == 17) for (int64_t capacity : {65536, 131072})
+        for (int64_t prefix : {int64_t(0), int64_t(67), capacity - 35})
+            staged_attention_bounds(queries, q4, capacity, prefix);
 }
 }  // namespace
 
@@ -250,6 +462,7 @@ int main(int argc, char** argv) {
         }
         require(argc == 1, "unknown allocation fixture argument");
         allocation_layouts();
+        shared_owner_layouts();
         for (int64_t n : {1, 15, 16, 17, 31, 32, 33, 63, 64, 255, 256}) {
             selection_bounds(n, false);
             selection_bounds(n, true);

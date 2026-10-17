@@ -394,10 +394,11 @@ Gemm::~Gemm() {
 #if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
 namespace {
 // STRATA_TRACE, Windows CUDA only (the established Windows-CUDA predicate): exact-byte free-memory samples around
-// init_external's cublasCreate and setup.  The caller allocated the scratch and the workspace before this function,
-// so both samples already include them: only the change between two samples belongs to what ran between them, and
-// no sample re-prices them as handle cost.  A failed sync or query prints both statuses and no value - a failed
-// query is never a zero measurement.  Trace-off runs no CUDA call and prints nothing.
+// init_external's cublasCreate and setup. Samples include scratch/workspace only if the caller allocated them
+// before this function (the private owned pressure path prepares with null buffers, then rebinds). Only the change
+// between samples belongs to what ran between them; no sample re-prices buffers as handle cost. A failed sync or
+// query prints both statuses and no value; a failed query is never a zero measurement. Trace-off runs no CUDA call
+// and prints nothing.
 constexpr uint64_t kTraceUnread = ~0ull;   // the sample could not be read: report no value, not zero
 uint64_t trace_free_bytes(const char* where) {
     if (std::getenv("STRATA_TRACE") == nullptr) return kTraceUnread;
@@ -418,7 +419,7 @@ uint64_t trace_free_bytes(const char* where) {
 #endif
 
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                         std::string& err) {
+                         std::string& err, bool require_stream_binding) {
     cublasHandle_t h = nullptr;
 #if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
     const uint64_t free_pre = trace_free_bytes("before cublasCreate");
@@ -436,7 +437,12 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     handle_ = h;
     stream_ = stream;
     external_ = true;
-    note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
+    const cublasStatus_t stream_status = cublasSetStream(h, (cudaStream_t) stream);
+    if (require_stream_binding && stream_status != CUBLAS_STATUS_SUCCESS) {
+        err = "prefill gemm: cublasSetStream: cuBLAS status " + std::to_string((int) stream_status);
+        return false;
+    }
+    note(stream_status, "cublasSetStream");
     workspace_ = workspace;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");

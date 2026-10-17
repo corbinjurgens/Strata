@@ -30,6 +30,14 @@ int main() {
         check(c.select <= 256 && c.attention <= 32, "retain original large-chunk launch limits");
     }
     constexpr uint64_t MiB = 1ull << 20;
+    static_assert(!d::shared_stage_pressure(420 * MiB, 80 * MiB, 20 * MiB), "exact boundary is healthy");
+    check(!d::shared_stage_pressure(420 * MiB, 80 * MiB, 20 * MiB), "exact pressure threshold stays separate");
+    check(d::shared_stage_pressure(420 * MiB - 1, 80 * MiB, 20 * MiB), "one byte below threshold selects pressure");
+    check(!d::shared_stage_pressure(420 * MiB + 1, 80 * MiB, 20 * MiB), "one byte above threshold stays separate");
+    check(d::shared_stage_pressure(0, 0, 0), "zero free memory is pressure");
+    check(d::shared_stage_pressure(UINT64_MAX, UINT64_MAX, 1), "normal plus late overflow cannot look healthy");
+    check(d::shared_stage_pressure(UINT64_MAX, UINT64_MAX - 1, 0), "floor overflow cannot look healthy");
+    check(!d::shared_stage_pressure(UINT64_MAX, 0, 0), "large healthy free count is retained");
     const std::array<uint64_t, 2> fallback = {1280ull * 2560 * 2, 2560ull * 640 * 2};
     // Mixed low-bit packs, Q8 experts whose group exceeds 64 MiB, and builds without MMQ. Include odd tails to
     // ensure alignment does not make the two simultaneous images overlap.

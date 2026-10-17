@@ -400,7 +400,8 @@ Gemm::~Gemm() {
 
 bool Gemm::init_external(void *stream, uint16_t *scratch, int64_t scratch_elems,
                          void *workspace, size_t ws_bytes,
-                         std::string &err) try {
+                         std::string &err, bool require_stream_binding) try {
+    (void) require_stream_binding;
     dpct::blas::descriptor_ptr h = nullptr;
     if (const int s = DPCT_CHECK_ERROR(h = new dpct::blas::descriptor());
         s != 0) {

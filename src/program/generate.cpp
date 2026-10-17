@@ -4288,6 +4288,19 @@ int main(int argc, char** argv) {
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
+    // Private prototype permission uses the original automatic-cache choice and the planned topology, before
+    // peers/helpers are attached. The owner repeats its physical invariants and chooses only under pressure.
+    auto allow_shared_stage = [&](const void* borrow) -> bool {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+        const char* v = std::getenv("STRATA_PREFILL_SHARED_STAGE");
+        return auto_cache && v != nullptr && std::strcmp(v, "1") == 0 && borrow == nullptr &&
+               o.peer_device < 0 && !multi_gpu && !split_same && stages.empty() &&
+               o.batch == 0 && o.batch_groups == 1 && o.pipeline_windows == 0;
+#else
+        (void) borrow;
+        return false;
+#endif
+    };
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
     const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
@@ -4295,6 +4308,7 @@ int main(int argc, char** argv) {
     // The post-touch check must retain the same later allocations as the initial sizing.  Only the base reserve
     // can be adapted below; the owned prompt buffers, draft binding and pipeline buffers still have to fit.
     int64_t auto_cache_late_bytes = pipe_first;
+    uint64_t remaining_priced_late_bytes = (uint64_t) pipe_first;
     if (pipe_first > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
@@ -4375,6 +4389,7 @@ int main(int argc, char** argv) {
         for (const auto& d : slot_mtp)
             mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
         auto_cache_late_bytes = (prefill_mib << 20) + mtp_bind + pipe_first;
+        remaining_priced_late_bytes = (uint64_t) (mtp_bind + pipe_first);
         const int64_t reserve = ((int64_t) o.vram_reserve_mib << 20) + auto_cache_late_bytes;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
@@ -6669,7 +6684,8 @@ int main(int argc, char** argv) {
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
             mem_mark("before the prompt path initialization");
-            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
+                         allow_shared_stage(borrow), remaining_priced_late_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
         };
@@ -11386,7 +11402,7 @@ int main(int argc, char** argv) {
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
+                          borrow_bytes, allow_shared_stage(borrow), remaining_priced_late_bytes)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

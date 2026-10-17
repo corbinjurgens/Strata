@@ -15,6 +15,15 @@ constexpr PromptBatchCaps prompt_batch_caps(size_t chunk) {
             static_cast<int64_t>(std::min<size_t>(chunk, 32))};
 }
 
+// Heuristic only: retain the normal owned price, remaining explicitly priced late buffers, the existing
+// 256 MiB Windows CUDA floor and 64 MiB allocator allowance. Subtraction also handles an overflowing sum.
+constexpr bool shared_stage_pressure(uint64_t free_bytes, uint64_t normal_owned_bytes, uint64_t remaining_late_bytes) {
+    if (normal_owned_bytes > free_bytes) return true;
+    free_bytes -= normal_owned_bytes;
+    if (remaining_late_bytes > free_bytes) return true;
+    return free_bytes - remaining_late_bytes < (256ull << 20) + (64ull << 20);
+}
+
 // These weight images are used successively on the compute stream. The MMQ gate/up and down images coexist,
 // as do the fallback ring's pairs; neither overlaps its own slice. The dense GEMM keeps its original capacity.
 struct WeightScratchLayout {

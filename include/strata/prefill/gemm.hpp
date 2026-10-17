@@ -22,8 +22,9 @@ public:
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
     bool init(void* stream, int64_t scratch_elems, std::string& err);
     /// The same with caller-owned device buffers (the prompt path borrowing expert-cache slots).
+    /// Private preparation may require stream binding to succeed; false preserves the legacy setup diagnostics.
     bool init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                       std::string& err);
+                       std::string& err, bool require_stream_binding = false);
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
     /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM (Turing with
