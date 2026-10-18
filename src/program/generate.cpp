@@ -4288,12 +4288,11 @@ int main(int argc, char** argv) {
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
-    // Private prototype permission uses the original automatic-cache choice and the planned topology, before
+    // The owner's permission uses the original automatic-cache choice and the planned topology, before
     // peers/helpers are attached. The owner repeats its physical invariants and chooses only under pressure.
     auto allow_shared_stage = [&](const void* borrow) -> bool {
 #if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
-        const char* v = std::getenv("STRATA_PREFILL_SHARED_STAGE");
-        return auto_cache && v != nullptr && std::strcmp(v, "1") == 0 && borrow == nullptr &&
+        return auto_cache && borrow == nullptr &&
                o.peer_device < 0 && !multi_gpu && !split_same && stages.empty() &&
                o.batch == 0 && o.batch_groups == 1 && o.pipeline_windows == 0;
 #else

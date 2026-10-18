@@ -1106,7 +1106,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         const uint64_t normal_bytes = bytes_needed_owned(g, ss, chunk);
         select_shared_stage = detail::shared_stage_pressure(free_bytes, normal_bytes, remaining_priced_late_bytes);
-        std::fprintf(stderr, "prefill: private shared-stage pressure heuristic free_bytes=%llu normal_owned_bytes=%llu "
+        std::fprintf(stderr, "prefill: shared-stage pressure heuristic free_bytes=%llu normal_owned_bytes=%llu "
                      "remaining_priced_late_bytes=%llu floor_bytes=268435456 allocator_bytes=67108864 selected=%s; "
                      "later reserve-absorbed allocations and growth still require verification\n",
                      (unsigned long long) free_bytes, (unsigned long long) normal_bytes,

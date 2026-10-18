@@ -780,6 +780,45 @@ alongside 37-file hash maps; full 55-file per-arm post-maps were not saved.
 Raw arms, layouts, protection receipts and telemetry are under
 `build-unsloth/cross-pc-memory-20261018-desktop-evidence-r1/`.
 
+## Automatic shared-stage selection on Windows CUDA, 2026-10-18
+
+The eligible Windows CUDA automatic path now selects the shared stage under memory pressure without
+`STRATA_PREFILL_SHARED_STAGE`. It still requires an automatic expert cache and owned prompt buffers;
+peer, split, pipeline, batch and helper paths remain excluded, as do non-Windows, HIP and SYCL builds.
+The owner retains its physical eligibility checks and selects separate buffers when pressure is
+absent. Explicit expert-cache counts do not adapt, and explicit reserve values retain their meaning.
+
+The heuristic retains a known selection gap: its 320 MiB post-handle slack threshold is below the
+later costs measured on the 4050 (46 MiB for the verifier and 32 MiB for the first request). Slack
+between 320 and about 334 MiB can therefore select separate buffers and later hit the 256 MiB
+floor refusal even though shared buffers would have fit. Neither tested card was near this band:
+the 4050 had 248 MiB of slack, while the 4080 SUPER had gigabytes. These observed costs are not
+encoded as policy constants.
+
+The measurements above describe the env-gated prototype at `1357a2d7`. New default-path runs on
+the same 4050 used EAGER, q4_0 KV, automatic expert-cache counts and GPU reserve, ready-copy off,
+and frozen host budgets (16 GiB resident experts). Neither shared-stage prototype variable was set.
+Each run passed eleven requests: short answers and cached follow-ups, three 512-token generations
+with follow-ups, then a fresh 2K retrieval and cached retrieval.
+
+| Capacity | Selected layout | Automatic reserve / cache slots | Minimum logged CUDA free | Minimum available RAM / commit |
+|---|---|---|---|---|
+| 64K | Separate | 513 MiB / 1 | 260 MiB | 17.061 / 7.422 GiB |
+| 128K | Shared | 423 MiB / 1 | 270 MiB | 16.761 / 7.687 GiB |
+
+Both passed the short 256 MiB CUDA gate. Each run's text and prompt/completion token counts matched
+all eleven requests from its historical one-slot reference (64K separate, 128K shared). Protected
+files were unchanged, the test port closed, and no owned engine survived. CUDA/HIP compile-link
+and focused CUDA tests passed (5/5); unchanged SYCL sources retain the prior full-engine build.
+The fresh 2K prefills took 67.4 s and 130.5 s respectively; these are not speed comparisons.
+
+Both runs failed the stronger 8 GiB host-commit requirement. Host sample gaps reached 4.50 s at
+64K and 1.93 s at 128K, so these records also do not establish continuous or once-per-second host
+coverage. Frozen host budgets do not verify live host-plan resampling. Raw evidence is under
+`build-unsloth/cross-pc-memory-20261018-auto/phase1/`; source and binary hashes are in the build
+receipts under `build-shared-stage-auto-20261018/`. Full-context inputs, host headroom,
+external-display, responsiveness, performance and whole-plan acceptance remain open.
+
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
 Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
