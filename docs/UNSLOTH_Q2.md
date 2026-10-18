@@ -861,6 +861,37 @@ runs, and the remaining cross-PC and whole-plan obligations stay open. Raw recor
 are under `build-unsloth/cross-pc-memory-20261018-host-accept/phase2/`; executable
 and source hashes are in the preserved build receipt and per-arm receipts.
 
+### Private direct-read scratch observation
+
+A separate diagnostic build of `31fbb474` added host and Windows direct-read
+scratch tracing without changing allocation sizes, budgets or guards. It ran the
+same eleven-request sequence on this laptop, EAGER/q4_0 at 128K capacity, from
+03:24 to 03:30 JST on October 19. Checks and the final 30-second idle passed;
+automatic planning chose 17 GiB pinned and a 7538 MiB recent-cache target, later
+7199.2 MiB. This is an instrumented observation, not another uninstrumented arm.
+
+The external observer recorded 1666 host samples with a maximum gap of 0.531 s,
+minimum commit 8.102779 GiB and physical RAM 17.858990 GiB. The engine's 79 host
+trace rows captured lower minima: commit 8.048862 GiB and physical RAM 17.811138
+GiB. Both streams passed the 8 GiB floor; the smallest observed commit margin
+was 50.035 MiB. Enforced CUDA stage samples stayed at or above 270 MiB. Owned
+process identities were absent after cleanup, GPU use returned to zero, the port
+closed and protected profile, launcher and engine hashes matched.
+
+There were 444 scratch events over 47 observed thread lifetimes. The largest
+buffer was 92 MiB; summing each lifetime's maximum gives a conservative 656 MiB
+capacity ceiling, plus 111804 bytes of vector capacity. This is not a simultaneous
+peak or process-commit measurement. Only 14 destruction sequences were observed;
+termination lifetimes are incomplete, and cross-thread timestamps are not globally
+ordered. Allocator overhead and kernel event storage are excluded.
+
+The planner already reserves 2 GiB for CPU/server and 0.5 GiB for later startup
+on this small-GPU policy. This measurement does not prove scratch was omitted
+from those allowances or justify an additional reserve. Normal background work
+remains included. No production accounting change, repeatability, speed or
+near-full-context claim follows. Private evidence is retained under
+`build-unsloth/cross-pc-memory-20261018-host-trace/phase2/trace128-scratch-r1`.
+
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
 Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
