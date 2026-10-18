@@ -681,6 +681,53 @@ profile on port 8081. It keeps automatic memory sizing, explicit lazy loading an
 ready-copy reuse; restart resamples memory. This is an experimental local candidate,
 not a default change or full-context acceptance.
 
+## Opt-in shared prefill stage on the RTX 4050, 2026-10-18
+
+Commit `1357a2d7` adds a prototype switch that is off by default. Setting
+`STRATA_PREFILL_SHARED_STAGE=1` lets the Windows CUDA prompt path with an automatic expert cache
+choose a shared prefill stage instead of the separate one. Nothing changes without the variable,
+with an explicit `--expert-cache`, or with a helper, peer, split, pipeline, batch or borrowed
+buffer, and HIP/SYCL never select it. The automatic cache price is unchanged, so any saving appears
+as free VRAM rather than extra slots. The measurement below is a local prototype result, not
+adoption, and no product default changed.
+
+Measured on the same RTX 4050 Laptop 6 GB / i7-13700H / 63.71 GiB RAM / Windows 11 / no pagefile
+machine, CUDA 13.4 / MSVC 19.43, EAGER q4_0, with the short-validation sequence: warmup, exact arithmetic, cached
+follow-up, three 512-token sustained generations with cached follow-ups, a fresh 2048-token
+retrieval and its cached reuse.
+
+| Capacity, reserve | Default (env unset) | `STRATA_PREFILL_SHARED_STAGE=1` |
+| --- | --- | --- |
+| 128K, automatic | Refused before any request: 238 MiB free after all buffers, below the 256 MiB floor | Ready at 340 MiB, all requests passed, minimum 270 MiB |
+| 64K, saved 448 MiB | 234 MiB after the first request (pre-prototype run) | All requests passed, minimum 262 MiB, 32 (37) slots |
+| 64K, automatic | Separate by default; no matched automatic run | Selected separate, all requests passed, minimum 258 MiB |
+
+The frozen 128K reserve from the 2026-10-16 block was a different operating point: at an explicit
+400 MiB reserve the prototype selected shared and still fell to 248 MiB after the fresh 2K prompt,
+eight below the floor, and the guard stopped that run before its retrieval checks were saved. The
+216 MiB refusal in that earlier block was on this same frozen reserve. The automatic path instead
+adapted 700 MiB to a 423 MiB reserve with 1 slot and passed at 270 MiB. At 64K the automatic path
+selects separate even with the variable, because the selection threshold is 256 MiB plus a 64 MiB
+allowance (`src/prefill/buffer_layout.hpp`) and free minus owned was 360 MiB; the variable changes
+nothing there.
+
+Output parity was checked at 64K on a private build that forces the choice and differs from the
+committed heuristic by that predicate alone (never committed): all 11 requests produced identical
+outputs on both layouts, and shared left 66 MiB more free (396 vs 330 MiB at ready, 326 vs 260 MiB
+after the sequence). The committed shared selection was measured directly at 128K automatic, where
+outputs matched the 64K separate run at equal slot count; the 13-slot 128K run differed on the three
+sustained 512-token texts, consistent with a slot-count rounding effect that was not isolated. The
+8K fresh prompt was tested only at 64K on the separate layout (265.2 s, 256 MiB minimum, 4 MiB more
+than 2K). No speed claim follows: the 131.2 s 2K prefill was measured at 13 slots in the frozen-400
+run that ended at 248 MiB, while the automatic 1-slot run measured 130.8 s.
+
+Several phase-1 arms sampled minimum commit between 7.21 and 7.88 GiB, below the configured 8 GiB
+laptop headroom, although the emergency stops (commit below 2 GiB immediately, below 4 GiB over five
+samples) never fired. This does not establish whole-plan acceptance: the HIP/SYCL builds, the RTX
+4080 SUPER healthy-card check, near-128K inputs, an external display, observed responsiveness and
+host commit headroom remain open. Raw records (per-arm profiles, protection receipts, request-arm
+records and console logs) are under `build-unsloth/cross-pc-memory-20261016-opencode/phase1/`.
+
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
 Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
