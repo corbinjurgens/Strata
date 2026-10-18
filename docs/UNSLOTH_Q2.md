@@ -725,9 +725,10 @@ Several phase-1 arms sampled minimum commit between 7.21 and 7.88 GiB, below the
 laptop headroom, although the emergency stops (commit below 2 GiB immediately, below 4 GiB over five
 samples) never fired. This does not establish whole-plan acceptance. The RTX 4080 SUPER healthy-card
 check now has the bounded 2026-10-18 result below; the gfx1100 HIP engine and its fixture compile and
-link in a private ROCm 10.2 / Clang 24 SDK with no AMD runtime, and the affected prefill objects
-compile under oneAPI 2026.2 while the full SYCL engine still fails on a pre-existing `NativeDense`
-`scratch_`/`arena_` mismatch unchanged from `9c16f6f1`. The HIP runtime, near-128K inputs, an external
+link in a private ROCm 10.2 / Clang 24 SDK with no AMD runtime. The full SYCL engine also compiles
+and links in a private WSL2 / Ubuntu 24.04 build with oneAPI 2026.2 after correcting stale
+`NativeDense` private-member references in the SYCL implementation; its allocation and cleanup
+sequence is unchanged. No AMD or Intel GPU runtime was exercised. Near-128K inputs, an external
 display, observed responsiveness and host commit headroom remain open. Raw records (per-arm profiles,
 protection receipts, request-arm records and console logs) are under
 `build-unsloth/cross-pc-memory-20261016-opencode/phase1/`.
