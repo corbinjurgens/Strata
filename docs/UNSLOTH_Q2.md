@@ -770,8 +770,11 @@ not a saving, and not a speed proof. The parent's group-A 64K arm reached a phys
 emergency guard never fired; the other eleven arms sampled physical minima from 4.0253 to 4.2447 GiB
 and commit minima from 14.0364 to 14.7118 GiB. Machine-wide samples give no overall clean acceptance
 and no basis for blaming the parent's code. Recent-cache host targets varied per arm automatically,
-so bit-identical host allocations are not claimed. The desktop CPU guard self-check survives only as
-a later generated note, with no contemporaneous receipt file.
+so bit-identical host allocations are not claimed. The original CPU guard self-check command and
+pass output were later recovered from the desktop session transcript, including the pinned harness
+hashes; it completed before the first model arm. The same transcript records a final 55-file
+comparison with no changes. Per-arm receipts retain the 55-file count and empty change lists,
+alongside 37-file hash maps; full 55-file per-arm post-maps were not saved.
 
 Raw arms, layouts, protection receipts and telemetry are under
 `build-unsloth/cross-pc-memory-20261018-desktop-evidence-r1/`.
