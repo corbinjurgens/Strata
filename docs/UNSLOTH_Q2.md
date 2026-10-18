@@ -819,6 +819,48 @@ coverage. Frozen host budgets do not verify live host-plan resampling. Raw evide
 receipts under `build-shared-stage-auto-20261018/`. Full-context inputs, host headroom,
 external-display, responsiveness, performance and whole-plan acceptance remain open.
 
+## Automatic host-budget observations on the RTX 4050, 2026-10-19
+
+Two later runs used source `31fbb474` on the same Windows RTX 4050 laptop, with
+63.7 GiB usable RAM and no pagefile. Both used EAGER loading, q4_0 KV, 128K capacity,
+automatic expert-cache and host budgets, an automatic GPU reserve, and ready-copy off.
+Each completed eleven requests, including three actual 512-token generations, a fresh
+2048-token retrieval, its cached follow-up, and at least 30 seconds of monotonic idle.
+These runs used a separate host-sampling process to avoid inventory work delaying
+the host samples. The original emergency guard and stronger 8 GiB host acceptance
+floor were preserved.
+
+| Arm | Pinned experts | Recent-cache requested target | Minimum available RAM / commit | Minimum logged CUDA free | Maximum host-sample gap |
+|---|---|---|---|---|---|
+| `accept128-r3` | 16 GiB | 7936 MiB | 17.860 / 8.001747 GiB | 270 MiB | 0.453 s |
+| `accept128-r4` | 17 GiB | 7697 MiB | 17.709 / 8.050774 GiB | 272 MiB | 0.422 s |
+
+The automatic host policy resampled at each launch; the cache budgets were not
+frozen across these arms. In r4 the later recent-cache target was 7427.5 MiB.
+Targets do not establish actual allocated capacity. All arithmetic and retrieval
+checks passed, prompts were retained, and the cached retrieval reused 2073 of
+2108 tokens. Protected profiles, launchers and installed engines were unchanged;
+recorded owned processes exited, the test port closed and GPU use returned to idle.
+
+Both raw sampled host minima passed. R3 had only 1.789 MiB of commit margin and
+an unexplained new OpenCode process, so its held-app condition remains confounded.
+R4 had 51.992 MiB of commit margin. Its full process inventories retained ordinary
+background launches matching the enabled two-minute Kindle Previewer scheduled
+task and the exact preexisting Task Scheduler process identity. That attribution
+was checked after the run; scheduler history was disabled, so historical task
+configuration is not proved. No new Codex, Claude or OpenCode identity appeared
+in r4's retained inventories. Normal background allocations remain included in
+the measured minima.
+
+R4 is qualified bounded acceptance under normal apps, with 1676 host samples and
+296 process inventories. Inventories are non-atomic and can miss short-lived
+processes; CUDA values are startup/request-stage samples. The narrow margin does
+not establish repeatability, a runtime memory guarantee, performance parity or
+near-128K input acceptance. No production accounting change was made for these
+runs, and the remaining cross-PC and whole-plan obligations stay open. Raw records
+are under `build-unsloth/cross-pc-memory-20261018-host-accept/phase2/`; executable
+and source hashes are in the preserved build receipt and per-arm receipts.
+
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
 Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
