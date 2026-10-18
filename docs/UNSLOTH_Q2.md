@@ -723,10 +723,58 @@ run that ended at 248 MiB, while the automatic 1-slot run measured 130.8 s.
 
 Several phase-1 arms sampled minimum commit between 7.21 and 7.88 GiB, below the configured 8 GiB
 laptop headroom, although the emergency stops (commit below 2 GiB immediately, below 4 GiB over five
-samples) never fired. This does not establish whole-plan acceptance: the HIP/SYCL builds, the RTX
-4080 SUPER healthy-card check, near-128K inputs, an external display, observed responsiveness and
-host commit headroom remain open. Raw records (per-arm profiles, protection receipts, request-arm
-records and console logs) are under `build-unsloth/cross-pc-memory-20261016-opencode/phase1/`.
+samples) never fired. This does not establish whole-plan acceptance. The RTX 4080 SUPER healthy-card
+check now has the bounded 2026-10-18 result below; the gfx1100 HIP engine and its fixture compile and
+link in a private ROCm 10.2 / Clang 24 SDK with no AMD runtime, and the affected prefill objects
+compile under oneAPI 2026.2 while the full SYCL engine still fails on a pre-existing `NativeDense`
+`scratch_`/`arena_` mismatch unchanged from `9c16f6f1`. The HIP runtime, near-128K inputs, an external
+display, observed responsiveness and host commit headroom remain open. Raw records (per-arm profiles,
+protection receipts, request-arm records and console logs) are under
+`build-unsloth/cross-pc-memory-20261016-opencode/phase1/`.
+
+## Shared-stage preservation and selector check on the RTX 4080 SUPER, 2026-10-18
+
+Commit `1357a2d7` was then checked against its parent `e6dab366` on the same desktop used on
+2026-10-15: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM and Windows with a 28 GiB
+pagefile. Both builds used the same CUDA 13.4.92 / MSVC 19.44.35229 / sm89 toolchain, and each passed
+the same four focused CTests (expert-cache retry, prefill buffer layout, prefill allocation and
+prefill fallback allocation); the candidate's test time was 3.32 s and the parent's 4.16 s, which is
+not a model-speed result.
+
+Twelve arms ran one build each: the parent, the candidate with the variable unset and the candidate
+with `STRATA_PREFILL_SHARED_STAGE=1`, at 64K and 128K, in two groups. Every arm ran the same
+11-request sequence (warmup, exact arithmetic, cached follow-up, three 512-token generations with
+cached follow-ups, a fresh 2K retrieval and its cached reuse) on UD-Q2_K_XL with int8 KV, 32768
+resident cells, verifier window 2, automatic expert cache, a 12 GiB resident budget, a 1024 MiB GPU
+reserve, 4 GiB host headroom, a compact recent cache, eager CUDA loading and ready-copy reuse off.
+Both capacities are the configured limits; no arm sent a full-context input.
+
+Group A kept the preserved desktop profile, whose prompt path borrows 1963 cache slots (3.43 GiB) at
+128K and 1926 slots (3.37 GiB) at 64K. That path emits no selection line and never exercises the
+shared-stage choice. Group B was a controlled diagnostic that adds only `--no-prefill-borrow`; its
+prompt path allocates its own buffers with an effective prefill chunk of 2048. This diagnostic
+does not replace the user's saved profile or change a default.
+
+Every candidate arm reproduced its parent: all 11 requests returned identical text and identical
+prompt and completion usage counts, in all eight parent/candidate comparisons. Slot counts matched
+within each group (A 5270 at 128K and 5334 at 64K, B 4422 at 128K and 4486 at 64K), and the minimum
+enforced free VRAM was 683, 683, 1011 and 1077 MiB respectively, the same across the three arms
+of each group. Both group-B arms that set the variable selected the separate stage, so no arm on this
+desktop ran the shared stage.
+
+The group-B arms with the variable set prepared the GEMM handle earlier, before the pressure
+query, so its free-after-host-staging reading is 218 MiB lower (2545 to 2327 MiB at 128K, 2543 to
+2325 MiB at 64K) while the later stage and free VRAM match. That is a startup ordering difference,
+not a saving, and not a speed proof. The parent's group-A 64K arm reached a physical minimum of
+3.9724617 GiB with 6 of 250 samples below 4 GiB, missing its configured host floor even though the
+emergency guard never fired; the other eleven arms sampled physical minima from 4.0253 to 4.2447 GiB
+and commit minima from 14.0364 to 14.7118 GiB. Machine-wide samples give no overall clean acceptance
+and no basis for blaming the parent's code. Recent-cache host targets varied per arm automatically,
+so bit-identical host allocations are not claimed. The desktop CPU guard self-check survives only as
+a later generated note, with no contemporaneous receipt file.
+
+Raw arms, layouts, protection receipts and telemetry are under
+`build-unsloth/cross-pc-memory-20261018-desktop-evidence-r1/`.
 
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
