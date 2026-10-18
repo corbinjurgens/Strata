@@ -277,16 +277,30 @@ void selection_bounds(int64_t queries, bool tensor_core) {
     require(a == b, "selection differs with exact-sized scratch");
 }
 
-// Exercise the real stage DMA and append into a previously used GEMM slab. Only the old prefix and appended
-// cells become finite; the rest of each full-capacity pool stays NaN-poisoned, including a partial last page.
-void staged_attention_bounds(int64_t queries, bool q4, int64_t cells, int64_t prefix) {
+// Exercise the real stage DMA and append into a previously used GEMM slab, in every KV storage format. Only the old
+// prefix and appended cells become finite; the rest of each full-capacity pool stays NaN-poisoned, including a
+// partial last page. Each storage run's bytes come from its own formula and end in a guard: two equal planes for
+// fp16 and q4_0; int8's K/V codes each ride their per-64 fp16 scale run; K8V4 (kKvHybrid, kv_stream.hpp) is int8 K
+// codes, their scales, and rotated q4_0 V - three runs, like take_stage stages them in prefill.cpp.
+void staged_attention_bounds(int64_t queries, int fmt, int64_t cells, int64_t prefix) {
     const auto s = k::qsa_real_shapes();
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
     const size_t stride = (size_t) k::qsa_decode_attn_scratch_floats(cap, s);
-    const size_t row_bytes = q4 ? 144 : 512;
-    const size_t plane = (size_t) cells * s.n_head_kv * row_bytes;
-    const size_t v_offset = (size_t) pf::detail::buffer_bytes(plane);
-    const size_t stage_bytes = 2 * v_offset;
+    const size_t rows = (size_t) (cells * s.n_head_kv), codes = (size_t) s.head_dim,
+                 scales = (size_t) (s.head_dim / 64) * 2;
+    std::vector<size_t> row_bytes;
+    switch (fmt) {
+    case k::kKvF16:    row_bytes = {512, 512}; break;                      // fp16 planes
+    case k::kKvInt8:   row_bytes = {codes, codes, scales, scales}; break;   // K/V codes, then K/V scale runs
+    case k::kKvQ4:     row_bytes = {144, 144}; break;                      // q4_0 planes
+    case k::kKvHybrid: row_bytes = {codes, scales, 144}; break;             // K codes, K scales, q4_0 V
+    }
+    std::vector<size_t> run_off(row_bytes.size(), 0), run_bytes(row_bytes.size(), 0);
+    for (size_t r = 0; r < row_bytes.size(); ++r) {
+        if (r) run_off[r] = run_off[r - 1] + (size_t) pf::detail::buffer_bytes((uint64_t) run_bytes[r - 1]);
+        run_bytes[r] = rows * row_bytes[r];
+    }
+    const size_t stage_bytes = run_off.back() + (size_t) pf::detail::buffer_bytes((uint64_t) run_bytes.back());
     const auto layout = pf::detail::shared_gemm_stage_layout(64ull << 20, 8ull << 20, stage_bytes);
     Dev shared((size_t) layout.shared_payload_bytes), separate(stage_bytes);
     ck(cudaMemset(shared.p, 0xff, shared.bytes), "poison old GEMM image and workspace");
@@ -299,24 +313,65 @@ void staged_attention_bounds(int64_t queries, bool q4, int64_t cells, int64_t pr
         }
         ~Host() { cudaFreeHost(p); }
     } host(stage_bytes);
+    const auto fill_f16 = [&](unsigned char* dst, size_t seed) {
+        for (size_t d = 0; d < 512; d += 2) {
+            const uint16_t value = (uint16_t) (0x3400 + (seed + d) % 5 * 0x100);
+            std::memcpy(dst + d, &value, 2);
+        }
+    };
+    const auto fill_q4 = [&](unsigned char* dst, size_t seed) {
+        for (size_t b = 0; b < 144; b += 18) {
+            const uint16_t scale = 0x3000;
+            std::memcpy(dst + b, &scale, 2);
+            std::memset(dst + b + 2, (int) (0x65 + seed % 5), 16);
+        }
+    };
+    const auto fill_int8 = [&](unsigned char* dst, size_t seed) {
+        for (size_t d = 0; d < codes; ++d) dst[d] = (unsigned char) (0x70 - (seed + d) % 32);
+    };
+    const auto fill_scale = [&](unsigned char* dst) {
+        for (size_t d = 0; d < scales; d += 2) {
+            const uint16_t scale = 0x3000;
+            std::memcpy(dst + d, &scale, 2);
+        }
+    };
     for (int64_t cell = 0; cell < prefix; ++cell) for (int64_t h = 0; h < s.n_head_kv; ++h) {
         const size_t row = (size_t) ((cell / s.page_size * s.n_head_kv + h) * s.page_size + cell % s.page_size);
-        for (size_t off : {size_t(0), v_offset}) {
-            unsigned char* dst = host.p + off + row * row_bytes;
-            if (q4) for (size_t b = 0; b < row_bytes; b += 18) {
-                const uint16_t scale = 0x3000;
-                std::memcpy(dst + b, &scale, 2);
-                std::memset(dst + b + 2, (int) (0x65 + (cell + h) % 5), 16);
-            } else for (size_t d = 0; d < row_bytes; d += 2) {
-                const uint16_t value = (uint16_t) (0x3400 + (cell + h + d) % 5 * 0x100);
-                std::memcpy(dst + d, &value, 2);
-            }
+        const size_t seed = (size_t) (cell + h);
+        for (size_t r = 0; r < row_bytes.size(); ++r) {
+            unsigned char* dst = host.p + run_off[r] + row * row_bytes[r];
+            const bool scale_run = (fmt == k::kKvInt8 && r >= 2) || (fmt == k::kKvHybrid && r == 1);
+            const bool q4_run = fmt == k::kKvQ4 || (fmt == k::kKvHybrid && r == 2);
+            if (scale_run) fill_scale(dst);
+            else if (q4_run) fill_q4(dst, seed);
+            else if (fmt == k::kKvF16) fill_f16(dst, seed);
+            else fill_int8(dst, seed);
         }
     }
+    // The format's pool pointers into one image, one run per offset.
     auto host_pools = [&](unsigned char* base) {
         k::KvHostPools p;
-        if (q4) { p.k_q4 = base; p.v_q4 = base + v_offset; }
-        else { p.k_pool = reinterpret_cast<uint16_t*>(base); p.v_pool = reinterpret_cast<uint16_t*>(base + v_offset); }
+        switch (fmt) {
+        case k::kKvF16:
+            p.k_pool = reinterpret_cast<uint16_t*>(base + run_off[0]);
+            p.v_pool = reinterpret_cast<uint16_t*>(base + run_off[1]);
+            break;
+        case k::kKvInt8:
+            p.k_q = reinterpret_cast<int8_t*>(base + run_off[0]);
+            p.v_q = reinterpret_cast<int8_t*>(base + run_off[1]);
+            p.k_scale = reinterpret_cast<uint16_t*>(base + run_off[2]);
+            p.v_scale = reinterpret_cast<uint16_t*>(base + run_off[3]);
+            break;
+        case k::kKvQ4:
+            p.k_q4 = base + run_off[0];
+            p.v_q4 = base + run_off[1];
+            break;
+        case k::kKvHybrid:
+            p.k_q = reinterpret_cast<int8_t*>(base + run_off[0]);
+            p.k_scale = reinterpret_cast<uint16_t*>(base + run_off[1]);
+            p.v_q4 = base + run_off[2];
+            break;
+        }
         return p;
     };
     const auto hp = host_pools(host.p);
@@ -336,25 +391,42 @@ void staged_attention_bounds(int64_t queries, bool q4, int64_t cells, int64_t pr
     for (size_t i = 0; i < x.size(); ++i) x[i] = ((int) (i % 37) - 18) * 0.025f;
     for (size_t i = 0; i < current.size(); ++i) current[i] = ((int) (i % 29) - 14) * 0.0625f;
     Dev dt(table.size() * 4), dm(missing.size() * 4), ds(steps.size() * 4), di(ids.size() * 4),
-        dx(x.size() * 4), dc(current.size() * 4), scratch((size_t) queries * stride * 4),
+        dx(x.size() * 4), dc(current.size() * 4), dv(current.size() * 4), scratch((size_t) queries * stride * 4),
         out(x.size() * 4), ref(x.size() * 4);
-    dt.upload(table); dm.upload(missing); ds.upload(steps); di.upload(ids); dx.upload(x); dc.upload(current);
+    dt.upload(table); dm.upload(missing); ds.upload(steps); di.upload(ids); dx.upload(x); dc.upload(current); dv.upload(current);
     auto pools = [&](const k::KvHostPools& p) {
         k::QsaAttnPools r;
-        r.k_pool = p.k_pool; r.v_pool = p.v_pool; r.k_q4 = p.k_q4; r.v_q4 = p.v_q4;
+        r.k_pool = p.k_pool; r.v_pool = p.v_pool; r.k_q = p.k_q; r.v_q = p.v_q;
+        r.k_scale = p.k_scale; r.v_scale = p.v_scale; r.k_q4 = p.k_q4; r.v_q4 = p.v_q4;
         r.page_table = dt.as<int32_t>();
         return r;
     };
-    for (const auto& p : {a, b}) {
-        unsigned char* base = q4 ? p.k_q4 : reinterpret_cast<unsigned char*>(p.k_pool);
-        ck(cudaMemset(base + plane, 0xa5, 256), "set K slice guard");
-        ck(cudaMemset(base + v_offset + plane, 0xa5, 256), "set V slice guard");
-        k::kv_stage_from_host(pools(p), hp, q4 ? k::kKvQ4 : k::kKvF16,
-                             (prefix + s.page_size - 1) / s.page_size, s, nullptr);
-        if (q4) k::kv_append_q4(p.k_q4, p.v_q4, dm.as<int32_t>(), prefix, queries,
-                                dc.as<float>(), dc.as<float>(), s, nullptr, nullptr, &p);
-        else pf::kv_append(dc.as<float>(), dc.as<float>(), queries, prefix, dm.as<int32_t>(), s.page_size,
-                           p.k_pool, p.v_pool, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &p);
+    if (fmt == k::kKvHybrid) k::fwht256_inplace_cuda(dv.as<float>(), queries * 2, nullptr);   // K8V4: only V rotates
+    for (Dev* image : {&shared, &separate}) {
+        unsigned char* base = image->as<unsigned char>();
+        for (size_t r = 0; r < run_bytes.size(); ++r)
+            ck(cudaMemset(base + run_off[r] + run_bytes[r], 0xa5, 256), "set a pool run guard");
+        // The real staging DMA: the host copy's finite prefix (its poison) over the pool's poison.
+        k::kv_stage_from_host(pools(host_pools(base)), hp, fmt, (prefix + s.page_size - 1) / s.page_size, s, nullptr);
+        const k::KvHostPools p = host_pools(base);
+        // The real appends, shaped like production's (prefill.cpp): the direct pool args point at the staged pools,
+        // whose table passes no resident blocks (`missing`), so every appended cell rides the stage path.
+        if (fmt == k::kKvQ4)
+            k::kv_append_q4(p.k_q4, p.v_q4, dm.as<int32_t>(), prefix, queries, dc.as<float>(), dc.as<float>(), s,
+                            nullptr, nullptr, &p);
+        else if (fmt == k::kKvF16)
+            pf::kv_append(dc.as<float>(), dc.as<float>(), queries, prefix, dm.as<int32_t>(), s.page_size,
+                          p.k_pool, p.v_pool, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &p);
+        else if (fmt == k::kKvInt8)
+            pf::kv_append(dc.as<float>(), dc.as<float>(), queries, prefix, dm.as<int32_t>(), s.page_size,
+                          nullptr, nullptr, p.k_q, p.v_q, p.k_scale, p.v_scale, nullptr, nullptr, &p);
+        else if (fmt == k::kKvHybrid) {   // the folded halves: int8 codes/scales for K, rotated q4_0 for V
+            const k::KvHostPools sk = k::kv_hybrid_k_half(p), sv = k::kv_hybrid_v_half(p);
+            pf::kv_append(dc.as<float>(), dc.as<float>(), queries, prefix, dm.as<int32_t>(), s.page_size,
+                          nullptr, nullptr, p.k_q, p.k_q, p.k_scale, p.k_scale, nullptr, nullptr, &sk);
+            k::kv_append_q4(p.v_q4, p.v_q4, dm.as<int32_t>(), prefix, queries, dv.as<float>(), dv.as<float>(), s,
+                            nullptr, nullptr, &sv);
+        }
     }
     auto compare = [&](bool tensor) {
         const bool launched_a = tensor && k::qsa_prompt_attn_batch(dx.as<float>(), pools(a), di.as<int32_t>(),
@@ -363,15 +435,20 @@ void staged_attention_bounds(int64_t queries, bool q4, int64_t cells, int64_t pr
             ds.as<int32_t>(), cap, s, ref.as<float>(), queries, nullptr);
         require(launched_a == launched_b, "shared pool changed tensor attention dispatch");
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
-        if (tensor && q4) {
+        if (tensor) {
             int device = 0, major = 0;
             ck(cudaGetDevice(&device), "tensor fixture device");
             ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device), "tensor fixture capability");
             const char* warp = std::getenv("STRATA_QSA_WARP");
-            const char* q4_mode = std::getenv("STRATA_PROMPT_ATTN_Q4");
             const bool forced_warp = warp && (!std::strcmp(warp, "1") || !std::strcmp(warp, "attn"));
-            if (major >= 8 && !forced_warp && !(q4_mode && q4_mode[0] == '0'))
-                require(launched_a, "supported default q4 tensor attention was not exercised");
+            if (fmt == k::kKvQ4) {
+                // sm_80+ only: on Turing mode 4 would run as pairs of m16n8k8 MMAs, which no parity run has checked yet
+                const char* q4_mode = std::getenv("STRATA_PROMPT_ATTN_Q4");
+                if (major >= 8 && !forced_warp && !(q4_mode && q4_mode[0] == '0'))
+                    require(launched_a, "supported default q4 tensor attention was not exercised");
+            } else if (major >= 7) {
+                require(launched_a, "supported tensor attention was not exercised for the staged format");
+            }
         }
 #endif
         if (!launched_a) {
@@ -388,21 +465,23 @@ void staged_attention_bounds(int64_t queries, bool q4, int64_t cells, int64_t pr
                 std::all_of(bv.begin(), bv.end(), [](float v) { return std::isfinite(v); }),
                 "attention read poisoned unwritten cells");
         require(std::memcmp(av.data(), bv.data(), av.size() * 4) == 0, "shared and separate staged attention differ");
-        std::printf("staged attention: cells=%lld prefix=%lld queries=%lld q4=%d tensor=%d\n",
-                    (long long) cells, (long long) prefix, (long long) queries, (int) q4, (int) launched_a);
+        std::printf("staged attention: cells=%lld prefix=%lld queries=%lld format=%d tensor=%d\n",
+                    (long long) cells, (long long) prefix, (long long) queries, fmt, (int) launched_a);
     };
     compare(false);   // Forced decode fallback, regardless of tensor availability.
     compare(true);
     for (Dev* image : {&shared, &separate}) {
-        for (size_t offset : {plane, v_offset + plane}) {
+        const unsigned char* base = image->as<unsigned char>();
+        for (size_t r = 0; r < run_bytes.size(); ++r) {
             std::vector<unsigned char> guard(256);
-            ck(cudaMemcpy(guard.data(), image->as<unsigned char>() + offset, guard.size(), cudaMemcpyDeviceToHost),
-               "read stage slice guard");
-            require(std::all_of(guard.begin(), guard.end(), [](auto v) { return v == 0xa5; }), "stage exceeded a plane guard");
+            ck(cudaMemcpy(guard.data(), base + run_off[r] + run_bytes[r], guard.size(), cudaMemcpyDeviceToHost),
+               "read a pool run guard");
+            require(std::all_of(guard.begin(), guard.end(), [](auto v) { return v == 0xa5; }),
+                    "stage exceeded a pool run guard");
         }
         image->guard();
     }
-    scratch.guard(); out.guard(); ref.guard(); dt.guard(); dm.guard(); ds.guard(); di.guard(); dc.guard(); dx.guard();
+    scratch.guard(); out.guard(); ref.guard(); dt.guard(); dm.guard(); ds.guard(); di.guard(); dc.guard(); dv.guard(); dx.guard();
 }
 
 void attention_bounds(int64_t queries, bool q4) {
@@ -447,7 +526,7 @@ void attention_bounds(int64_t queries, bool q4) {
     require(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "attention differs with exact-sized scratch");
     if (queries == 17) for (int64_t capacity : {65536, 131072})
         for (int64_t prefix : {int64_t(0), int64_t(67), capacity - 35})
-            staged_attention_bounds(queries, q4, capacity, prefix);
+            staged_attention_bounds(queries, q4 ? k::kKvQ4 : k::kKvF16, capacity, prefix);
 }
 }  // namespace
 
@@ -468,6 +547,11 @@ int main(int argc, char** argv) {
             selection_bounds(n, true);
             if (n <= 32) { attention_bounds(n, false); attention_bounds(n, true); }
         }
+        // The int8 and K8V4 staged formats ride the same query count, capacities and prefixes the fp16/q4 bounds use.
+        for (int format : {k::kKvInt8, k::kKvHybrid})
+            for (int64_t capacity : {65536, 131072})
+                for (int64_t prefix : {int64_t(0), int64_t(67), capacity - 35})
+                    staged_attention_bounds(17, format, capacity, prefix);
         std::puts("prefill allocations and scratch bounds: PASS");
         return 0;
     } catch (const std::exception& e) {
