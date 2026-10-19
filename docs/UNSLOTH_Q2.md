@@ -892,6 +892,39 @@ remains included. No production accounting change, repeatability, speed or
 near-full-context claim follows. Private evidence is retained under
 `build-unsloth/cross-pc-memory-20261018-host-trace/phase2/trace128-scratch-r1`.
 
+## Automatic host-budget observation on the RTX 4080 SUPER, 2026-10-19
+
+A later desktop run used source `31fbb474` on the RTX 4080 SUPER with 30.88 GiB
+usable RAM and a 58.88 GiB Windows commit limit. It used automatic EAGER/int8,
+128K capacity, 32768 resident KV cells, 4 GiB host headroom and ready-copy off,
+with no explicit VRAM reserve. Planning chose 9 GiB pinned experts and a 4182 MiB
+recent-cache target; the server resampled that target to 4145 MiB.
+
+The eleven-request sequence passed, including three actual 512-token generations,
+a fresh 2048-token retrieval, cached reuse of 2073 tokens and 30.005 seconds of
+monotonic idle. An independent host process recorded 1788 samples with a maximum
+gap of 0.209 s. Minimum available physical RAM was 4.015236 GiB and commit was
+13.739719 GiB. The physical margin above the requested floor was only 15.602 MiB.
+Enforced startup/request-stage CUDA samples stayed at or above 359 MiB; CUDA was
+not sampled continuously through idle.
+
+This is a qualified observed short-workload pass. Process inventories recorded
+outside Git and Python launches descending from preexisting Obsidian, a new
+Codex process, and changing MSI service and T3 memory. Both host minima occurred
+during the short idle before fresh retrieval, overlapping an outside Python
+process. That overlap does not establish causation, and no outside memory was
+subtracted. Inventories are non-atomic and can miss short-lived processes.
+
+Recorded owned identities were absent at follow-up cleanup, protected profile,
+launcher and engine hashes matched, the test port had no listener, and the
+recorded outside GPU client list was unchanged. An earlier immediate conhost
+handle timeout remains in the evidence. These observations do not establish a
+clean held-app comparison, complete ownership accounting, repeatability,
+near-128K input acceptance or a speed improvement. Raw desktop records remain
+under `build-unsloth/cross-pc-memory-20261018-desktop-host/phase2/accept128-desktop-r2`
+and its sibling receipts in the retained canonical desktop worktree. No
+production budget, guard or profile change was made for this run.
+
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 
 Commit `563c136c` passed a separate, guarded desktop run on an RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D,
