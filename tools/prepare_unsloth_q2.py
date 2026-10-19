@@ -518,6 +518,28 @@ def apply_overrides(cfg: dict, overrides: dict) -> None:
             cfg["env"][key] = value
 
 
+def memory_environment_removals(cfg: dict) -> set[str]:
+    """Recognize managed removals in a saved template or its prepared runtime copy."""
+    policy = cfg.get("memory_policy")
+    if not isinstance(policy, dict) or policy.get("version") != POLICY_VERSION:
+        return set()
+    generated, overrides, env = policy.get("generated_env"), policy.get("overrides", {}), cfg.get("env", {})
+    if not all(isinstance(values, dict) for values in (generated, overrides, env)):
+        return set()
+    explicit = overrides.get("env", {})
+    if not isinstance(explicit, dict):
+        return set()
+    normalize = lambda key: key.upper() if os.name == "nt" else key
+    generated, explicit, env = ({normalize(key): value for key, value in values.items()}
+                                for values in (generated, explicit, env))
+    removed = set()
+    for key in MEMORY_ENV:
+        changed = env.get(key) != generated.get(key) or (key in env and env[key] is None)
+        if (changed and env.get(key) is None) or (not changed and key in explicit and explicit[key] is None):
+            removed.add(key)
+    return removed
+
+
 def refreshed_config(cfg: dict) -> dict:
     """Refresh only policy-owned values that the user has not changed in the saved configuration."""
     cfg = copy.deepcopy(cfg)
@@ -566,9 +588,11 @@ def refreshed_config(cfg: dict) -> dict:
     for flag in MEMORY_FLAGS:
         if flag_value(cfg["args"], flag) != flag_value(policy["generated_args"], flag):
             explicit["args"][flag] = flag_value(cfg["args"], flag)
+    removals = memory_environment_removals(cfg)
     for key in MEMORY_ENV:
-        if (cfg.get("env", {}).get(key) != policy["generated_env"].get(key) or
-                (key in cfg.get("env", {}) and cfg["env"][key] is None)):
+        if key in removals:
+            explicit["env"][key] = None
+        elif cfg.get("env", {}).get(key) != policy["generated_env"].get(key):
             explicit["env"][key] = cfg.get("env", {}).get(key)
     gpu, memory = detected_gpu(cfg.get("gpu")), dict(detected_memory())
     cfg["gpu"] = gpu["index"]

@@ -182,6 +182,110 @@ class Startup(unittest.TestCase):
                                      ("0.0.0.0", 8182, cfg["api_key"]))
                     self.assertEqual(path.read_bytes(), original)
 
+    def test_policy_headroom_removals_reach_public_engine_environment(self):
+        from tools import prepare_unsloth_q2 as prep
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        for removal in ("null", "delete"):
+            for inherited in ("8", "2", "0"):
+                with self.subTest(removal=removal, inherited=inherited), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                            "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}) as sample, \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), \
+                        patch.object(prep, "admit_automatic_launch", wraps=prep.admit_automatic_launch) as admit, \
+                        patch.dict(os.environ, {key: inherited, "UNRELATED_CONTROL": "keep"}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    if removal == "null":
+                        cfg["env"][key] = None
+                    else:
+                        cfg["env"].pop(key)
+                    original = prep.json_bytes(cfg)
+                    path.write_bytes(original)
+                    refreshed = cfg
+                    for _ in range(2):
+                        refreshed = prep.refreshed_config(refreshed)
+                        self.assertIsNone(refreshed["memory_policy"]["overrides"]["env"][key])
+                        self.assertNotIn(key, refreshed["env"])
+                    sample.reset_mock()
+                    create, _, _ = self.run_main(path)
+                    sample.assert_called_once()
+                    self.assertEqual(admit.call_args.args[0]["headroom_gib"], 4)
+                    self.assertTrue(admit.call_args.args[0]["automatic_host_cache"])
+                    env = create.call_args.kwargs["env"]
+                    self.assertNotIn(key, env)
+                    self.assertEqual(env["UNRELATED_CONTROL"], "keep")
+                    self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0")
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_removed_headroom_admission_preserves_physical_and_commit_limits(self):
+        from tools import prepare_unsloth_q2 as prep
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        for available, commit, admitted in ((10, 60, True), (27, 25, True), (8, 60, False), (27, 23, False)):
+            with self.subTest(available=available, commit=commit), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": available, "commit_available_gib": commit, "windows_commit": True}), \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready") as ready, \
+                    patch.object(prep, "admit_automatic_launch", wraps=prep.admit_automatic_launch) as admit, \
+                    patch.dict(os.environ, {key: "8"}, clear=True):
+                path, cfg = self.fixture(Path(directory), prep)
+                cfg["env"].pop(key)
+                original = prep.json_bytes(cfg)
+                path.write_bytes(original)
+                if admitted:
+                    create, _, _ = self.run_main(path)
+                    self.assertNotIn(key, create.call_args.kwargs["env"])
+                else:
+                    with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path)]), \
+                            patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as http, \
+                            contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                        server.main()
+                    self.assertEqual(error.exception.code, 2)
+                    engine.assert_not_called()
+                    http.assert_not_called()
+                    ready.assert_not_called()
+                self.assertEqual(admit.call_args.args[0]["headroom_gib"], 4)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_generated_numeric_and_static_headroom_keep_their_environment_precedence(self):
+        from tools import prepare_unsloth_q2 as prep
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        for mode, expected in (("generated", "4"), ("numeric", "2"), ("static", "8")):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}), \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready"), patch.dict(os.environ, {key: "8"}, clear=True):
+                path, cfg = self.fixture(Path(directory), prep)
+                if mode == "numeric":
+                    cfg["env"][key] = "2"
+                elif mode == "static":
+                    cfg.pop("memory_policy")
+                    cfg["env"].pop(key)
+                original = prep.json_bytes(cfg)
+                path.write_bytes(original)
+                create, _, _ = self.run_main(path)
+                self.assertEqual(create.call_args.kwargs["env"][key], expected)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_environment_removal_requires_known_managed_names_and_policy_version(self):
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        inherited = {key: "8", "UNRELATED_CONTROL": "keep"}
+        policy = {"version": 1, "generated_env": {},
+                  "overrides": {"env": {key: None, "UNRELATED_CONTROL": None}}}
+        self.assertEqual(server.config_environment({"memory_policy": policy, "env": {}}, inherited),
+                         {"UNRELATED_CONTROL": "keep"})
+        for invalid in ({}, {**policy, "version": 999}, {**policy, "generated_env": []}, "unknown"):
+            with self.subTest(policy=invalid):
+                self.assertEqual(server.config_environment({"memory_policy": invalid, "env": {}}, inherited), inherited)
+        for platform, expected in (("nt", {}), ("posix", {key.lower(): "8"})):
+            with self.subTest(platform=platform), patch.object(server.os, "name", platform):
+                self.assertEqual(server.config_environment({"memory_policy": policy, "env": {}},
+                                                           {key.lower(): "8"}), expected)
+
     def test_static_main_keeps_bytes_and_skips_policy_preparation(self):
         from tools import prepare_unsloth_q2 as prep
         with tempfile.TemporaryDirectory() as directory, \

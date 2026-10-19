@@ -1,5 +1,4 @@
 """Offline checks for distinct hardware budgets and read-only shared model verification."""
-import ast
 import hashlib
 import contextlib
 import io
@@ -546,12 +545,9 @@ class PortableProfiles(unittest.TestCase):
             self.assertNotIn("--vram-reserve-mib", cfg["args"])
 
     def test_null_environment_removals_survive_refresh_and_launch_without_exporting_none(self):
-        server = Path(__file__).resolve().parents[1] / "serve/server.py"
-        node = next(n for n in ast.parse(server.read_text(encoding="utf-8")).body
-                    if isinstance(n, ast.FunctionDef) and n.name == "child_env")
-        namespace = {"os": prep.os, "Path": Path, "hip_visible": lambda cfg: [], "gpu_list": lambda cfg: []}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(server), "exec"), namespace)
+        from serve.server import child_env
         parent_env = {k: v for k, v in prep.os.environ.items() if k not in prep.MEMORY_ENV}
+        parent_env.update({key: "inherited" for key in prep.MEMORY_ENV})
         for key in prep.MEMORY_ENV:
             for source in ("override", "saved", "old-generated-null"):
                 with self.subTest(key=key, source=source):
@@ -577,7 +573,7 @@ class PortableProfiles(unittest.TestCase):
                     self.assertNotIn(key, saved["env"])
                     self.assertIsNone(saved["memory_policy"]["overrides"]["env"][key])
                     with patch.dict(prep.os.environ, parent_env, clear=True):
-                        self.assertNotIn(key, namespace["child_env"](saved))
+                        self.assertNotIn(key, child_env(saved))
 
     def test_failed_launcher_publish_rolls_back_new_config(self):
         real_replace = prep.os.replace

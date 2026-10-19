@@ -2349,6 +2349,20 @@ def ordered_gpus(cfg: dict, scores=None) -> list[int]:
     return out
 
 
+def config_environment(cfg: dict, inherited: dict) -> dict:
+    """Merge saved engine controls, honoring explicit automatic-policy removals."""
+    removed = set()
+    if cfg.get("memory_policy"):
+        from tools.prepare_unsloth_q2 import memory_environment_removals
+        removed = memory_environment_removals(cfg)
+    normalize = lambda key: key.upper() if os.name == "nt" else key
+    env = {key: value for key, value in inherited.items() if normalize(key) not in removed}
+    for key, value in (cfg.get("env") or {}).items():
+        if normalize(key) not in removed:
+            env[str(key)] = str(value)
+    return env
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -2358,8 +2372,7 @@ def child_env(cfg: dict) -> dict:
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
-    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
-        env[str(k)] = str(v)
+    env = config_environment(cfg, env)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"

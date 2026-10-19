@@ -124,12 +124,12 @@ def file_identity(path):
 
 def safe_engine_environment(cfg, inherited):
     """Record allowed controls from both actual environment layers, with config taking precedence."""
+    from serve.server import config_environment
     effective = {}
-    for layer in (inherited, cfg.get("env", {})):
-        for key, value in layer.items():
-            name = key.upper() if os.name == "nt" else key
-            if name in EVIDENCE_ENV:
-                effective[name] = value
+    for key, value in config_environment(cfg, inherited).items():
+        name = key.upper() if os.name == "nt" else key
+        if name in EVIDENCE_ENV:
+            effective[name] = value
     return effective
 
 

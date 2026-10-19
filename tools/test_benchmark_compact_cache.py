@@ -99,6 +99,27 @@ class HelperTests(unittest.TestCase):
         with patch.object(bench.os, "name", "posix"):
             self.assertEqual(bench.safe_engine_environment(cfg, inherited), {"STRATA_FILE_CACHE_MIB": "64"})
 
+    def test_safe_evidence_honors_saved_and_prepared_removals_without_child_side_effects(self):
+        from serve import server
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        for removal in ("null", "delete", "prepared"):
+            with self.subTest(removal=removal):
+                cfg = {"backend": "hip", "lib_dirs": ["unused"], "env": {}, "memory_policy": {
+                    "version": 1, "generated_env": {key: "4"}, "overrides": {"env": {}}}}
+                if removal == "null":
+                    cfg["env"][key] = None
+                elif removal == "prepared":
+                    cfg["memory_policy"]["generated_env"] = {}
+                    cfg["memory_policy"]["overrides"]["env"][key] = None
+                original = json.dumps(cfg, sort_keys=True)
+                with patch.object(server, "child_env", side_effect=AssertionError("full child setup")), \
+                        patch.object(server, "hip_env_guard", side_effect=AssertionError("HIP directory probes")), \
+                        patch.object(server, "gpu_list", side_effect=AssertionError("GPU composition")), \
+                        patch.object(server, "_dir_writable", side_effect=AssertionError("directory probe")):
+                    self.assertEqual(bench.safe_engine_environment(cfg, {key: "8", "STRATA_FILE_DIRECT_UNMAP": "1"}),
+                                     {"STRATA_FILE_DIRECT_UNMAP": "1"})
+                self.assertEqual(json.dumps(cfg, sort_keys=True), original)
+
     def test_summary_separates_prefill_and_uses_total_decode_time(self):
         rows = [{"response": {"usage": {"completion_tokens": count, "prompt_tokens": 80},
                              "timings": {"predicted_ms": ms, "prompt_ms": prefill}}}
