@@ -418,7 +418,7 @@ At 131072 context, the default GPU choices are:
 | --- | --- | --- |
 | KV storage / GPU resident cells | q4_0 / 20480 | int8 / 32768 |
 | Prefill chunks | 64, separate buffers (`--no-prefill-borrow`) | auto, normal borrowing |
-| Explicit VRAM reserve | 400 MiB at 128K; 448 MiB at 64K or below | 1024 MiB |
+| VRAM reserve request | Engine automatic at 128K; explicit 448 MiB at 64K or below | Explicit 1024 MiB |
 | Owned-buffer pricing | `STRATA_OWNED_PRICE=exact` | normal pricing |
 | MTP, suffix and lookup drafting | off; verifier window 2 | off; verifier window 2 |
 
@@ -430,12 +430,15 @@ The expert pool is the smaller remaining physical/commit budget, capped at 42.9 
 the helper allows 2 GiB for CPU/server use, 0.5 GiB for later startup buffers on a small GPU or 1 GiB on the
 desktop, streamed KV storage for 13 layers at the selected context/precision, and application headroom of
 8 GiB on systems with at least 48 GiB RAM or 4 GiB below that. The Windows commit calculation also reserves
-GPU memory less the configured VRAM reserve; this GPU allowance is not subtracted again from physical RAM.
+GPU memory less an explicit configured VRAM reserve, or full GPU memory when the reserve flag is absent;
+this GPU allowance is not subtracted again from physical RAM. An absent flag lets the engine choose its
+reserve and does not request a zero reserve.
 If available-memory telemetry is missing, the helper discloses its fallback estimate of 65% of total RAM.
 Missing Windows commit telemetry falls back to the physical pool for planning. These fallbacks are labelled
 unverified: read-only planning and preparation remain available, but cannot establish launch feasibility.
 These are policy allowances, not measured worst-case memory requirements. The laptop's 8 GiB headroom applies
-to system RAM; its 400 MiB GPU reserve is separate and has not been validated for normal external-monitor use.
+to system RAM; the engine's automatic GPU reserve is separate. The changed default has only the bounded
+measurement below, which does not validate normal external-monitor use or the requested host allowance.
 Everyday laptop acceptance keeps the external monitor connected and normal applications open, and samples
 actual free VRAM rather than assuming all 6 GB is available.
 
@@ -860,6 +863,36 @@ near-128K input acceptance. No production accounting change was made for these
 runs, and the remaining cross-PC and whole-plan obligations stay open. Raw records
 are under `build-unsloth/cross-pc-memory-20261018-host-accept/phase2/`; executable
 and source hashes are in the preserved build receipt and per-arm receipts.
+
+### Generated-default reserve correction
+
+Two additional RTX 4050 runs on October 19 used the same uninstrumented `31fbb474` engine,
+EAGER/q4_0, 131072-token capacity, prefill 64 and an 8 GiB physical/commit acceptance floor.
+Defender was enabled and the user had closed applications; these differ from the earlier normal-app runs.
+
+| Arm | Generated GPU reserve | Workload | Minimum sampled RAM / commit | Minimum logged CUDA free |
+|---|---|---|---|---|
+| `accept128-default-r1` | Explicit 400 MiB | Ten requests; guard stopped after fresh retrieval | 16.748169 / 7.636311 GiB | 250 MiB |
+| `accept128-default-fixed-r1` | Flag absent; engine adapted 700 to 423 MiB | Eleven requests and 30.016 s final idle | 17.271202 / 7.945656 GiB | 270 MiB |
+
+The helper correction removes the explicit reserve only from generated small-GPU 128K profiles and
+charges full VRAM in Windows commit planning. The second run used helper SHA-256 `35a40310` with the
+retained engine; it is not an unchanged `31fbb474` pipeline. Explicit overrides and static profiles remain
+preserved. Existing managed profiles refresh in memory without rewriting their saved bytes. CPU checks
+passed 151 tests; independent review exercised the actual server argument consumer and override ownership.
+
+The corrected run passed exact answers, three actual 512-token generations, fresh 2048-token retrieval
+and 2073 cached tokens on reuse. Its CUDA stage samples passed the unchanged 256 MiB emergency floor,
+but host acceptance still failed: commit fell 55.648 MiB below 8 GiB. The minimum preceded fresh retrieval;
+1603 host samples had a maximum gap of 0.719 s. New T3-parented Codex/Claude processes and Git activity
+were recorded, so neither run establishes held-app isolation or a causal host-performance improvement.
+No outside memory was subtracted. Logged CUDA values are stage samples, not continuous telemetry.
+
+Both runs retained protected profile/launcher/engine bytes and ended with no engine, compute process or
+test-port listener. The external owned Job terminated a remaining console host in each run; this is
+qualified cleanup rather than natural process disappearance. The GPU-reserve correction addresses the
+bounded generated-default CUDA failure. Production host accounting, repeatability, long-input and
+whole-phase acceptance remain open; no additional host reserve is justified by these observations.
 
 ### Private direct-read scratch observation
 
