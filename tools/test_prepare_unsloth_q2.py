@@ -133,12 +133,80 @@ class MemoryProfiles(unittest.TestCase):
         self.assertEqual(value(plan["args"], "--kv"), "int8")
 
     def test_fp16_and_q4_alias_use_their_source_defined_cell_sizes(self):
-        for kv, gib in (("fp16", 3.25), ("q4", 0.9140625), ("q4_0", 0.9140625), ("k8v4", 1.294921875)):
+        for kv, gib in (("fp16", 3.25), ("q4", 0.9140625), ("q4_0", 0.9140625), ("k8v4", 1.32421875)):
             with self.subTest(kv=kv):
                 plan = prep.memory_plan(30.88, 15.99, 131072, available_gib=27, commit_available_gib=45,
                                         overrides={"args": {"--kv": kv}})
                 self.assertEqual(value(plan["args"], "--kv"), kv)
                 self.assertEqual(plan["kv_ram_gib"], gib)
+
+    def test_explicit_kv_residency_charges_host_storage_before_automatic_admission(self):
+        # At 32K, the native 20,480-cell minimum is below the logical capacity, so
+        # layer.cpp allocates a full host copy. The existing 13-layer INT8 allowance
+        # is 429 MiB; neither plentiful commit nor plentiful physical RAM can replace it.
+        for ram, vram, available, commit in ((30.88, 16, 7.5, 60), (63.7, 6, 58, 16.5625)):
+            with self.subTest(ram=ram, vram=vram):
+                plan = prep.memory_plan(ram, vram, 32768, available_gib=available,
+                                        commit_available_gib=commit,
+                                        overrides={"args": {"--kv-resident": "20480"}})
+                self.assertEqual(plan["kv_ram_gib"], 429 / 1024)
+                self.assertEqual(plan["expert_pool_gib"], 83 / 1024)
+                self.assertTrue(plan["automatic_host_cache"])
+                with self.assertRaisesRegex(ValueError, "at least 0.25 GiB"):
+                    prep.admit_automatic_launch(plan)
+
+    def test_removed_or_zero_kv_residency_has_no_host_kv_allowance(self):
+        for resident in (None, "0", "0.75", "nonnumeric"):
+            with self.subTest(resident=resident):
+                plan = prep.memory_plan(30.88, 15.99, 131072, available_gib=27, commit_available_gib=45,
+                                        overrides={"args": {"--kv-resident": resident}})
+                self.assertEqual(prep.flag_value(plan["args"], "--kv-resident"), resident)
+                self.assertEqual(plan["kv_ram_gib"], 0)
+                self.assertEqual(plan["expert_pool_gib"], 20)
+                self.assertEqual(plan["pinned_gib"], 12)
+                self.assertEqual(plan["recent_mib"], 8192)
+                self.assertTrue(plan["automatic_host_cache"])
+
+    def test_positive_kv_residency_keeps_the_draft_allowance_when_main_kv_fits(self):
+        # kv_plan rounds main residency to four-cell pages after applying its 20,480
+        # minimum. MTP's separate ring can still allocate host storage when that
+        # makes the main layers fully resident; do not credit this allowance away.
+        for context, residents, mib in (
+                (8192, ("1", "20480", "8192"), 107.25),
+                (32768, ("1", "20479", "20480", "32767", "32768", "32769", "65536"), 429),
+                (131072, ("131072", "131073", "262144"), 1716)):
+            for resident in residents:
+                with self.subTest(context=context, resident=resident):
+                    plan = prep.memory_plan(32, 16, context, available_gib=27, commit_available_gib=60,
+                                            overrides={"args": {"--kv-resident": resident}})
+                    self.assertEqual(value(plan["args"], "--kv-resident"), resident)
+                    self.assertEqual(plan["kv_ram_gib"], mib / 1024)
+                    self.assertTrue(plan["automatic_host_cache"])
+
+    def test_explicit_kv_residency_preserves_format_allowances_and_integer_prefix(self):
+        for kv, mib in (("fp16", 832), ("int8", 429), ("q4", 234), ("q4_0", 234), ("k8v4", 339)):
+            for resident in (" \t+20480 \r\n", "20480.75", "1e3"):
+                with self.subTest(kv=kv, resident=resident):
+                    plan = prep.memory_plan(32, 16, 32768, available_gib=27, commit_available_gib=60,
+                                            overrides={"args": {"--kv": kv, "--kv-resident": resident}})
+                    self.assertEqual(value(plan["args"], "--kv-resident"), resident)
+                    self.assertEqual(value(plan["args"], "--kv"), kv)
+                    self.assertEqual(plan["kv_ram_gib"], mib / 1024)
+
+    def test_hybrid_kv_allowance_includes_the_plain_int8_draft(self):
+        # kv_q8.hpp and kv_q4.hpp give 816 bytes per hybrid main cell and 1056
+        # per INT8 draft cell. mtp.cpp selects INT8 for the draft under K8V4.
+        # At 128K this is 1224 MiB for the main layers plus 132 MiB for the draft.
+        plan = prep.memory_plan(32, 16, 131072, available_gib=27, commit_available_gib=60,
+                                overrides={"args": {"--kv": "k8v4"}})
+        self.assertEqual(plan["kv_ram_gib"], 1356 / 1024)
+        self.assertEqual(value(plan["args"], "--kv"), "k8v4")
+        self.assertEqual(plan["expert_pool_gib"], 18.67578125)
+
+    def test_kv_residency_rejects_negative_and_signed_integer_overflow(self):
+        for resident in ("-1", "-1e3", "9223372036854775808", "1" * 100):
+            with self.subTest(resident=resident), self.assertRaisesRegex(ValueError, "--kv-resident"):
+                prep.memory_plan(32, 16, 32768, overrides={"args": {"--kv-resident": resident}})
 
     def test_explicit_vram_reserve_changes_commit_exposure(self):
         plan = prep.memory_plan(30.88, 16, 131072, available_gib=27, commit_available_gib=28,
@@ -316,6 +384,33 @@ class PortableProfiles(unittest.TestCase):
         self.assertEqual(value(refreshed["args"], "--resident-budget-gib"), "9")
         self.assertEqual(refreshed["env"]["STRATA_FILE_CACHE_MIB"], "0")
         self.assertEqual(refreshed["api_key"], cfg["api_key"])
+
+    def test_saved_kv_residency_edits_and_removals_survive_refresh_and_read_only_startup(self):
+        for context, resident, kv_gib in ((32768, "20480", 429 / 1024), (131072, None, 0)):
+            with self.subTest(context=context, resident=resident):
+                cfg = prep.config_for(self.root / "source", self.root / "pack", context, None)
+                prep.set_flag(cfg["args"], "--kv-resident", resident)
+                for _ in range(2):
+                    cfg = prep.refreshed_config(cfg)
+                    self.assertEqual(prep.flag_value(cfg["args"], "--kv-resident"), resident)
+                    self.assertEqual(cfg["memory_policy"]["overrides"]["args"]["--kv-resident"], resident)
+                    self.assertEqual(cfg["memory_policy"]["sample"]["kv_ram_gib"], kv_gib)
+                    self.assertTrue(cfg["memory_policy"]["sample"]["automatic_host_cache"])
+                original = prep.json_bytes(cfg)
+                self.config.write_bytes(original)
+                with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    runtime = prep.prepare_launch(self.config)
+                self.assertEqual(prep.flag_value(runtime["args"], "--kv-resident"), resident)
+                self.assertEqual(runtime["memory_policy"]["sample"]["kv_ram_gib"], kv_gib)
+                self.assertEqual(self.config.read_bytes(), original)
+                publish.assert_not_called()
+
+    def test_saved_kv_residency_cannot_admit_an_uncharged_automatic_pool(self):
+        cfg = prep.config_for(self.root / "source", self.root / "pack", 32768, None)
+        prep.set_flag(cfg["args"], "--kv-resident", "20480")
+        prep.detected_memory.return_value["available_gib"] = 7.5
+        self.assert_launch_rejected(cfg, "at least 0.25 GiB")
 
     def test_explicit_override_equal_to_old_auto_value_stays_explicit(self):
         cfg = self.make_config({"args": {"--resident-budget-gib": "12"},

@@ -35,7 +35,7 @@ MEMORY_FLAGS = ("--expert-cache", "--max-context", "--kv", "--kv-resident", "--s
 MEMORY_ENV = ("STRATA_RESIDENT_HEADROOM_GIB", "STRATA_FILE_CACHE_MIB",
               "STRATA_FILE_CACHE_COMPACT", "STRATA_OWNED_PRICE")
 # Per token/layer: two KV heads, 256 values each, K and V. See kv_q8.hpp,
-# kv_q4.hpp and layer.hpp; reserve all 13 layers as setup does, including the draft layer.
+# kv_q4.hpp and layer.hpp; reserve the 12 main layers and the draft layer as setup does.
 KV_CELL_BYTES = {"fp16": 2048, "int8": 1056, "q4_0": 576, "q4": 576, "k8v4": 816}
 
 
@@ -136,7 +136,16 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         raise ValueError(f"Unsupported KV format: {kv}")
     resident_cells = 20480 if small_gpu else 32768
     streamed = context >= 65536
-    kv_ram = context * 13 * KV_CELL_BYTES[kv] / 2**30 if streamed else 0
+    resident_value = arg_overrides.get("--kv-resident", resident_cells if streamed else 0)
+    prefix = C_INTEGER_PREFIX.match(str(resident_value))
+    effective_resident = int(prefix[1]) if prefix else 0  # The engine parses this flag with atoll.
+    if not 0 <= effective_resident <= 2**63 - 1:
+        raise ValueError("--kv-resident effective integer prefix must be between 0 and 9223372036854775807 cells.")
+    # A positive setting can enable the MTP's host-backed ring even when the main
+    # context fits in VRAM. Keep the nominal 12-main-plus-draft allowance; MTP uses
+    # plain INT8 for a K8V4 draft (mtp.cpp), rather than the main layers' hybrid format.
+    kv_cell_bytes = 12 * KV_CELL_BYTES[kv] + KV_CELL_BYTES["int8" if kv == "k8v4" else kv]
+    kv_ram = context * kv_cell_bytes / 2**30 if effective_resident > 0 else 0
     headroom_value = env_overrides.get("STRATA_RESIDENT_HEADROOM_GIB", 8 if ram >= 48 else 4)
     headroom = float(4 if headroom_value is None else headroom_value)
     later = 0.5 if small_gpu else 1.0
