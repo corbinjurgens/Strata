@@ -4288,6 +4288,18 @@ int main(int argc, char** argv) {
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
+    // The owner's permission uses the original automatic-cache choice and the planned topology, before
+    // peers/helpers are attached. The owner repeats its physical invariants and chooses only under pressure.
+    auto allow_shared_stage = [&](const void* borrow) -> bool {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+        return auto_cache && borrow == nullptr &&
+               o.peer_device < 0 && !multi_gpu && !split_same && stages.empty() &&
+               o.batch == 0 && o.batch_groups == 1 && o.pipeline_windows == 0;
+#else
+        (void) borrow;
+        return false;
+#endif
+    };
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
     const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
@@ -4295,6 +4307,7 @@ int main(int argc, char** argv) {
     // The post-touch check must retain the same later allocations as the initial sizing.  Only the base reserve
     // can be adapted below; the owned prompt buffers, draft binding and pipeline buffers still have to fit.
     int64_t auto_cache_late_bytes = pipe_first;
+    uint64_t remaining_priced_late_bytes = (uint64_t) pipe_first;
     if (pipe_first > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
@@ -4312,9 +4325,36 @@ int main(int argc, char** argv) {
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
+    // The AUTOMATIC sizing reads (the initial figure below, then the native per-layer and profile room) share this
+    // one checked query: device_free_bytes ignores cudaMemGetInfo's status and hands back 0 - or whatever the failed
+    // call left behind - which the sizing arithmetic would consume as if it were a real reading.  On Windows CUDA a
+    // failed query prints the CUDA error and stops before anything is sized, allocated or bound; a successful zero
+    // stays a real reading.  The manual (explicit cache) reads, and HIP, gfx906, SYCL and non-Windows, keep the
+    // legacy device_free_bytes call unchanged - the same predicate the post-touch callback below is checked under.
+    auto sizing_free_bytes = [&](size_t& free_b, std::string& why) -> bool {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+        if (auto_cache) {
+            size_t query_free = 0, query_total = 0;
+            if (const cudaError_t status = cudaMemGetInfo(&query_free, &query_total); status != cudaSuccess) {
+                why = std::string("expert cache auto: cudaMemGetInfo failed: ") + cudaGetErrorString(status);
+                free_b = 0;   // a failed query leaves no bytes for arithmetic to consume
+                return false;
+            }
+            free_b = query_free;
+            return true;
+        }
+#endif
+        (void) why;
+        free_b = strata::core::device_free_bytes();
+        return true;
+    };
     if (o.expert_cache < 0) {
-        size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        size_t free_b = 0;
+        std::string query_why;
+        if (!sizing_free_bytes(free_b, query_why)) {
+            std::fprintf(stderr, "strata generate: %s\n", query_why.c_str());
+            return 1;
+        }
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
@@ -4348,6 +4388,7 @@ int main(int argc, char** argv) {
         for (const auto& d : slot_mtp)
             mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
         auto_cache_late_bytes = (prefill_mib << 20) + mtp_bind + pipe_first;
+        remaining_priced_late_bytes = (uint64_t) (mtp_bind + pipe_first);
         const int64_t reserve = ((int64_t) o.vram_reserve_mib << 20) + auto_cache_late_bytes;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
@@ -4453,7 +4494,12 @@ int main(int argc, char** argv) {
     std::vector<int64_t> sized_slots;
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
-        const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
+        size_t free_b = 0;   // the same reading the shared-cache sizing uses (the checked query above for auto)
+        std::string query_why;
+        if (!sizing_free_bytes(free_b, query_why)) {
+            std::fprintf(stderr, "strata generate: %s\n", query_why.c_str());
+            return 1;
+        }
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * lay.max_blob;
@@ -4478,8 +4524,12 @@ int main(int argc, char** argv) {
                          (double) ((uint64_t) q * per_layer_bytes) / 1073741824.0);
         }
     } else if (native_pack && o.expert_cache > 0 && !profile.empty()) {
-        size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        size_t free_b = 0;
+        std::string query_why;
+        if (!sizing_free_bytes(free_b, query_why)) {
+            std::fprintf(stderr, "strata generate: %s\n", query_why.c_str());
+            return 1;
+        }
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
@@ -4588,7 +4638,15 @@ int main(int argc, char** argv) {
                 why = std::string("expert cache auto: cudaDeviceSynchronize failed: ") + cudaGetErrorString(status);
                 return false;
             },
-            [&]() -> int64_t { return (int64_t) strata::core::device_free_bytes(); },
+            [&](int64_t& available, std::string& why) -> bool {
+                // one owner for the checked query (sizing_free_bytes above): on Windows CUDA a failed read stops
+                // validation before any readiness arithmetic - never read as a low or zero free figure - while
+                // HIP/SYCL/non-Windows (and a manual read) keep device_free_bytes unchanged
+                size_t query_free = 0;
+                if (!sizing_free_bytes(query_free, why)) return false;
+                available = (int64_t) query_free;
+                return true;
+            },
             [&]() -> bool {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
                 // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
@@ -6625,7 +6683,8 @@ int main(int argc, char** argv) {
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
             mem_mark("before the prompt path initialization");
-            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
+                         allow_shared_stage(borrow), remaining_priced_late_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
         };
@@ -11342,7 +11401,7 @@ int main(int argc, char** argv) {
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
+                          borrow_bytes, allow_shared_stage(borrow), remaining_priced_late_bytes)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

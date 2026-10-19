@@ -911,7 +911,10 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
                    core::SessionState &ss, core::ExpertSource *src,
                    const core::ExpertCache *cache, const int32_t *host_res,
                    int64_t chunk, void *stream, std::string &err, void *borrow,
-                   uint64_t borrow_bytes) try {
+                   uint64_t borrow_bytes, bool allow_shared_stage,
+                   uint64_t remaining_priced_late_bytes) try {
+    (void) allow_shared_stage;
+    (void) remaining_priced_late_bytes;
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = strata::q_of(stream); m.stats = &stats_;
@@ -1243,7 +1246,7 @@ bool Prefill::relayout(int64_t chunk, void *borrow, uint64_t borrow_bytes,
     o.owned = &m.owned;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
-    if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
+    if (ok && !m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
     if (!ok || !carve((size_t) chunk, &o)) {
         size_t fb = 0, tb = 0;
         /*
@@ -1273,6 +1276,7 @@ catch (sycl::exception const &exc) {
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+bool Prefill::shared_stage() const { return false; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {

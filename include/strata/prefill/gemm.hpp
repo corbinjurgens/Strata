@@ -22,8 +22,9 @@ public:
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
     bool init(void* stream, int64_t scratch_elems, std::string& err);
     /// The same with caller-owned device buffers (the prompt path borrowing expert-cache slots).
+    /// Private preparation may require stream binding to succeed; false preserves the legacy setup diagnostics.
     bool init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                       std::string& err);
+                       std::string& err, bool require_stream_binding = false);
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
     /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM (Turing with
@@ -52,8 +53,9 @@ public:
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
     void set_f16_io(bool on) { f16_io_ = on; }
 
-    /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
-    void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
+    /// Caller-owned buffers only: move the scratch and workspace after workspace binding succeeds.
+    /// Returns false with err on binding failure, leaving this object's buffer fields unchanged.
+    bool rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes, std::string& err);
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }

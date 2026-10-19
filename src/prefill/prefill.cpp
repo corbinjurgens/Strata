@@ -722,6 +722,8 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
+    bool shared_stage = false;
+    uint64_t shared_stage_bytes = 0;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -844,6 +846,14 @@ namespace {
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+// Read once, with the same parse/default for admission and the runtime prefetch path.
+bool kv_prefetch_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_KV_PREFETCH");
+        return e ? std::atoi(e) != 0 : false;
+    }();
+    return on;
+}
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
@@ -1052,7 +1062,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
-                   void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
+                   void* stream, std::string& err, void* borrow, uint64_t borrow_bytes,
+                   bool allow_shared_stage, uint64_t remaining_priced_late_bytes) {
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
@@ -1078,6 +1089,71 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
+    bool prepared_gemm = false, select_shared_stage = false;
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    if (allow_shared_stage && borrow == nullptr && stage_lb_ == 0 && stage_le_ == g.n_layers &&
+        next_ == nullptr && helper_ == nullptr && !m.pp && !m.help_pp && !core::peer_portable() &&
+        ss.qsa_states[ss.qsa_primary()].kv_mode == 1 && !stage_own() && !kv_prefetch_enabled()) {
+        // Prepare the existing owner once, before choosing or allocating physical buffers. Even a normal-layout
+        // decision must bind the real workspace with the checked rebind below; never initialize a second handle.
+        if (!m.gemm.init_external(stream, nullptr, 0, nullptr, 0, err, true)) return false;
+        prepared_gemm = true;
+        size_t free_bytes = 0, total_bytes = 0;
+        if (const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes); status != cudaSuccess) {
+            err = "prefill: shared-stage pressure query: cudaMemGetInfo status " + std::to_string((int) status) +
+                  " (" + cudaGetErrorString(status) + ")";
+            return false;
+        }
+        const uint64_t normal_bytes = bytes_needed_owned(g, ss, chunk);
+        select_shared_stage = detail::shared_stage_pressure(free_bytes, normal_bytes, remaining_priced_late_bytes);
+        std::fprintf(stderr, "prefill: shared-stage pressure heuristic free_bytes=%llu normal_owned_bytes=%llu "
+                     "remaining_priced_late_bytes=%llu floor_bytes=268435456 allocator_bytes=67108864 selected=%s; "
+                     "later reserve-absorbed allocations and growth still require verification\n",
+                     (unsigned long long) free_bytes, (unsigned long long) normal_bytes,
+                     (unsigned long long) remaining_priced_late_bytes, select_shared_stage ? "shared" : "separate");
+    }
+#else
+    (void) allow_shared_stage;
+    (void) remaining_priced_late_bytes;
+#endif
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    // STRATA_TRACE only: this init's actual fixed-buffer inputs, as two bounded startup records - the payload and
+    // selection line (weight arena layout, dense scratch, workspace, MMQ plan, the selected chunk/loan/ring/blob)
+    // and the take-parameter line (geometry and KV stage).  bytes_needed_owned's total prints on the second record:
+    // it carries Alloc's guard and 2 MiB page rounding, so it is NOT the sum of the payload fields, and the
+    // free-MiB deltas stay in the existing stage records above/below.  Diagnostics only: no allocation, sizing or
+    // setup change, and trace-off runs no query and prints nothing.
+    if (std::getenv("STRATA_TRACE") != nullptr) {
+        const detail::WeightScratchLayout wsl = weight_scratch_layout();
+        const MmqPlan& mp = mmq_plan();
+        const bool fz = fused_layout((size_t) chunk, src != nullptr);
+        const bool f16 = prompt_f16();
+        std::fprintf(stderr,
+                     "strata trace: prefill inputs chunk=%lld borrow=%d borrow_bytes=%llu ring_slots=%d ring_cap=%d "
+                     "maxblob_bytes=%llu arena_layout_bytes=%llu dense_scratch_elems=%lld workspace_bytes=%llu "
+                     "mmq_any=%d mmq_fallback=%d mmq_gu_max=%llu mmq_d_max=%llu fused=%d f16_io=%d\n",
+                     (long long) chunk, (int) (borrow != nullptr), (unsigned long long) borrow_bytes,
+                     ring_slots((size_t) chunk), ring_cap(), (unsigned long long) MAXBLOB(),
+                     (unsigned long long) wsl.bytes, (long long) GEMM_SCRATCH,
+                     (unsigned long long) (select_shared_stage ? (8u << 20) : GEMM_WS),
+                     (int) mp.any, (int) mp.fallback, (unsigned long long) mp.gu_max,
+                     (unsigned long long) mp.d_max, (int) fz, (int) f16);
+        const strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+        const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+        std::fprintf(stderr,
+                     "strata trace: prefill takes n_embd=%lld hc=%lld hc_lr=%lld n_expert=%lld n_layers=%lld "
+                     "stage=%lld..%lld n_head=%lld n_head_kv=%lld head_dim=%lld idx_q_heads=%lld idx_key_dim=%lld "
+                     "page_size=%lld idx_block=%lld kv_mode=%d kv_hybrid=%d kv_q4=%d kv_int8=%d n_pages=%lld "
+                     "max_cells=%lld kv_stage_own=%d bytes_needed_owned=%llu\n",
+                     (long long) g.n_embd, (long long) g.hc, (long long) g.hc_lr, (long long) g.n_expert,
+                     (long long) g.n_layers, (long long) stage_lb_, (long long) stage_le_,
+                     (long long) g.n_head, (long long) g.n_head_kv, (long long) g.head_dim,
+                     (long long) g.idx_q_heads, (long long) g.idx_key_dim, (long long) sh.page_size,
+                     (long long) sh.idx_block, (int) q0.kv_mode, (int) q0.kv_hybrid, (int) q0.kv_q4,
+                     (int) q0.kv_int8, (long long) q0.n_pages, (long long) q0.max_cells, (int) stage_own(),
+                     (unsigned long long) bytes_needed_owned(g, ss, chunk));
+    }
+#endif
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
@@ -1182,10 +1258,32 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     {
-        uint16_t* gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
-        void* ws = o.take<uint8_t>(GEMM_WS, ok);
+        uint16_t* gs = nullptr;
+        void* ws = nullptr;
+        const size_t workspace_bytes = select_shared_stage ? (8u << 20) : GEMM_WS;
+        if (select_shared_stage) {
+            strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+            s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
+            Alloc count; count.count_only = true;
+            strata::kernels::KvHostPools stage;
+            take_stage(count, ss, s, stage, ok);
+            const auto layout = detail::shared_gemm_stage_layout(weight_scratch_layout().bytes, workspace_bytes,
+                                                                 count.used);
+            uint8_t* slab = o.take<uint8_t>((size_t) layout.shared_payload_bytes, ok);
+            if (ok) {
+                gs = reinterpret_cast<uint16_t*>(slab);
+                ws = slab + layout.workspace_offset_bytes;
+                m.shared_stage_bytes = layout.shared_payload_bytes;
+            }
+        } else {
+            gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
+            ws = o.take<uint8_t>(GEMM_WS, ok);
+        }
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
-        if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
+        if (prepared_gemm) {
+            if (!m.gemm.rebind(gs, GEMM_SCRATCH, ws, workspace_bytes, err)) return false;
+        } else if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
+        m.shared_stage = select_shared_stage;
         // this stage's device decides, once, here (init runs on the stage's own device): its gr_* kernels write the
         // image its GEMMs read, and set_act_f16 writes that device's symbol
         const core::OnDevice on_stage(m.device);
@@ -1326,7 +1424,15 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    if (m.shared_stage) {
+        // Fixed same-stream alias window: all Q/K/V/indexer projections finish before staging/append, and the
+        // final attention reader finishes before attn_output reuses the weight arena/workspace. The expert copy
+        // ring, activations and identity page table remain separate; no other instance may attach to this slab.
+        Alloc stage;
+        stage.base = reinterpret_cast<uint8_t*>(m.gemm.scratch());
+        stage.cap = m.shared_stage_bytes;
+        take_stage(stage, ss, s, m.stage, ok);
+    } else take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     return ok;
 }
@@ -1349,7 +1455,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.owned = &m.owned;
     uint16_t* gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
-    if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
+    if (ok && !m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
     if (!ok || !carve((size_t) chunk, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
@@ -1364,6 +1470,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+bool Prefill::shared_stage() const { return impl_->shared_stage; }
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
@@ -1558,6 +1665,10 @@ double split_help_frac(int64_t T) {
 
 bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     Impl& m = *impl_;
+    if (m.shared_stage || (helper != nullptr && helper->impl_->shared_stage)) {
+        err = "prefill: shared GEMM/KV stage cannot attach a stage helper";
+        return false;
+    }
     m.help_pp.reset();
     if (helper == nullptr || helper == this || !split_help_env()) return true;
     const Impl& h = *helper->impl_;
@@ -1663,6 +1774,10 @@ bool Prefill::bind_stage_helper(int64_t T) {
 
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
+    if (m.shared_stage) {
+        err = "prefill: shared GEMM/KV stage cannot attach a peer";
+        return false;
+    }
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // Without P2P the activations and the result rows take the mapped host route of the layer split's helper
     // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
@@ -2052,12 +2167,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
-    // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
-    static const bool kv_prefetch_on = [] {
-        const char* e = std::getenv("STRATA_KV_PREFETCH");
-        return e ? std::atoi(e) != 0 : false;
-    }();
-    const bool kv_prefetch = kv_prefetch_on;
+    const bool kv_prefetch = kv_prefetch_enabled();
     if (kv_prefetch) {
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||

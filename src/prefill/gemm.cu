@@ -391,17 +391,58 @@ Gemm::~Gemm() {
     }
 }
 
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+namespace {
+// STRATA_TRACE, Windows CUDA only (the established Windows-CUDA predicate): exact-byte free-memory samples around
+// init_external's cublasCreate and setup. Samples include scratch/workspace only if the caller allocated them
+// before this function (the private owned pressure path prepares with null buffers, then rebinds). Only the change
+// between samples belongs to what ran between them; no sample re-prices buffers as handle cost. A failed sync or
+// query prints both statuses and no value; a failed query is never a zero measurement. Trace-off runs no CUDA call
+// and prints nothing.
+constexpr uint64_t kTraceUnread = ~0ull;   // the sample could not be read: report no value, not zero
+uint64_t trace_free_bytes(const char* where) {
+    if (std::getenv("STRATA_TRACE") == nullptr) return kTraceUnread;
+    const cudaError_t sync = cudaDeviceSynchronize();
+    size_t free_bytes = 0, total_bytes = 0;
+    const cudaError_t query = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (sync != cudaSuccess || query != cudaSuccess) {
+        std::fprintf(stderr,
+                     "strata trace: gemm init_external %s: sync status %d, query status %d; no free-bytes value\n",
+                     where, (int) sync, (int) query);
+        return kTraceUnread;
+    }
+    std::fprintf(stderr, "strata trace: gemm init_external %s: free %llu of %llu bytes; sync status 0, query status 0\n",
+                 where, (unsigned long long) free_bytes, (unsigned long long) total_bytes);
+    return (uint64_t) free_bytes;
+}
+}  // namespace
+#endif
+
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                         std::string& err) {
+                         std::string& err, bool require_stream_binding) {
     cublasHandle_t h = nullptr;
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    const uint64_t free_pre = trace_free_bytes("before cublasCreate");
+#endif
     if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
         err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
         return false;
     }
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    const uint64_t free_post = trace_free_bytes("after cublasCreate");
+    if (free_pre != kTraceUnread && free_post != kTraceUnread)
+        std::fprintf(stderr, "strata trace: gemm init_external cublasCreate delta %+lld bytes (free after minus before)\n",
+                     (long long) free_post - (long long) free_pre);
+#endif
     handle_ = h;
     stream_ = stream;
     external_ = true;
-    note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
+    const cublasStatus_t stream_status = cublasSetStream(h, (cudaStream_t) stream);
+    if (require_stream_binding && stream_status != CUBLAS_STATUS_SUCCESS) {
+        err = "prefill gemm: cublasSetStream: cuBLAS status " + std::to_string((int) stream_status);
+        return false;
+    }
+    note(stream_status, "cublasSetStream");
     workspace_ = workspace;
     note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
@@ -410,14 +451,24 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
 #endif
+#if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+    const uint64_t free_setup = trace_free_bytes("after setup");
+    if (free_post != kTraceUnread && free_setup != kTraceUnread)
+        std::fprintf(stderr, "strata trace: gemm init_external setup delta %+lld bytes (free after minus before)\n",
+                     (long long) free_setup - (long long) free_post);
+#endif
     return true;
 }
 
-void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes) {
+bool Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes, std::string& err) {
+    if (const cublasStatus_t s = cublasSetWorkspace((cublasHandle_t) handle_, workspace, ws_bytes);
+        s != CUBLAS_STATUS_SUCCESS) {
+        err = "prefill gemm: cublasSetWorkspace: cuBLAS status " + std::to_string((int) s);
+        return false;
+    }
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
-    cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (hipblaslt_state_) {
         auto* state = static_cast<HipLtState*>(hipblaslt_state_);
@@ -425,6 +476,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
         state->workspace_bytes = ws_bytes;
     }
 #endif
+    return true;
 }
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {

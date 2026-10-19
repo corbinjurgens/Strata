@@ -418,7 +418,7 @@ At 131072 context, the default GPU choices are:
 | --- | --- | --- |
 | KV storage / GPU resident cells | q4_0 / 20480 | int8 / 32768 |
 | Prefill chunks | 64, separate buffers (`--no-prefill-borrow`) | auto, normal borrowing |
-| Explicit VRAM reserve | 400 MiB at 128K; 448 MiB at 64K or below | 1024 MiB |
+| VRAM reserve request | Engine automatic at 128K; explicit 448 MiB at 64K or below | Explicit 1024 MiB |
 | Owned-buffer pricing | `STRATA_OWNED_PRICE=exact` | normal pricing |
 | MTP, suffix and lookup drafting | off; verifier window 2 | off; verifier window 2 |
 
@@ -430,12 +430,15 @@ The expert pool is the smaller remaining physical/commit budget, capped at 42.9 
 the helper allows 2 GiB for CPU/server use, 0.5 GiB for later startup buffers on a small GPU or 1 GiB on the
 desktop, streamed KV storage for 13 layers at the selected context/precision, and application headroom of
 8 GiB on systems with at least 48 GiB RAM or 4 GiB below that. The Windows commit calculation also reserves
-GPU memory less the configured VRAM reserve; this GPU allowance is not subtracted again from physical RAM.
+GPU memory less an explicit configured VRAM reserve, or full GPU memory when the reserve flag is absent;
+this GPU allowance is not subtracted again from physical RAM. An absent flag lets the engine choose its
+reserve and does not request a zero reserve.
 If available-memory telemetry is missing, the helper discloses its fallback estimate of 65% of total RAM.
 Missing Windows commit telemetry falls back to the physical pool for planning. These fallbacks are labelled
 unverified: read-only planning and preparation remain available, but cannot establish launch feasibility.
 These are policy allowances, not measured worst-case memory requirements. The laptop's 8 GiB headroom applies
-to system RAM; its 400 MiB GPU reserve is separate and has not been validated for normal external-monitor use.
+to system RAM; the engine's automatic GPU reserve is separate. The changed default has only the bounded
+measurement below, which does not validate normal external-monitor use or the requested host allowance.
 Everyday laptop acceptance keeps the external monitor connected and normal applications open, and samples
 actual free VRAM rather than assuming all 6 GB is available.
 
@@ -586,6 +589,374 @@ Historical preparation on 2026-10-09 used the RTX 4080 SUPER 16 GB, 30.88 GiB us
 driver 617.14, CUDA 13.4.92 and MSVC 19.44.35229. Its sm_89 engine built and ran its help command; all three
 model hashes passed, and `--compat-bf16` packing produced the 1.38 GiB arena. Those checks establish that
 preparation step, not the performance of the newer automatic policy.
+
+## RTX 4050 comparison after the desktop changes, 2026-10-16
+
+The pre-pull source `63a01bba` and desktop source `9c16f6f1` were rebuilt with the same
+CUDA 13.4 / MSVC 19.43 toolchain, sm_89 flags and identical local GGML inputs. The machine
+was the RTX 4050 Laptop 6 GB / i7-13700H, with 63.71 GiB usable RAM, Windows 11,
+driver 617.42, no pagefile, an MSI M480 PRO NVMe SSD, the internal display and normal
+applications including Codex open. These were automated tests; UI responsiveness was
+not observed, and an external monitor was not connected.
+
+The existing static 39 GiB pinned profile was stopped during warmup on the old source:
+available commit reached 2.006 GiB and stayed below 4 GiB for five samples, despite
+the engine clamping the pinned allocation to 29.26 GiB. This is separate from an
+engine performance comparison. An eager-loading current-source control started at
+266 MiB CUDA-free but reached 234 MiB after warmup; the guard stopped it too.
+A separate baseline diagnostic, with only the current request-end `mem_mark` added,
+reproduced the same 234 MiB reading under identical eager controls. This confirms
+that shortfall predates the pull. Its source and original executable were restored;
+the diagnostic binary was not used for performance measurements.
+
+The matched comparison therefore used explicit `CUDA_MODULE_LOADING=LAZY`, 16 GiB
+pinned experts, 4096 MiB compact recent retention and 8 GiB host headroom. Capacity
+was 65536, q4_0 KV with 20480 resident cells, 256-token separate prefill buffers,
+verifier window 2 and no MTP, suffix or lookup drafting. These frozen controls
+used the existing GGUF-in-place pack; they are not refreshed automatic budgets.
+
+| Source / ready-copy setting | Decode tokens/s, two runs | Fresh 2048-token prefill, seconds |
+| --- | --- | --- |
+| Pre-pull `63a01bba`, off | 10.30 / 10.51 | 67.642 / 64.127 |
+| Current `9c16f6f1`, off | 10.16 / 10.41 | 64.124 / 66.549 |
+| Current `9c16f6f1`, on | 10.32 / 10.21 | 52.452 / 53.450 |
+
+Order was old / current-off / current-on / current-on / current-off / old. Each
+run used the same warmup, two rounds of the same three 160-token generation cases,
+fresh retrieval and a cached follow-up. All timed output sequences matched exactly,
+all retrieval/follow-up checks passed, and each run realized 59 GPU expert slots
+and 16 GiB pinned experts. Pooled decode was 10.40 before and 10.28 after; these
+overlapping short-run ranges do not establish a material regression or gain.
+
+Ready-copy reuse reduced prefill time by 18.20% and 16.65% against the faster
+current-source off control. It did not establish a decode gain. This is a 2K
+workload at 64K capacity, not the desktop's 8K test or a full-context result.
+Across this block, available commit stayed above 11.28 GiB. Current-source stage
+samples stayed at or above 420 MiB CUDA-free; the old source lacked the request-end
+trace, so its 472 MiB startup sample is not a continuous or comparable runtime minimum.
+
+The hardware-policy comparison produced identical argument/environment choices at
+both revisions across 48 healthy RAM/VRAM/context/memory combinations. The Python
+preparation, server configuration and benchmark suites passed 146 tests; the focused
+C++ cache-retry, file-source and prefill-allocation checks also passed. Local raw
+results, protected-file receipts, build provenance and harnesses are under
+`build-unsloth/msi4050-20261016/`. Existing engines and saved launchers were preserved.
+
+### Contiguous-layout pilot and refreshed automatic profile
+
+A separate contiguous pack was built with bounded buffers and independently compared
+against every original GGUF expert slice. All 46084915200 expert bytes matched; its
+SHA-256 was `5a71d41249331ac874f97f998e0ec807c13318ca0e0b8a334a9c0ca4e600cc07`,
+the same as the desktop artifact. Dense weights, index, layout and tokenizer hashes
+also matched the installed pack. With only the pack path changed from the frozen
+current-source off controls, one pilot measured 12.20 decode tokens/s and 22.807 seconds
+for fresh 2K prefill. That is 17.22% faster decode and 64.43% less prefill time than
+the faster current-source controls. All timed outputs and retrieval checks matched.
+Preparation and verification warmed storage; this was not a cold-cache test or a
+repeated storage-layout acceptance block. The additional 42.92 GiB expert file and
+copied pack files were removed after measurement; receipts and reproduction code remain.
+
+The old local pack initially lacked `source-verification.json`, so automatic startup
+was refused before engine creation. All original GGUF SHA-256 checks then passed and
+the verification receipt was added without rewriting the weights. The prepared eager
+128K profile was subsequently refused at 216 MiB CUDA-free, below the 256 MiB floor.
+
+A separate refreshed automatic profile using the original GGUF-in-place pack,
+explicit lazy CUDA and ready-copy reuse passed arithmetic, cached answers, three
+512-token generations, their cached follow-ups, 30 seconds of idle monitoring, and
+fresh 2048-token retrieval plus 2073-token cached reuse. Capacity stayed 131072,
+q4_0 KV and 20480 resident cells; prefill was 64. The runtime requested 17 GiB pinned
+and 7562 MiB recent, with the recent target finalized at 7053 MiB. Sustained generations
+measured 11.5 / 11.2 / 12.0 tokens/s. These different automatic allocations and workloads
+are not a matched speed comparison against the frozen 64K controls.
+
+Minimum physical RAM available was 19.52 GiB, commit available 7.549 GiB and logged
+CUDA-free memory 378 MiB. Five memory samples during fresh retrieval were below the
+requested 8 GiB commit allowance; the final memory sample recovered to 8.67 GiB.
+The run passed the 2 GiB immediate / 4 GiB sustained commit guards, but does not
+establish that the requested 8 GiB headroom is always retained. Stage readings are
+not continuous VRAM minima. Full near-128K inputs, external displays, observed UI
+responsiveness, HIP/SYCL and Linux remain unverified.
+
+An unselected local candidate is available at
+`build-unsloth/msi4050-20261016/run-automatic-128k.bat`, with an authenticated loopback
+profile on port 8081. It keeps automatic memory sizing, explicit lazy loading and
+ready-copy reuse; restart resamples memory. This is an experimental local candidate,
+not a default change or full-context acceptance.
+
+## Opt-in shared prefill stage on the RTX 4050, 2026-10-18
+
+Commit `1357a2d7` adds a prototype switch that is off by default. Setting
+`STRATA_PREFILL_SHARED_STAGE=1` lets the Windows CUDA prompt path with an automatic expert cache
+choose a shared prefill stage instead of the separate one. Nothing changes without the variable,
+with an explicit `--expert-cache`, or with a helper, peer, split, pipeline, batch or borrowed
+buffer, and HIP/SYCL never select it. The automatic cache price is unchanged, so any saving appears
+as free VRAM rather than extra slots. The measurement below is a local prototype result, not
+adoption, and no product default changed.
+
+Measured on the same RTX 4050 Laptop 6 GB / i7-13700H / 63.71 GiB RAM / Windows 11 / no pagefile
+machine, CUDA 13.4 / MSVC 19.43, EAGER q4_0, with the short-validation sequence: warmup, exact arithmetic, cached
+follow-up, three 512-token sustained generations with cached follow-ups, a fresh 2048-token
+retrieval and its cached reuse.
+
+| Capacity, reserve | Default (env unset) | `STRATA_PREFILL_SHARED_STAGE=1` |
+| --- | --- | --- |
+| 128K, automatic | Refused before any request: 238 MiB free after all buffers, below the 256 MiB floor | Ready at 340 MiB, all requests passed, minimum 270 MiB |
+| 64K, saved 448 MiB | 234 MiB after the first request (pre-prototype run) | All requests passed, minimum 262 MiB, 32 (37) slots |
+| 64K, automatic | Separate by default; no matched automatic run | Selected separate, all requests passed, minimum 258 MiB |
+
+The frozen 128K reserve from the 2026-10-16 block was a different operating point: at an explicit
+400 MiB reserve the prototype selected shared and still fell to 248 MiB after the fresh 2K prompt,
+eight below the floor, and the guard stopped that run before its retrieval checks were saved. The
+216 MiB refusal in that earlier block was on this same frozen reserve. The automatic path instead
+adapted 700 MiB to a 423 MiB reserve with 1 slot and passed at 270 MiB. At 64K the automatic path
+selects separate even with the variable, because the selection threshold is 256 MiB plus a 64 MiB
+allowance (`src/prefill/buffer_layout.hpp`) and free minus owned was 360 MiB; the variable changes
+nothing there.
+
+Output parity was checked at 64K on a private build that forces the choice and differs from the
+committed heuristic by that predicate alone (never committed): all 11 requests produced identical
+outputs on both layouts, and shared left 66 MiB more free (396 vs 330 MiB at ready, 326 vs 260 MiB
+after the sequence). The committed shared selection was measured directly at 128K automatic, where
+outputs matched the 64K separate run at equal slot count; the 13-slot 128K run differed on the three
+sustained 512-token texts, consistent with a slot-count rounding effect that was not isolated. The
+8K fresh prompt was tested only at 64K on the separate layout (265.2 s, 256 MiB minimum, 4 MiB more
+than 2K). No speed claim follows: the 131.2 s 2K prefill was measured at 13 slots in the frozen-400
+run that ended at 248 MiB, while the automatic 1-slot run measured 130.8 s.
+
+Several phase-1 arms sampled minimum commit between 7.21 and 7.88 GiB, below the configured 8 GiB
+laptop headroom, although the emergency stops (commit below 2 GiB immediately, below 4 GiB over five
+samples) never fired. This does not establish whole-plan acceptance. The RTX 4080 SUPER healthy-card
+check now has the bounded 2026-10-18 result below; the gfx1100 HIP engine and its fixture compile and
+link in a private ROCm 10.2 / Clang 24 SDK with no AMD runtime. The full SYCL engine also compiles
+and links in a private WSL2 / Ubuntu 24.04 build with oneAPI 2026.2 after correcting stale
+`NativeDense` private-member references in the SYCL implementation; its allocation and cleanup
+sequence is unchanged. No AMD or Intel GPU runtime was exercised. Near-128K inputs, an external
+display, observed responsiveness and host commit headroom remain open. Raw records (per-arm profiles,
+protection receipts, request-arm records and console logs) are under
+`build-unsloth/cross-pc-memory-20261016-opencode/phase1/`.
+
+## Shared-stage preservation and selector check on the RTX 4080 SUPER, 2026-10-18
+
+Commit `1357a2d7` was then checked against its parent `e6dab366` on the same desktop used on
+2026-10-15: RTX 4080 SUPER 16 GB, Ryzen 7 9800X3D, 30.88 GiB usable RAM and Windows with a 28 GiB
+pagefile. Both builds used the same CUDA 13.4.92 / MSVC 19.44.35229 / sm89 toolchain, and each passed
+the same four focused CTests (expert-cache retry, prefill buffer layout, prefill allocation and
+prefill fallback allocation); the candidate's test time was 3.32 s and the parent's 4.16 s, which is
+not a model-speed result.
+
+Twelve arms ran one build each: the parent, the candidate with the variable unset and the candidate
+with `STRATA_PREFILL_SHARED_STAGE=1`, at 64K and 128K, in two groups. Every arm ran the same
+11-request sequence (warmup, exact arithmetic, cached follow-up, three 512-token generations with
+cached follow-ups, a fresh 2K retrieval and its cached reuse) on UD-Q2_K_XL with int8 KV, 32768
+resident cells, verifier window 2, automatic expert cache, a 12 GiB resident budget, a 1024 MiB GPU
+reserve, 4 GiB host headroom, a compact recent cache, eager CUDA loading and ready-copy reuse off.
+Both capacities are the configured limits; no arm sent a full-context input.
+
+Group A kept the preserved desktop profile, whose prompt path borrows 1963 cache slots (3.43 GiB) at
+128K and 1926 slots (3.37 GiB) at 64K. That path emits no selection line and never exercises the
+shared-stage choice. Group B was a controlled diagnostic that adds only `--no-prefill-borrow`; its
+prompt path allocates its own buffers with an effective prefill chunk of 2048. This diagnostic
+does not replace the user's saved profile or change a default.
+
+Every candidate arm reproduced its parent: all 11 requests returned identical text and identical
+prompt and completion usage counts, in all eight parent/candidate comparisons. Slot counts matched
+within each group (A 5270 at 128K and 5334 at 64K, B 4422 at 128K and 4486 at 64K), and the minimum
+enforced free VRAM was 683, 683, 1011 and 1077 MiB respectively, the same across the three arms
+of each group. Both group-B arms that set the variable selected the separate stage, so no arm on this
+desktop ran the shared stage.
+
+The group-B arms with the variable set prepared the GEMM handle earlier, before the pressure
+query, so its free-after-host-staging reading is 218 MiB lower (2545 to 2327 MiB at 128K, 2543 to
+2325 MiB at 64K) while the later stage and free VRAM match. That is a startup ordering difference,
+not a saving, and not a speed proof. The parent's group-A 64K arm reached a physical minimum of
+3.9724617 GiB with 6 of 250 samples below 4 GiB, missing its configured host floor even though the
+emergency guard never fired; the other eleven arms sampled physical minima from 4.0253 to 4.2447 GiB
+and commit minima from 14.0364 to 14.7118 GiB. Machine-wide samples give no overall clean acceptance
+and no basis for blaming the parent's code. Recent-cache host targets varied per arm automatically,
+so bit-identical host allocations are not claimed. The original CPU guard self-check command and
+pass output were later recovered from the desktop session transcript, including the pinned harness
+hashes; it completed before the first model arm. The same transcript records a final 55-file
+comparison with no changes. Per-arm receipts retain the 55-file count and empty change lists,
+alongside 37-file hash maps; full 55-file per-arm post-maps were not saved.
+
+Raw arms, layouts, protection receipts and telemetry are under
+`build-unsloth/cross-pc-memory-20261018-desktop-evidence-r1/`.
+
+## Automatic shared-stage selection on Windows CUDA, 2026-10-18
+
+The eligible Windows CUDA automatic path now selects the shared stage under memory pressure without
+`STRATA_PREFILL_SHARED_STAGE`. It still requires an automatic expert cache and owned prompt buffers;
+peer, split, pipeline, batch and helper paths remain excluded, as do non-Windows, HIP and SYCL builds.
+The owner retains its physical eligibility checks and selects separate buffers when pressure is
+absent. Explicit expert-cache counts do not adapt, and explicit reserve values retain their meaning.
+
+The heuristic retains a known selection gap: its 320 MiB post-handle slack threshold is below the
+later costs measured on the 4050 (46 MiB for the verifier and 32 MiB for the first request). Slack
+between 320 and about 334 MiB can therefore select separate buffers and later hit the 256 MiB
+floor refusal even though shared buffers would have fit. Neither tested card was near this band:
+the 4050 had 248 MiB of slack, while the 4080 SUPER had gigabytes. These observed costs are not
+encoded as policy constants.
+
+The measurements above describe the env-gated prototype at `1357a2d7`. New default-path runs on
+the same 4050 used EAGER, q4_0 KV, automatic expert-cache counts and GPU reserve, ready-copy off,
+and frozen host budgets (16 GiB resident experts). Neither shared-stage prototype variable was set.
+Each run passed eleven requests: short answers and cached follow-ups, three 512-token generations
+with follow-ups, then a fresh 2K retrieval and cached retrieval.
+
+| Capacity | Selected layout | Automatic reserve / cache slots | Minimum logged CUDA free | Minimum available RAM / commit |
+|---|---|---|---|---|
+| 64K | Separate | 513 MiB / 1 | 260 MiB | 17.061 / 7.422 GiB |
+| 128K | Shared | 423 MiB / 1 | 270 MiB | 16.761 / 7.687 GiB |
+
+Both passed the short 256 MiB CUDA gate. Each run's text and prompt/completion token counts matched
+all eleven requests from its historical one-slot reference (64K separate, 128K shared). Protected
+files were unchanged, the test port closed, and no owned engine survived. CUDA/HIP compile-link
+and focused CUDA tests passed (5/5); unchanged SYCL sources retain the prior full-engine build.
+The fresh 2K prefills took 67.4 s and 130.5 s respectively; these are not speed comparisons.
+
+Both runs failed the stronger 8 GiB host-commit requirement. Host sample gaps reached 4.50 s at
+64K and 1.93 s at 128K, so these records also do not establish continuous or once-per-second host
+coverage. Frozen host budgets do not verify live host-plan resampling. Raw evidence is under
+`build-unsloth/cross-pc-memory-20261018-auto/phase1/`; source and binary hashes are in the build
+receipts under `build-shared-stage-auto-20261018/`. Full-context inputs, host headroom,
+external-display, responsiveness, performance and whole-plan acceptance remain open.
+
+## Automatic host-budget observations on the RTX 4050, 2026-10-19
+
+Two later runs used source `31fbb474` on the same Windows RTX 4050 laptop, with
+63.7 GiB usable RAM and no pagefile. Both used EAGER loading, q4_0 KV, 128K capacity,
+automatic expert-cache and host budgets, an automatic GPU reserve, and ready-copy off.
+Each completed eleven requests, including three actual 512-token generations, a fresh
+2048-token retrieval, its cached follow-up, and at least 30 seconds of monotonic idle.
+These runs used a separate host-sampling process to avoid inventory work delaying
+the host samples. The original emergency guard and stronger 8 GiB host acceptance
+floor were preserved.
+
+| Arm | Pinned experts | Recent-cache requested target | Minimum available RAM / commit | Minimum logged CUDA free | Maximum host-sample gap |
+|---|---|---|---|---|---|
+| `accept128-r3` | 16 GiB | 7936 MiB | 17.860 / 8.001747 GiB | 270 MiB | 0.453 s |
+| `accept128-r4` | 17 GiB | 7697 MiB | 17.709 / 8.050774 GiB | 272 MiB | 0.422 s |
+
+The automatic host policy resampled at each launch; the cache budgets were not
+frozen across these arms. In r4 the later recent-cache target was 7427.5 MiB.
+Targets do not establish actual allocated capacity. All arithmetic and retrieval
+checks passed, prompts were retained, and the cached retrieval reused 2073 of
+2108 tokens. Protected profiles, launchers and installed engines were unchanged;
+recorded owned processes exited, the test port closed and GPU use returned to idle.
+
+Both raw sampled host minima passed. R3 had only 1.789 MiB of commit margin and
+an unexplained new OpenCode process, so its held-app condition remains confounded.
+R4 had 51.992 MiB of commit margin. Its full process inventories retained ordinary
+background launches matching the enabled two-minute Kindle Previewer scheduled
+task and the exact preexisting Task Scheduler process identity. That attribution
+was checked after the run; scheduler history was disabled, so historical task
+configuration is not proved. No new Codex, Claude or OpenCode identity appeared
+in r4's retained inventories. Normal background allocations remain included in
+the measured minima.
+
+R4 is qualified bounded acceptance under normal apps, with 1676 host samples and
+296 process inventories. Inventories are non-atomic and can miss short-lived
+processes; CUDA values are startup/request-stage samples. The narrow margin does
+not establish repeatability, a runtime memory guarantee, performance parity or
+near-128K input acceptance. No production accounting change was made for these
+runs, and the remaining cross-PC and whole-plan obligations stay open. Raw records
+are under `build-unsloth/cross-pc-memory-20261018-host-accept/phase2/`; executable
+and source hashes are in the preserved build receipt and per-arm receipts.
+
+### Generated-default reserve correction
+
+Two additional RTX 4050 runs on October 19 used the same uninstrumented `31fbb474` engine,
+EAGER/q4_0, 131072-token capacity, prefill 64 and an 8 GiB physical/commit acceptance floor.
+Defender was enabled and the user had closed applications; these differ from the earlier normal-app runs.
+
+| Arm | Generated GPU reserve | Workload | Minimum sampled RAM / commit | Minimum logged CUDA free |
+|---|---|---|---|---|
+| `accept128-default-r1` | Explicit 400 MiB | Ten requests; guard stopped after fresh retrieval | 16.748169 / 7.636311 GiB | 250 MiB |
+| `accept128-default-fixed-r1` | Flag absent; engine adapted 700 to 423 MiB | Eleven requests and 30.016 s final idle | 17.271202 / 7.945656 GiB | 270 MiB |
+
+The helper correction removes the explicit reserve only from generated small-GPU 128K profiles and
+charges full VRAM in Windows commit planning. The second run used helper SHA-256 `35a40310` with the
+retained engine; it is not an unchanged `31fbb474` pipeline. Explicit overrides and static profiles remain
+preserved. Existing managed profiles refresh in memory without rewriting their saved bytes. CPU checks
+passed 151 tests; independent review exercised the actual server argument consumer and override ownership.
+
+The corrected run passed exact answers, three actual 512-token generations, fresh 2048-token retrieval
+and 2073 cached tokens on reuse. Its CUDA stage samples passed the unchanged 256 MiB emergency floor,
+but host acceptance still failed: commit fell 55.648 MiB below 8 GiB. The minimum preceded fresh retrieval;
+1603 host samples had a maximum gap of 0.719 s. New T3-parented Codex/Claude processes and Git activity
+were recorded, so neither run establishes held-app isolation or a causal host-performance improvement.
+No outside memory was subtracted. Logged CUDA values are stage samples, not continuous telemetry.
+
+Both runs retained protected profile/launcher/engine bytes and ended with no engine, compute process or
+test-port listener. The external owned Job terminated a remaining console host in each run; this is
+qualified cleanup rather than natural process disappearance. The GPU-reserve correction addresses the
+bounded generated-default CUDA failure. Production host accounting, repeatability, long-input and
+whole-phase acceptance remain open; no additional host reserve is justified by these observations.
+
+### Private direct-read scratch observation
+
+A separate diagnostic build of `31fbb474` added host and Windows direct-read
+scratch tracing without changing allocation sizes, budgets or guards. It ran the
+same eleven-request sequence on this laptop, EAGER/q4_0 at 128K capacity, from
+03:24 to 03:30 JST on October 19. Checks and the final 30-second idle passed;
+automatic planning chose 17 GiB pinned and a 7538 MiB recent-cache target, later
+7199.2 MiB. This is an instrumented observation, not another uninstrumented arm.
+
+The external observer recorded 1666 host samples with a maximum gap of 0.531 s,
+minimum commit 8.102779 GiB and physical RAM 17.858990 GiB. The engine's 79 host
+trace rows captured lower minima: commit 8.048862 GiB and physical RAM 17.811138
+GiB. Both streams passed the 8 GiB floor; the smallest observed commit margin
+was 50.035 MiB. Enforced CUDA stage samples stayed at or above 270 MiB. Owned
+process identities were absent after cleanup, GPU use returned to zero, the port
+closed and protected profile, launcher and engine hashes matched.
+
+There were 444 scratch events over 47 observed thread lifetimes. The largest
+buffer was 92 MiB; summing each lifetime's maximum gives a conservative 656 MiB
+capacity ceiling, plus 111804 bytes of vector capacity. This is not a simultaneous
+peak or process-commit measurement. Only 14 destruction sequences were observed;
+termination lifetimes are incomplete, and cross-thread timestamps are not globally
+ordered. Allocator overhead and kernel event storage are excluded.
+
+The planner already reserves 2 GiB for CPU/server and 0.5 GiB for later startup
+on this small-GPU policy. This measurement does not prove scratch was omitted
+from those allowances or justify an additional reserve. Normal background work
+remains included. No production accounting change, repeatability, speed or
+near-full-context claim follows. Private evidence is retained under
+`build-unsloth/cross-pc-memory-20261018-host-trace/phase2/trace128-scratch-r1`.
+
+## Automatic host-budget observation on the RTX 4080 SUPER, 2026-10-19
+
+A later desktop run used source `31fbb474` on the RTX 4080 SUPER with 30.88 GiB
+usable RAM and a 58.88 GiB Windows commit limit. It used automatic EAGER/int8,
+128K capacity, 32768 resident KV cells, 4 GiB host headroom and ready-copy off,
+with no explicit VRAM reserve. Planning chose 9 GiB pinned experts and a 4182 MiB
+recent-cache target; the server resampled that target to 4145 MiB.
+
+The eleven-request sequence passed, including three actual 512-token generations,
+a fresh 2048-token retrieval, cached reuse of 2073 tokens and 30.005 seconds of
+monotonic idle. An independent host process recorded 1788 samples with a maximum
+gap of 0.209 s. Minimum available physical RAM was 4.015236 GiB and commit was
+13.739719 GiB. The physical margin above the requested floor was only 15.602 MiB.
+Enforced startup/request-stage CUDA samples stayed at or above 359 MiB; CUDA was
+not sampled continuously through idle.
+
+This is a qualified observed short-workload pass. Process inventories recorded
+outside Git and Python launches descending from preexisting Obsidian, a new
+Codex process, and changing MSI service and T3 memory. Both host minima occurred
+during the short idle before fresh retrieval, overlapping an outside Python
+process. That overlap does not establish causation, and no outside memory was
+subtracted. Inventories are non-atomic and can miss short-lived processes.
+
+Recorded owned identities were absent at follow-up cleanup, protected profile,
+launcher and engine hashes matched, the test port had no listener, and the
+recorded outside GPU client list was unchanged. An earlier immediate conhost
+handle timeout remains in the evidence. These observations do not establish a
+clean held-app comparison, complete ownership accounting, repeatability,
+near-128K input acceptance or a speed improvement. Raw desktop records remain
+under `build-unsloth/cross-pc-memory-20261018-desktop-host/phase2/accept128-desktop-r2`
+and its sibling receipts in the retained canonical desktop worktree. No
+production budget, guard or profile change was made for this run.
 
 ## Shared automatic policy on the RTX 4080 SUPER, 2026-10-15
 

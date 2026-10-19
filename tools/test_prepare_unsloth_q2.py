@@ -68,13 +68,24 @@ class MemoryProfiles(unittest.TestCase):
         self.assertEqual(plan["later_startup_gib"], 1)
 
     def test_small_gpu_reserve_matches_context_and_commit_budget(self):
-        for context, reserve in ((8192, 448), (32768, 448), (65536, 448), (131072, 400)):
+        for context, pool in ((8192, 23.9375), (32768, 23.9375), (65536, 23.48046875)):
             with self.subTest(context=context):
                 plan = prep.memory_plan(63.7, 6, context, available_gib=58, commit_available_gib=40)
-                self.assertEqual(value(plan["args"], "--vram-reserve-mib"), str(reserve))
-                self.assertEqual(plan["gpu_commit_gib"], 6 - reserve / 1024)
-                self.assertAlmostEqual(plan["expert_pool_gib"],
-                                       40 - 8 - 0.5 - 2 - plan["kv_ram_gib"] - (6 - reserve / 1024))
+                self.assertEqual(value(plan["args"], "--vram-reserve-mib"), "448")
+                self.assertEqual(plan["gpu_commit_gib"], 5.5625)
+                self.assertEqual(plan["expert_pool_gib"], pool)
+
+    def test_small_gpu_128k_uses_engine_reserve_and_full_windows_gpu_commit(self):
+        plan = prep.memory_plan(63.7, 6, 131072, available_gib=58, commit_available_gib=40)
+        self.assertNotIn("--vram-reserve-mib", plan["args"])
+        self.assertEqual(plan["gpu_commit_gib"], 6)
+        self.assertEqual(plan["expert_pool_gib"], 22.5859375)
+        self.assertEqual(plan["pinned_gib"], 15)
+        self.assertEqual(plan["recent_mib"], 7768)
+        self.assertTrue(plan["automatic_host_cache"])
+        linux = prep.memory_plan(63.7, 6, 131072, available_gib=58, windows_commit=False)
+        self.assertNotIn("--vram-reserve-mib", linux["args"])
+        self.assertEqual(linux["gpu_commit_gib"], 0)
 
     def test_tight_commit_reduces_both_caches_without_changing_context(self):
         plan = prep.memory_plan(30.88, 15.99, 131072, available_gib=27, commit_available_gib=28)
@@ -430,8 +441,86 @@ class PortableProfiles(unittest.TestCase):
         self.assertEqual(value(refreshed["args"], "--kv"), "q4_0")
         self.assertEqual(value(refreshed["args"], "--max-context"), "131072")
         self.assertEqual(value(refreshed["args"], "--prefill"), "64")
-        self.assertEqual(value(refreshed["args"], "--vram-reserve-mib"), "400")
+        self.assertNotIn("--vram-reserve-mib", refreshed["args"])
         self.assertIn("--no-prefill-borrow", refreshed["args"])
+
+    def test_old_managed_128k_reserve_is_removed_at_read_only_server_preparation(self):
+        prep.setup.gpu_info.return_value["vram_gb"] = 6
+        prep.detected_memory.return_value.update(ram_gib=63.7, available_gib=58, commit_available_gib=40)
+        # Historical generated profiles recorded 400 in both argv and generated_args,
+        # with no explicit reserve override. Retain that provenance in this fixture.
+        cfg = self.make_config({"args": {"--vram-reserve-mib": "400"}})
+        cfg["memory_policy"]["overrides"] = {}
+        self.assertEqual(value(cfg["memory_policy"]["generated_args"], "--vram-reserve-mib"), "400")
+        self.assertEqual(cfg["env"]["STRATA_FILE_CACHE_MIB"], "7144")
+        original = json.dumps(cfg, indent=3).encode()
+        self.config.write_bytes(original)
+        with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                runtime = prep.prepare_launch(self.config)
+                self.assertNotIn("--vram-reserve-mib", runtime["args"])
+                self.assertNotIn("--vram-reserve-mib", runtime["memory_policy"]["generated_args"])
+                self.assertNotIn("--vram-reserve-mib", runtime["memory_policy"]["overrides"]["args"])
+                self.assertEqual(runtime["memory_policy"]["sample"]["gpu_commit_gib"], 6)
+                self.assertEqual(value(runtime["args"], "--resident-budget-gib"), "15")
+                self.assertEqual(runtime["env"]["STRATA_FILE_CACHE_MIB"], "7768")
+            again = prep.refreshed_config(runtime)
+        publish.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertNotIn("--vram-reserve-mib", again["args"])
+        self.assertNotIn("--vram-reserve-mib", again["memory_policy"]["overrides"]["args"])
+
+    def test_static_small_gpu_128k_400_reserve_skips_refresh_and_keeps_saved_bytes(self):
+        prep.setup.gpu_info.return_value["vram_gb"] = 6
+        cfg = self.make_config({"args": {"--vram-reserve-mib": "400"}})
+        cfg.pop("memory_policy")
+        original = json.dumps(cfg, indent=3).encode()
+        self.config.write_bytes(original)
+        with patch.object(prep, "detected_memory", side_effect=AssertionError("static memory sample")), \
+                patch.object(prep, "detected_gpu", side_effect=AssertionError("static GPU sample")), \
+                patch.object(prep, "atomic_files") as publish:
+            runtime = prep.prepare_launch(self.config)
+        publish.assert_not_called()
+        self.assertEqual(value(runtime["args"], "--vram-reserve-mib"), "400")
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_small_gpu_128k_explicit_reserves_and_removals_survive_refresh_and_preparation(self):
+        prep.setup.gpu_info.return_value["vram_gb"] = 6
+        prep.detected_memory.return_value.update(ram_gib=63.7, available_gib=58, commit_available_gib=40)
+        for raw, effective, gpu_commit in (("400", 400, 5.609375), ("0", 0, 6),
+                                            ("4e2", 4, 5.99609375), ("400.75", 400, 5.609375),
+                                            (None, 0, 6)):
+            with self.subTest(raw=raw):
+                cfg = self.make_config({"args": {"--vram-reserve-mib": raw}})
+                for _ in range(2):
+                    cfg = prep.refreshed_config(cfg)
+                    self.assertEqual(prep.flag_value(cfg["args"], "--vram-reserve-mib"), raw)
+                    self.assertEqual(cfg["memory_policy"]["overrides"]["args"]["--vram-reserve-mib"], raw)
+                original = prep.json_bytes(cfg)
+                self.config.write_bytes(original)
+                with patch.object(prep, "check_ready"), patch.object(prep, "atomic_files") as publish, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    runtime = prep.prepare_launch(self.config)
+                self.assertEqual(prep.flag_value(runtime["args"], "--vram-reserve-mib"), raw)
+                sample = runtime["memory_policy"]["sample"]
+                self.assertEqual(sample["vram_reserve_requested_mib"], float(raw) if raw is not None else 0)
+                self.assertEqual(sample["vram_reserve_mib"], effective)
+                self.assertEqual(sample["gpu_commit_gib"], gpu_commit)
+                publish.assert_not_called()
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_saved_small_gpu_128k_reserve_edits_and_removals_stay_explicit(self):
+        prep.setup.gpu_info.return_value["vram_gb"] = 6
+        for saved, generated in (("400", None), ("400", "448"), (None, "400")):
+            with self.subTest(saved=saved, generated=generated):
+                cfg = self.make_config()
+                prep.set_flag(cfg["memory_policy"]["generated_args"], "--vram-reserve-mib", generated)
+                prep.set_flag(cfg["args"], "--vram-reserve-mib", saved)
+                for _ in range(2):
+                    cfg = prep.refreshed_config(cfg)
+                    self.assertEqual(prep.flag_value(cfg["args"], "--vram-reserve-mib"), saved)
+                    self.assertEqual(cfg["memory_policy"]["overrides"]["args"]["--vram-reserve-mib"], saved)
 
     def test_laptop_refresh_preserves_explicit_vram_reserve(self):
         cfg = self.make_config({"args": {"--vram-reserve-mib": "448"}})

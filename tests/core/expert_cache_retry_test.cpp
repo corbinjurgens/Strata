@@ -23,6 +23,7 @@ struct Operations {
     std::vector<int> failed_opens;
     int fail_touch = 0;
     int fail_sync = 0;
+    int fail_query = 0;
     bool allocation_shrink_ok = true;
     bool reserve_shrink_ok = true;
     int opens = 0, touches = 0, syncs = 0, queries = 0, allocation_shrinks = 0, reserve_shrinks = 0;
@@ -50,12 +51,21 @@ struct Operations {
                 why = "cudaDeviceSynchronize failed: injected synchronization error";
                 return false;
             },
-            [&]() -> int64_t {
+            [&](int64_t& free_b, std::string& why) -> bool {
                 order += 'Q';
-                const size_t index = (size_t) queries++;
-                if (index < readings.size()) return readings[index];
+                const int nth = ++queries;
+                if (nth == fail_query) {
+                    why = "cudaMemGetInfo failed: injected query error";
+                    return false;
+                }
+                const size_t index = (size_t) (nth - 1);
+                if (index < readings.size()) {
+                    free_b = readings[index];
+                    return true;
+                }
                 check(false, "each queried free-memory reading was explicitly supplied");
-                return 0;
+                free_b = 0;
+                return true;
             },
             [&]() {
                 order += 'A';
@@ -121,6 +131,46 @@ int main() {
               "synchronization failure stops before query or shrinking");
         check(op.err == "cudaDeviceSynchronize failed: injected synchronization error",
               "synchronization operation and error are retained");
+    }
+    {
+        Operations op;
+        op.fail_query = 1;
+        const auto result = op.run();
+        check(result.status == ExpertCacheRetryStatus::validation_failed && result.allocation_retries == 0 &&
+              op.order == "OTSQ" && op.opens == 1 && op.touches == 1 && op.syncs == 1 && op.queries == 1 &&
+              op.reserve_shrinks == 0 && op.allocation_shrinks == 0,
+              "failed query at an ordinary reserve fails validation without shrink, reopen or retry");
+        check(op.err == "cudaMemGetInfo failed: injected query error",
+              "free-memory query failure retains its error text");
+    }
+    {
+        Operations op;
+        op.fail_query = 1;
+        const auto result = op.run(true, 64 * mib);
+        check(result.status == ExpertCacheRetryStatus::validation_failed && op.order == "OTSQ" &&
+              op.opens == 1 && op.queries == 1 && op.reserve_shrinks == 0,
+              "failed query at a low reserve fails validation instead of accepting the candidate");
+        check(op.err == "cudaMemGetInfo failed: injected query error",
+              "low-reserve free-memory query failure retains its error text");
+    }
+    {
+        Operations op;
+        op.readings = {0};
+        const auto result = op.run(true, 64 * mib);
+        check(result.status == ExpertCacheRetryStatus::ready && op.order == "OTSQ" && op.queries == 1 &&
+              op.reserve_shrinks == 0,
+              "a successful zero-byte reading at a low reserve stays a real reading, not a failure");
+    }
+    {
+        Operations op;
+        op.fail_query = 2;
+        op.readings = {400 * mib};
+        const auto result = op.run();
+        check(result.status == ExpertCacheRetryStatus::validation_failed && op.order == "OTSQROTSQ" &&
+              op.opens == 2 && op.queries == 2 && op.reserve_shrinks == 1 && op.allocation_shrinks == 0,
+              "query failure after a reserve shrink stops the loop with no further shrink or reopen");
+        check(op.err == "cudaMemGetInfo failed: injected query error",
+              "mid-retry free-memory query failure retains its error text");
     }
     {
         Operations op;

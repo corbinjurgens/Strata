@@ -400,7 +400,8 @@ Gemm::~Gemm() {
 
 bool Gemm::init_external(void *stream, uint16_t *scratch, int64_t scratch_elems,
                          void *workspace, size_t ws_bytes,
-                         std::string &err) try {
+                         std::string &err, bool require_stream_binding) try {
+    (void) require_stream_binding;
     dpct::blas::descriptor_ptr h = nullptr;
     if (const int s = DPCT_CHECK_ERROR(h = new dpct::blas::descriptor());
         s != 0) {
@@ -433,7 +434,8 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes) {
+bool Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes, std::string& err) {
+    (void) err;
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
@@ -448,6 +450,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
         state->workspace_bytes = ws_bytes;
     }
 #endif
+    return true;
 }
 
 bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) try {

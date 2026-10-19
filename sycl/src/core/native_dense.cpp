@@ -137,7 +137,7 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 
 NativeDense::~NativeDense() {
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
-    if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
+    if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
     for (void *p : weights_)
         DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
 }
@@ -151,7 +151,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
         return l < layer_lo || l >= layer_hi;
     };
-    if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
+    if (arena_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         std::vector<Pending> pending;
@@ -399,7 +399,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);
-        scratch_ = scratch.release();
+        arena_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         if (hc_q8_requested())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",

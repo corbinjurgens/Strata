@@ -150,8 +150,9 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
     headroom = float(4 if headroom_value is None else headroom_value)
     later = 0.5 if small_gpu else 1.0
     fixed = 2.0
-    # Match the measured laptop GPU settings: 448 MiB at 64K, 400 MiB at 128K.
-    default_reserve_mib = (400 if context > 65536 else 448) if small_gpu else 1024
+    # At 128K on a small GPU, leave reserve selection to the engine's automatic path.
+    # Its reserve can adapt, so charge full VRAM to Windows commit when no flag is given.
+    default_reserve_mib = (None if context > 65536 else 448) if small_gpu else 1024
     reserve_value = arg_overrides.get("--vram-reserve-mib", default_reserve_mib)
     reserve_mib = effective_vram_reserve_mib(reserve_value) if reserve_value is not None else 0
     gpu_commit = max(0, vram - reserve_mib / 1024) if windows_commit else 0
@@ -175,7 +176,9 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
         recent_mib = int(env_overrides["STRATA_FILE_CACHE_MIB"] or 0)
     args = ["--expert-cache", "auto", "--max-context", str(context), "--kv", kv,
             "--spec", "2", "--suffix-draft", "0", "--lookup-chain", "0",
-            "--resident-budget-gib", f"{budget:g}", "--vram-reserve-mib", f"{reserve_mib:g}"]
+            "--resident-budget-gib", f"{budget:g}"]
+    if reserve_value is not None:
+        args += ["--vram-reserve-mib", f"{reserve_mib:g}"]
     env = {"STRATA_RESIDENT_HEADROOM_GIB": f"{headroom:g}", "STRATA_FILE_CACHE_MIB": str(recent_mib),
            "STRATA_FILE_CACHE_COMPACT": "1"}
     if small_gpu:
