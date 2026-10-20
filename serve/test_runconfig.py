@@ -298,20 +298,159 @@ class Startup(unittest.TestCase):
                             self.assertNotIn(key, evidence)
                         self.assertEqual(path.read_bytes(), original)
 
-    def test_posix_metadata_only_managed_override_application_stays_unchanged(self):
+    def test_posix_metadata_only_managed_overrides_reach_refresh_startup_and_evidence(self):
         from tools import prepare_unsloth_q2 as prep
-        with patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
-                "available_gib": 27, "commit_available_gib": 60, "windows_commit": False}), \
-                patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
-                patch.object(prep.setup, "find_nvcc", return_value=(None, None)):
-            cfg = prep.config_for(Path("source"), Path("pack"), 131072, None)
-            key = "STRATA_RESIDENT_HEADROOM_GIB"
-            cfg["memory_policy"]["overrides"] = {"env": {key: "8", key.lower(): "6"}}
-            with patch.object(prep.os, "name", "posix"):
-                runtime = prep.refreshed_config(cfg)
-            self.assertEqual(runtime["env"][key], "4")
-            self.assertNotIn(key.lower(), runtime["env"])
-            self.assertEqual(runtime["memory_policy"]["overrides"]["env"][key.lower()], "6")
+        from tools import benchmark_compact_cache as benchmark
+        for key, raw in (("STRATA_RESIDENT_HEADROOM_GIB", "8"), ("STRATA_RESIDENT_HEADROOM_GIB", 8),
+                         ("STRATA_RESIDENT_HEADROOM_GIB", 8.0), ("STRATA_RESIDENT_HEADROOM_GIB", 0),
+                         ("STRATA_FILE_CACHE_MIB", "1024"), ("STRATA_FILE_CACHE_MIB", 1024),
+                         ("STRATA_FILE_CACHE_COMPACT", 0), ("STRATA_OWNED_PRICE", "exact")):
+            inherited = {key: "99", key.lower(): "inherited-lower", key.title(): "inherited-mixed",
+                         "Unknown_Case": "inherited"}
+            posix = SimpleNamespace(**{**vars(os), "name": "posix", "environ": inherited})
+            with self.subTest(key=key, raw=raw), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": None, "windows_commit": False}), \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready"), patch.object(prep, "report_memory") as report, \
+                    patch.object(prep, "os", posix), patch.object(server, "os", posix), \
+                    patch.object(benchmark, "os", posix):
+                path, cfg = self.fixture(Path(directory), prep)
+                cfg["memory_policy"]["overrides"] = {"env": {key: raw}}
+                cfg["env"].update({key.lower(): "saved-lower", key.title(): "saved-mixed", "Unknown_Case": "saved"})
+                original = prep.json_bytes(cfg)
+                path.write_bytes(original)
+                for _ in range(2):
+                    before = prep.json_bytes(cfg)
+                    runtime = prep.refreshed_config(cfg)
+                    self.assertEqual(prep.json_bytes(cfg), before)
+                    cfg = runtime
+                    for values in (cfg["env"], cfg["memory_policy"]["sample"]["env"],
+                                   cfg["memory_policy"]["overrides"]["env"]):
+                        self.assertEqual(values[key], raw)
+                        self.assertIs(type(values[key]), type(raw))
+                    self.assertEqual(cfg["env"][key.lower()], "saved-lower")
+                    self.assertEqual(cfg["env"][key.title()], "saved-mixed")
+                create, _, _ = self.run_main(path)
+                runtime = report.call_args.args[1]
+                plan = runtime["memory_policy"]["sample"]
+                if key == "STRATA_RESIDENT_HEADROOM_GIB":
+                    self.assertEqual(plan["headroom_gib"], float(raw))
+                elif key == "STRATA_FILE_CACHE_MIB":
+                    self.assertEqual(plan["recent_mib"], int(raw))
+                self.assertEqual(runtime["env"][key], raw)
+                self.assertIs(type(runtime["env"][key]), type(raw))
+                self.assertEqual(plan["env"][key], raw)
+                self.assertIs(type(plan["env"][key]), type(raw))
+                child = create.call_args.kwargs["env"]
+                self.assertEqual(child[key], str(raw))
+                self.assertEqual(child, server.child_env(runtime))
+                self.assertEqual(child[key.lower()], "saved-lower")
+                self.assertEqual(child[key.title()], "saved-mixed")
+                self.assertEqual(child["Unknown_Case"], "saved")
+                evidence = benchmark.safe_engine_environment(runtime, inherited)
+                self.assertEqual(evidence[key], child[key])
+                self.assertNotIn(key.lower(), evidence)
+                self.assertNotIn(key.title(), evidence)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_posix_metadata_override_yields_to_saved_edits_and_removals(self):
+        from tools import prepare_unsloth_q2 as prep
+        from tools import benchmark_compact_cache as benchmark
+        for key, metadata, edited in (("STRATA_RESIDENT_HEADROOM_GIB", "8", 6.0),
+                                      ("STRATA_RESIDENT_HEADROOM_GIB", 8, 8.0),
+                                      ("STRATA_RESIDENT_HEADROOM_GIB", 8.0, 8),
+                                      ("STRATA_FILE_CACHE_MIB", "1024", 2048),
+                                      ("STRATA_FILE_CACHE_COMPACT", "1", 0),
+                                      ("STRATA_OWNED_PRICE", "exact", "custom")):
+            for edit in ("value", "null", "delete", "metadata-null"):
+                inherited = {key: "99", key.lower(): "lower", key.title(): "mixed", "Unknown_Case": "keep"}
+                posix = SimpleNamespace(**{**vars(os), "name": "posix", "environ": inherited})
+                with self.subTest(key=key, metadata=metadata, edited=edited, edit=edit), \
+                        tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                            "available_gib": 27, "commit_available_gib": None, "windows_commit": False}), \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), patch.object(prep, "report_memory") as report, \
+                        patch.object(prep, "os", posix), patch.object(server, "os", posix), \
+                        patch.object(benchmark, "os", posix):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    # Include the normally absent large-GPU control in the saved generated layer.
+                    cfg["memory_policy"]["generated_env"].setdefault(key, metadata)
+                    if isinstance(metadata, (int, float)):
+                        cfg["memory_policy"]["generated_env"][key] = metadata
+                    cfg["memory_policy"]["overrides"] = {"env": {key: metadata}}
+                    if edit == "metadata-null":
+                        cfg["env"][key] = cfg["memory_policy"]["generated_env"][key]
+                        cfg["memory_policy"]["overrides"]["env"][key] = None
+                    else:
+                        cfg["env"].pop(key, None)
+                        if edit != "delete":
+                            cfg["env"][key] = edited if edit == "value" else None
+                    original = prep.json_bytes(cfg)
+                    path.write_bytes(original)
+                    for _ in range(2):
+                        cfg = prep.refreshed_config(cfg)
+                        self.assertEqual(cfg["memory_policy"]["overrides"]["env"][key],
+                                         edited if edit == "value" else None)
+                        if edit == "value":
+                            self.assertEqual(cfg["env"][key], edited)
+                            self.assertIs(type(cfg["env"][key]), type(edited))
+                            self.assertEqual(cfg["memory_policy"]["sample"]["env"][key], edited)
+                        else:
+                            self.assertNotIn(key, cfg["env"])
+                            self.assertNotIn(key, cfg["memory_policy"]["sample"]["env"])
+                    create, _, _ = self.run_main(path)
+                    runtime = report.call_args.args[1]
+                    child = create.call_args.kwargs["env"]
+                    evidence = benchmark.safe_engine_environment(runtime, inherited)
+                    if edit == "value":
+                        for env in (runtime["env"], runtime["memory_policy"]["sample"]["env"],
+                                    runtime["memory_policy"]["overrides"]["env"]):
+                            self.assertEqual(env[key], edited)
+                            self.assertIs(type(env[key]), type(edited))
+                        self.assertEqual(child[key], str(edited))
+                        self.assertEqual(evidence[key], str(edited))
+                    else:
+                        self.assertNotIn(key, child)
+                        self.assertNotIn(key, evidence)
+                        self.assertNotIn("None", child.values())
+                    self.assertEqual(child[key.lower()], "lower")
+                    self.assertEqual(child[key.title()], "mixed")
+                    self.assertEqual(child["Unknown_Case"], "keep")
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_invalid_posix_metadata_stops_public_main_before_sampling_or_startup(self):
+        from tools import prepare_unsloth_q2 as prep
+        cases = (("STRATA_RESIDENT_HEADROOM_GIB", "garbage"), ("STRATA_RESIDENT_HEADROOM_GIB", True),
+                 ("STRATA_RESIDENT_HEADROOM_GIB", "NaN"), ("STRATA_FILE_CACHE_MIB", "1.5"),
+                 ("STRATA_FILE_CACHE_MIB", 1.0), ("STRATA_FILE_CACHE_MIB", -1))
+        posix = SimpleNamespace(**{**vars(os), "name": "posix", "environ": {}})
+        for key, raw in cases:
+            with self.subTest(key=key, raw=raw), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": None, "windows_commit": False}) as memory, \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}) as gpu, \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "os", posix), patch.object(server, "os", posix):
+                path, cfg = self.fixture(Path(directory), prep)
+                cfg["memory_policy"]["overrides"] = {"env": {key: raw}}
+                original = prep.json_bytes(cfg)
+                path.write_bytes(original)
+                memory.reset_mock()
+                gpu.reset_mock()
+                with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path)]), \
+                        patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as listener, \
+                        patch.object(server, "serve") as http, patch.object(prep, "check_ready") as ready, \
+                        patch.object(prep.subprocess, "run") as process, patch("webbrowser.open") as browser, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    server.main()
+                self.assertEqual(error.exception.code, 2)
+                for seam in (memory, gpu, engine, listener, http, ready, process, browser):
+                    seam.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
 
     @unittest.skipUnless(os.name == "nt", "Windows policy spelling")
     def test_windows_managed_aliases_match_public_startup_plan_child_and_evidence(self):

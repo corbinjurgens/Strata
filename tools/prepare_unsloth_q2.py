@@ -109,8 +109,8 @@ def memory_environment(env: dict) -> dict:
 
 
 def same_environment_value(first, second) -> bool:
-    """Keep raw Windows edits distinct even when numeric values compare equal."""
-    return first == second and (os.name != "nt" or type(first) is type(second))
+    """Keep raw edits distinct even when numeric values compare equal."""
+    return first == second and type(first) is type(second)
 
 
 def validate_memory_overrides(overrides: dict) -> None:
@@ -635,7 +635,7 @@ def refreshed_config(cfg: dict) -> dict:
         if key in explicit.get("env", {}):
             if explicit["env"][key] is None:
                 env.pop(key, None)
-            elif os.name == "nt":
+            else:
                 env[key] = explicit["env"][key]
             continue
         if same_environment_value(env.get(key), policy["generated_env"].get(key)):

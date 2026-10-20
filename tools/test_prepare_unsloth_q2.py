@@ -513,6 +513,58 @@ class PortableProfiles(unittest.TestCase):
                 self.assertIs(type(cfg["memory_policy"]["overrides"]["env"][key]), float)
                 self.assertIs(type(cfg["memory_policy"]["sample"]["env"][key]), float)
 
+    def test_posix_metadata_preparation_keeps_raw_values_and_input_bytes(self):
+        posix = SimpleNamespace(**{**vars(prep.os), "name": "posix", "environ": {}})
+        for key, raw in (("STRATA_RESIDENT_HEADROOM_GIB", "8"), ("STRATA_RESIDENT_HEADROOM_GIB", 8),
+                         ("STRATA_RESIDENT_HEADROOM_GIB", 8.0), ("STRATA_RESIDENT_HEADROOM_GIB", 0),
+                         ("STRATA_FILE_CACHE_MIB", "1024"), ("STRATA_FILE_CACHE_MIB", 1024)):
+            with self.subTest(key=key, raw=raw), patch.object(prep, "os", posix), \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": None, "windows_commit": False}), \
+                    patch.object(prep, "check_ready"), contextlib.redirect_stdout(io.StringIO()):
+                cfg = self.make_config()
+                cfg["memory_policy"]["overrides"] = {"env": {key: raw}}
+                original = prep.json_bytes(cfg)
+                self.config.write_bytes(original)
+                for _ in range(2):
+                    runtime = prep.prepare_launch(self.config)
+                    for env in (runtime["env"], runtime["memory_policy"]["sample"]["env"],
+                                runtime["memory_policy"]["overrides"]["env"]):
+                        self.assertEqual(env[key], raw)
+                        self.assertIs(type(env[key]), type(raw))
+                    self.assertEqual(self.config.read_bytes(), original)
+                    self.assertEqual(prep.json_bytes(cfg), original)
+
+    def test_posix_unknown_metadata_and_static_preparation_keep_their_existing_behavior(self):
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        posix = SimpleNamespace(**{**vars(prep.os), "name": "posix", "environ": {key: "99"}})
+        with patch.object(prep, "os", posix), \
+                patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                    "available_gib": 27, "commit_available_gib": None, "windows_commit": False}):
+            cfg = self.make_config()
+            unknown = {key.lower(): "garbage", key.title(): True, "Unknown_Case": "keep"}
+            cfg["memory_policy"]["overrides"] = {"env": unknown}
+            cfg["env"].update({key.lower(): "saved-lower", key.title(): "saved-mixed", "Unknown_Case": "saved"})
+            for _ in range(2):
+                cfg = prep.refreshed_config(cfg)
+                self.assertEqual(cfg["env"][key], "4")
+                self.assertEqual(cfg["memory_policy"]["sample"]["headroom_gib"], 4)
+                self.assertEqual(cfg["memory_policy"]["overrides"]["env"], unknown)
+                self.assertEqual(cfg["env"][key.lower()], "saved-lower")
+                self.assertEqual(cfg["env"][key.title()], "saved-mixed")
+                self.assertEqual(cfg["env"]["Unknown_Case"], "saved")
+            cfg.pop("memory_policy")
+            cfg["env"][key] = None
+            original = prep.json_bytes(cfg)
+            self.config.write_bytes(original)
+            with patch.object(prep, "detected_memory") as memory, patch.object(prep, "detected_gpu") as gpu, \
+                    patch.object(prep, "check_ready") as ready:
+                self.assertEqual(prep.refreshed_config(cfg), cfg)
+                self.assertEqual(prep.prepare_launch(self.config), cfg)
+            for seam in (memory, gpu, ready):
+                seam.assert_not_called()
+            self.assertEqual(self.config.read_bytes(), original)
+
     def test_new_profile_uses_distinct_artifacts_auth_fit_and_no_browser(self):
         cfg = self.make_config()
         self.assertEqual(Path(cfg["exe"]).name, "strata-unsloth-portable.exe")
