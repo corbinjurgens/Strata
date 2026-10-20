@@ -95,17 +95,36 @@ def effective_vram_reserve_mib(value) -> int:
     return number
 
 
+def memory_environment(env: dict) -> dict:
+    """Canonical Windows spellings for policy-owned names, retaining raw values and types."""
+    result = {}
+    for key, value in env.items():
+        name = key.upper() if os.name == "nt" and isinstance(key, str) else key
+        name = name if name in MEMORY_ENV else key
+        if name in MEMORY_ENV and name in result:
+            if type(result[name]) is not type(value) or result[name] != value:
+                raise ValueError(f"Conflicting managed environment aliases for {name}; use one value and type.")
+        result[name] = value
+    return result
+
+
+def same_environment_value(first, second) -> bool:
+    """Keep raw Windows edits distinct even when numeric values compare equal."""
+    return first == second and (os.name != "nt" or type(first) is type(second))
+
+
 def validate_memory_overrides(overrides: dict) -> None:
+    env = memory_environment(overrides.get("env", {}))
     for values, name, positive in (
             (overrides.get("args", {}), "--resident-budget-gib", True),
-            (overrides.get("env", {}), "STRATA_RESIDENT_HEADROOM_GIB", False)):
+            (env, "STRATA_RESIDENT_HEADROOM_GIB", False)):
         value = values.get(name)
         if value is not None:  # None records an explicit removal.
             memory_number(value, name, positive)
     reserve = overrides.get("args", {}).get("--vram-reserve-mib")
     if reserve is not None:
         effective_vram_reserve_mib(reserve)
-    recent = overrides.get("env", {}).get("STRATA_FILE_CACHE_MIB")
+    recent = env.get("STRATA_FILE_CACHE_MIB")
     if recent is not None:
         message = f"STRATA_FILE_CACHE_MIB must be a nonnegative integer between 0 and {MAX_RECENT_MIB} MiB."
         if (isinstance(recent, bool) or not isinstance(recent, (str, int)) or
@@ -128,7 +147,9 @@ def memory_plan(ram: float, vram: float, context: int, available_gib: float | No
     if context not in (8192, 32768, 65536, 131072):
         raise ValueError("Unsupported context; the helper never reduces the requested context.")
     small_gpu = vram < 8
-    overrides = overrides or {}
+    overrides = dict(overrides or {})
+    if "env" in overrides:
+        overrides["env"] = memory_environment(overrides["env"])
     validate_memory_overrides(overrides)
     arg_overrides, env_overrides = overrides.get("args", {}), overrides.get("env", {})
     kv = arg_overrides.get("--kv", "q4_0" if small_gpu and context >= 65536 else "int8") or "fp16"
@@ -481,6 +502,10 @@ def install_engine(bdir: Path, target: Path) -> None:
 
 def config_for(folder: Path, pack: Path, context: int, key_config: Path | None,
                engine: Path | None = None, overrides: dict | None = None) -> dict:
+    overrides = dict(overrides or {})
+    if "env" in overrides:
+        overrides["env"] = memory_environment(overrides["env"])
+    validate_memory_overrides(overrides)
     gpu, memory = detected_gpu(), dict(detected_memory())
     plan = memory_plan(vram=gpu["vram_gb"], context=context,
                        ram=memory.pop("ram_gib"), overrides=overrides, **memory)
@@ -529,12 +554,10 @@ def memory_environment_removals(cfg: dict) -> set[str]:
     explicit = overrides.get("env", {})
     if not isinstance(explicit, dict):
         return set()
-    normalize = lambda key: key.upper() if os.name == "nt" else key
-    generated, explicit, env = ({normalize(key): value for key, value in values.items()}
-                                for values in (generated, explicit, env))
+    generated, explicit, env = (memory_environment(values) for values in (generated, explicit, env))
     removed = set()
     for key in MEMORY_ENV:
-        changed = env.get(key) != generated.get(key) or (key in env and env[key] is None)
+        changed = not same_environment_value(env.get(key), generated.get(key)) or (key in env and env[key] is None)
         if (changed and env.get(key) is None) or (not changed and key in explicit and explicit[key] is None):
             removed.add(key)
     return removed
@@ -548,6 +571,12 @@ def refreshed_config(cfg: dict) -> dict:
         return cfg
     if policy.get("version") != POLICY_VERSION:
         raise ValueError("Unknown memory policy version; update the preparation helper before launching.")
+    cfg["env"] = memory_environment(cfg.get("env", {}))
+    policy["generated_env"] = memory_environment(policy["generated_env"])
+    explicit = copy.deepcopy(policy.get("overrides", {}))
+    explicit.setdefault("args", {})
+    explicit["env"] = memory_environment(explicit.get("env", {}))
+    memory_environment(os.environ)  # Refuse ambiguous inherited aliases before any resource sampler.
     context = flag_value(cfg["args"], "--max-context")
     if context is None or not re.fullmatch(r"[0-9]+", str(context).strip()) or int(context) <= 0:
         raise ValueError("Automatic memory policy requires an explicit positive --max-context capacity; "
@@ -582,9 +611,6 @@ def refreshed_config(cfg: dict) -> dict:
     validate_memory_overrides({"args": {flag: flag_value(cfg["args"], flag)
                                         for flag in ("--resident-budget-gib", "--vram-reserve-mib")},
                                "env": cfg.get("env", {})})
-    explicit = copy.deepcopy(policy.get("overrides", {}))
-    explicit.setdefault("args", {})
-    explicit.setdefault("env", {})
     for flag in MEMORY_FLAGS:
         if flag_value(cfg["args"], flag) != flag_value(policy["generated_args"], flag):
             explicit["args"][flag] = flag_value(cfg["args"], flag)
@@ -592,8 +618,9 @@ def refreshed_config(cfg: dict) -> dict:
     for key in MEMORY_ENV:
         if key in removals:
             explicit["env"][key] = None
-        elif cfg.get("env", {}).get(key) != policy["generated_env"].get(key):
+        elif not same_environment_value(env.get(key), policy["generated_env"].get(key)):
             explicit["env"][key] = cfg.get("env", {}).get(key)
+    validate_memory_overrides(explicit)
     gpu, memory = detected_gpu(cfg.get("gpu")), dict(detected_memory())
     cfg["gpu"] = gpu["index"]
     plan = memory_plan(ram=memory.pop("ram_gib"), vram=gpu["vram_gb"],
@@ -608,8 +635,10 @@ def refreshed_config(cfg: dict) -> dict:
         if key in explicit.get("env", {}):
             if explicit["env"][key] is None:
                 env.pop(key, None)
+            elif os.name == "nt":
+                env[key] = explicit["env"][key]
             continue
-        if env.get(key) == policy["generated_env"].get(key):
+        if same_environment_value(env.get(key), policy["generated_env"].get(key)):
             if key in plan["env"]:
                 env[key] = plan["env"][key]
             else:

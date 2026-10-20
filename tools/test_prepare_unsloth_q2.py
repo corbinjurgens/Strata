@@ -17,6 +17,47 @@ def value(args, flag):
 
 
 class MemoryProfiles(unittest.TestCase):
+    def test_windows_plan_uses_managed_alias_values_without_changing_raw_types(self):
+        for key, raw in (("strata_resident_headroom_gib", "8"),
+                         ("Strata_Resident_Headroom_Gib", 8),
+                         ("strata_file_cache_mib", "1024"),
+                         ("Strata_File_Cache_Mib", 1024)):
+            with self.subTest(key=key, raw=raw), patch.object(prep.os, "name", "nt"):
+                overrides = {"env": {key: raw, "Unknown_Case": "keep"}}
+                original = json.dumps(overrides)
+                plan = prep.memory_plan(32, 16, 131072, available_gib=27, commit_available_gib=60,
+                                        overrides=overrides)
+                canonical = key.upper()
+                self.assertEqual(plan["env"][canonical], raw)
+                self.assertIs(type(plan["env"][canonical]), type(raw))
+                self.assertEqual(plan["headroom_gib"] if "headroom" in key.lower() else plan["recent_mib"],
+                                 8 if "headroom" in key.lower() else 1024)
+                self.assertEqual(plan["env"]["Unknown_Case"], "keep")
+                self.assertNotIn(key, plan["env"])
+                self.assertEqual(json.dumps(overrides), original)
+
+    def test_windows_plan_collapses_only_identical_alias_values_and_types(self):
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        with patch.object(prep.os, "name", "nt"):
+            for raw in ("8", 8, 8.0, None):
+                with self.subTest(raw=raw):
+                    plan = prep.memory_plan(32, 16, 131072, overrides={"env": {key: raw, key.lower(): raw}})
+                    if raw is None:
+                        self.assertNotIn(key, plan["env"])
+                    else:
+                        self.assertEqual(plan["env"][key], raw)
+                        self.assertIs(type(plan["env"][key]), type(raw))
+            for first, second in (("8", "4"), (8, 8.0), (8, "8"), (0, False), (None, "None")):
+                with self.subTest(first=first, second=second), self.assertRaisesRegex(ValueError, "Conflicting managed"):
+                    prep.memory_plan(32, 16, 131072, overrides={"env": {key: first, key.lower(): second}})
+
+    def test_posix_plan_keeps_lowercase_names_distinct(self):
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        with patch.object(prep.os, "name", "posix"):
+            plan = prep.memory_plan(32, 16, 131072, overrides={"env": {key: "4", key.lower(): "garbage"}})
+        self.assertEqual(plan["headroom_gib"], 4)
+        self.assertEqual(plan["env"][key.lower()], "garbage")
+
     def test_desktop_uses_its_ram_budget_and_normal_prefill(self):
         args, env = prep.memory_settings(30.88, 15.99, 8192, available_gib=27, commit_available_gib=45)
         self.assertEqual(value(args, "--resident-budget-gib"), "12")
@@ -353,6 +394,124 @@ class PortableProfiles(unittest.TestCase):
         publish.assert_not_called()
         run.assert_not_called()
         self.assertEqual(self.config.read_bytes(), original)
+
+    @unittest.skipUnless(prep.os.name == "nt", "Windows policy spelling")
+    def test_managed_alias_edits_survive_refresh_and_read_only_preparation(self):
+        for key, raw in (("STRATA_RESIDENT_HEADROOM_GIB", "8"), ("STRATA_RESIDENT_HEADROOM_GIB", 8),
+                         ("STRATA_FILE_CACHE_MIB", "1024"), ("STRATA_FILE_CACHE_MIB", 1024)):
+            for spelling in (key.lower(), key.title()):
+                with self.subTest(key=key, raw=raw, spelling=spelling):
+                    cfg = self.make_config()
+                    cfg["env"].pop(key)
+                    cfg["env"].update({spelling: raw, "Unknown_Case": "keep"})
+                    for _ in range(2):
+                        cfg = prep.refreshed_config(cfg)
+                        self.assertEqual(cfg["env"][key], raw)
+                        self.assertIs(type(cfg["env"][key]), type(raw))
+                        self.assertEqual(cfg["memory_policy"]["overrides"]["env"][key], raw)
+                        self.assertEqual(cfg["memory_policy"]["sample"]["env"][key], raw)
+                        self.assertNotIn(spelling, cfg["env"])
+                        self.assertEqual(cfg["env"]["Unknown_Case"], "keep")
+                    original = prep.json_bytes(cfg)
+                    self.config.write_bytes(original)
+                    with patch.object(prep, "check_ready"), contextlib.redirect_stdout(io.StringIO()):
+                        runtime = prep.prepare_launch(self.config)
+                    self.assertEqual(runtime["memory_policy"]["sample"]["headroom_gib"] if "HEADROOM" in key
+                                     else runtime["memory_policy"]["sample"]["recent_mib"],
+                                     8 if "HEADROOM" in key else 1024)
+                    self.assertEqual(self.config.read_bytes(), original)
+
+    @unittest.skipUnless(prep.os.name == "nt", "Windows policy spelling")
+    def test_aliased_managed_removals_survive_two_refreshes_and_evidence(self):
+        from serve.server import config_environment
+        from tools.benchmark_compact_cache import safe_engine_environment
+        for key in prep.MEMORY_ENV:
+            for removal in ("null", "delete", "override", "generated-null"):
+                with self.subTest(key=key, removal=removal):
+                    cfg = self.make_config()
+                    generated = cfg["memory_policy"]["generated_env"]
+                    generated[key.title()] = generated.pop(key, "old")
+                    cfg["env"].pop(key, None)
+                    if removal in ("null", "generated-null"):
+                        cfg["env"][key.lower()] = None
+                    if removal == "generated-null":
+                        generated[key.title()] = None
+                    if removal == "override":
+                        generated.pop(key.title())
+                        cfg["memory_policy"]["overrides"] = {"env": {key.lower(): None}}
+                    for _ in range(2):
+                        cfg = prep.refreshed_config(cfg)
+                        self.assertNotIn(key, cfg["env"])
+                        self.assertIsNone(cfg["memory_policy"]["overrides"]["env"][key])
+                        self.assertNotIn(key, cfg["memory_policy"]["sample"]["env"])
+                        inherited = {key.lower(): "8", key: "8", "Unknown_Case": "keep"}
+                        effective = config_environment(cfg, inherited)
+                        self.assertNotIn(key, effective)
+                        self.assertNotIn(key.lower(), effective)
+                        self.assertEqual(effective["Unknown_Case"], "keep")
+                        self.assertNotIn(key, safe_engine_environment(cfg, inherited))
+
+    @unittest.skipUnless(prep.os.name == "nt", "Windows policy spelling")
+    def test_invalid_managed_alias_layers_refuse_before_resource_or_ready_samplers(self):
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        for layer in ("saved", "generated", "override", "inherited"):
+            for first, second in (("8", "4"), (8, 8.0), (8, "8"), (0, False)):
+                with self.subTest(layer=layer, first=first, second=second):
+                    cfg = self.make_config()
+                    aliases = {key: first, key.lower(): second}
+                    inherited = {}
+                    if layer == "saved":
+                        cfg["env"].update(aliases)
+                    elif layer == "generated":
+                        cfg["memory_policy"]["generated_env"].update(aliases)
+                    elif layer == "override":
+                        cfg["memory_policy"]["overrides"] = {"env": aliases}
+                    else:
+                        inherited = aliases
+                    original = prep.json_bytes(cfg)
+                    self.config.write_bytes(original)
+                    with patch.object(prep, "detected_memory") as memory, patch.object(prep, "detected_gpu") as gpu, \
+                            patch.object(prep, "check_ready") as ready, patch.object(prep.os, "environ", inherited), \
+                            self.assertRaisesRegex(ValueError, "Conflicting managed"):
+                        prep.prepare_launch(self.config)
+                    memory.assert_not_called()
+                    gpu.assert_not_called()
+                    ready.assert_not_called()
+                    self.assertEqual(self.config.read_bytes(), original)
+
+    @unittest.skipUnless(prep.os.name == "nt", "Windows policy spelling")
+    def test_lowercase_numeric_validation_precedes_new_profile_and_refresh_sampling(self):
+        for key, raw in (("strata_resident_headroom_gib", "garbage"), ("strata_resident_headroom_gib", True),
+                         ("Strata_File_Cache_Mib", "1.5"), ("Strata_File_Cache_Mib", 1.0)):
+            with self.subTest(key=key, raw=raw):
+                cfg = self.make_config()
+                cfg["env"].pop(key.upper())
+                cfg["env"][key] = raw
+                with patch.object(prep, "detected_memory") as memory, patch.object(prep, "detected_gpu") as gpu:
+                    with self.assertRaises(ValueError):
+                        prep.refreshed_config(cfg)
+                    with self.assertRaises(ValueError):
+                        self.make_config({"env": {key: raw}})
+                memory.assert_not_called()
+                gpu.assert_not_called()
+
+    def test_policy_refresh_keeps_posix_case_rules_and_windows_raw_numeric_edits(self):
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        cfg = self.make_config()
+        cfg["env"][key.lower()] = "garbage"
+        with patch.object(prep.os, "name", "posix"):
+            refreshed = prep.refreshed_config(cfg)
+        self.assertEqual(refreshed["env"][key.lower()], "garbage")
+        self.assertEqual(refreshed["memory_policy"]["sample"]["headroom_gib"], 4)
+        self.assertNotIn(key.lower(), refreshed["memory_policy"]["overrides"]["env"])
+        cfg = self.make_config({"env": {key: 8}})
+        cfg["env"][key] = 8.0
+        with patch.object(prep.os, "name", "nt"):
+            for _ in range(2):
+                cfg = prep.refreshed_config(cfg)
+                self.assertIs(type(cfg["env"][key]), float)
+                self.assertIs(type(cfg["memory_policy"]["overrides"]["env"][key]), float)
+                self.assertIs(type(cfg["memory_policy"]["sample"]["env"][key]), float)
 
     def test_new_profile_uses_distinct_artifacts_auth_fit_and_no_browser(self):
         cfg = self.make_config()

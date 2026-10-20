@@ -218,6 +218,249 @@ class Startup(unittest.TestCase):
                     self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0")
                     self.assertEqual(path.read_bytes(), original)
 
+    @unittest.skipUnless(os.name == "nt", "Windows policy spelling")
+    def test_windows_metadata_only_managed_overrides_reach_refresh_startup_and_evidence(self):
+        from tools import prepare_unsloth_q2 as prep
+        from tools.benchmark_compact_cache import safe_engine_environment
+        for key, raw in (("STRATA_RESIDENT_HEADROOM_GIB", "8"), ("STRATA_RESIDENT_HEADROOM_GIB", 8),
+                         ("STRATA_RESIDENT_HEADROOM_GIB", 8.0), ("STRATA_RESIDENT_HEADROOM_GIB", 0),
+                         ("STRATA_FILE_CACHE_MIB", "1024"), ("STRATA_FILE_CACHE_MIB", 1024)):
+            for spelling in (key, key.lower(), key.title()):
+                with self.subTest(key=key, raw=raw, spelling=spelling), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                            "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}), \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), patch.object(prep, "report_memory") as report, \
+                        patch.dict(os.environ, {key: "99"}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    cfg["memory_policy"]["overrides"] = {"env": {spelling: raw}}
+                    original = prep.json_bytes(cfg)
+                    path.write_bytes(original)
+                    for _ in range(2):
+                        cfg = prep.refreshed_config(cfg)
+                        self.assertEqual(cfg["env"][key], raw)
+                        self.assertIs(type(cfg["env"][key]), type(raw))
+                        self.assertEqual(cfg["memory_policy"]["sample"]["env"][key], raw)
+                        self.assertIs(type(cfg["memory_policy"]["overrides"]["env"][key]), type(raw))
+                        self.assertEqual(safe_engine_environment(cfg, {key.lower(): "99"})[key], str(raw))
+                    create, _, _ = self.run_main(path)
+                    runtime = report.call_args.args[1]
+                    plan = runtime["memory_policy"]["sample"]
+                    self.assertEqual(plan["headroom_gib"] if "HEADROOM" in key else plan["recent_mib"], float(raw))
+                    self.assertEqual(runtime["env"][key], raw)
+                    self.assertIs(type(runtime["env"][key]), type(raw))
+                    self.assertEqual(create.call_args.kwargs["env"][key], str(raw))
+                    self.assertEqual(safe_engine_environment(runtime, {key.lower(): "99"})[key], str(raw))
+                    self.assertEqual(path.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "nt", "Windows policy spelling")
+    def test_windows_metadata_override_yields_to_new_saved_edits_and_removals(self):
+        from tools import prepare_unsloth_q2 as prep
+        from tools.benchmark_compact_cache import safe_engine_environment
+        for key, metadata, edited in (("STRATA_RESIDENT_HEADROOM_GIB", "8", 6.0),
+                                      ("STRATA_FILE_CACHE_MIB", "1024", 2048)):
+            for spelling in (key, key.lower(), key.title()):
+                for edit in ("number", "null", "delete"):
+                    with self.subTest(key=key, spelling=spelling, edit=edit), tempfile.TemporaryDirectory() as directory, \
+                            patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                                "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}), \
+                            patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                            patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                            patch.object(prep, "check_ready"), patch.object(prep, "report_memory") as report, \
+                            patch.dict(os.environ, {key: "99"}, clear=True):
+                        path, cfg = self.fixture(Path(directory), prep)
+                        cfg["memory_policy"]["overrides"] = {"env": {spelling: metadata}}
+                        cfg["env"].pop(key)
+                        if edit != "delete":
+                            cfg["env"][key.lower()] = edited if edit == "number" else None
+                        original = prep.json_bytes(cfg)
+                        path.write_bytes(original)
+                        for _ in range(2):
+                            cfg = prep.refreshed_config(cfg)
+                            self.assertEqual(cfg["memory_policy"]["overrides"]["env"][key],
+                                             edited if edit == "number" else None)
+                            if edit == "number":
+                                self.assertEqual(cfg["env"][key], edited)
+                                self.assertIs(type(cfg["env"][key]), type(edited))
+                                self.assertEqual(cfg["memory_policy"]["sample"]["env"][key], edited)
+                            else:
+                                self.assertNotIn(key, cfg["env"])
+                                self.assertNotIn(key, safe_engine_environment(cfg, {key.lower(): "99"}))
+                        create, _, _ = self.run_main(path)
+                        runtime = report.call_args.args[1]
+                        child, evidence = create.call_args.kwargs["env"], safe_engine_environment(runtime, {key: "99"})
+                        if edit == "number":
+                            self.assertEqual(child[key], str(edited))
+                            self.assertEqual(evidence[key], str(edited))
+                        else:
+                            self.assertNotIn(key, child)
+                            self.assertNotIn(key, evidence)
+                        self.assertEqual(path.read_bytes(), original)
+
+    def test_posix_metadata_only_managed_override_application_stays_unchanged(self):
+        from tools import prepare_unsloth_q2 as prep
+        with patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                "available_gib": 27, "commit_available_gib": 60, "windows_commit": False}), \
+                patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                patch.object(prep.setup, "find_nvcc", return_value=(None, None)):
+            cfg = prep.config_for(Path("source"), Path("pack"), 131072, None)
+            key = "STRATA_RESIDENT_HEADROOM_GIB"
+            cfg["memory_policy"]["overrides"] = {"env": {key: "8", key.lower(): "6"}}
+            with patch.object(prep.os, "name", "posix"):
+                runtime = prep.refreshed_config(cfg)
+            self.assertEqual(runtime["env"][key], "4")
+            self.assertNotIn(key.lower(), runtime["env"])
+            self.assertEqual(runtime["memory_policy"]["overrides"]["env"][key.lower()], "6")
+
+    @unittest.skipUnless(os.name == "nt", "Windows policy spelling")
+    def test_windows_managed_aliases_match_public_startup_plan_child_and_evidence(self):
+        from tools import prepare_unsloth_q2 as prep
+        from tools.benchmark_compact_cache import safe_engine_environment
+        cases = (("STRATA_RESIDENT_HEADROOM_GIB", "8"), ("STRATA_RESIDENT_HEADROOM_GIB", 8),
+                 ("STRATA_FILE_CACHE_MIB", "1024"), ("STRATA_FILE_CACHE_MIB", 1024))
+        for key, raw in cases:
+            for spelling in (key.lower(), key.title()):
+                with self.subTest(key=key, raw=raw, spelling=spelling), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                            "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}) as sample, \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), patch.object(prep, "report_memory") as report, \
+                        patch.dict(os.environ, {key: "2", "Unknown_Case": "keep"}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    cfg["env"].pop(key)
+                    cfg["env"][spelling] = raw
+                    # Equal aliases in each separate layer collapse, while config overrides inherited values.
+                    cfg["env"][key] = raw
+                    generated = cfg["memory_policy"]["generated_env"]
+                    generated[spelling] = generated.pop(key)
+                    cfg["memory_policy"]["overrides"] = {"env": {spelling: raw, key: raw}}
+                    for _ in range(2):
+                        refreshed = prep.refreshed_config(cfg)
+                        self.assertEqual(refreshed["memory_policy"]["sample"]["env"][key], raw)
+                        self.assertIs(type(refreshed["env"][key]), type(raw))
+                        cfg = refreshed
+                    # Exercise public startup from the original spelling, with saved bytes unchanged.
+                    cfg["env"][spelling] = cfg["env"].pop(key)
+                    original = prep.json_bytes(cfg)
+                    path.write_bytes(original)
+                    sample.reset_mock()
+                    create, _, _ = self.run_main(path)
+                    sample.assert_called_once()
+                    runtime = report.call_args.args[1]
+                    plan = runtime["memory_policy"]["sample"]
+                    self.assertEqual(plan["headroom_gib"] if "HEADROOM" in key else plan["recent_mib"],
+                                     8 if "HEADROOM" in key else 1024)
+                    self.assertEqual(plan["env"][key], raw)
+                    self.assertIs(type(plan["env"][key]), type(raw))
+                    child = create.call_args.kwargs["env"]
+                    self.assertEqual(child[key], str(raw))
+                    self.assertNotIn(spelling, child)
+                    inherited = {key.lower(): "2", "Unknown_Case": "keep"}
+                    effective = server.config_environment(runtime, inherited)
+                    self.assertEqual(effective[key], child[key])
+                    self.assertEqual(effective["Unknown_Case"], "keep")
+                    self.assertEqual(safe_engine_environment(runtime, inherited)[key], child[key])
+                    self.assertEqual(path.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "nt", "Windows policy spelling")
+    def test_invalid_windows_managed_aliases_stop_public_main_before_all_startup_seams(self):
+        from tools import prepare_unsloth_q2 as prep
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        cases = ((key.lower(), "garbage", False), (key.title(), True, False),
+                 ("strata_file_cache_mib", "1.5", False), ("Strata_File_Cache_Mib", 1.0, False),
+                 (key.lower(), "8", True), (key.lower(), 4, True))
+        for spelling, raw, conflict in cases:
+            with self.subTest(spelling=spelling, raw=raw, conflict=conflict), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}) as memory, \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}) as gpu, \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)):
+                path, cfg = self.fixture(Path(directory), prep)
+                if not conflict:
+                    cfg["env"].pop(spelling.upper())
+                elif isinstance(raw, int):
+                    # Numeric equality does not erase a raw type conflict.
+                    cfg["env"][key] = 4.0
+                cfg["env"][spelling] = raw
+                original = prep.json_bytes(cfg)
+                path.write_bytes(original)
+                memory.reset_mock()
+                gpu.reset_mock()
+                with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path)]), \
+                        patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as listener, \
+                        patch.object(server, "serve") as http, patch.object(prep, "check_ready") as ready, \
+                        patch.object(prep.subprocess, "run") as process, patch("webbrowser.open") as browser, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    server.main()
+                self.assertEqual(error.exception.code, 2)
+                for seam in (memory, gpu, engine, listener, http, ready, process, browser):
+                    seam.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "nt", "Windows policy spelling")
+    def test_windows_aliased_removals_reach_public_startup_and_evidence(self):
+        from tools import prepare_unsloth_q2 as prep
+        from tools.benchmark_compact_cache import safe_engine_environment
+        for key in prep.MEMORY_ENV:
+            for removal in ("null", "delete", "override"):
+                with self.subTest(key=key, removal=removal), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                            "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}), \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), patch.object(prep, "report_memory") as report, \
+                        patch.dict(os.environ, {key.lower(): "8"}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    generated = cfg["memory_policy"]["generated_env"]
+                    generated[key.title()] = generated.pop(key, "old")
+                    cfg["env"].pop(key, None)
+                    if removal == "null":
+                        cfg["env"][key.lower()] = None
+                    elif removal == "override":
+                        generated.pop(key.title())
+                        cfg["memory_policy"]["overrides"] = {"env": {key.lower(): None}}
+                    original = prep.json_bytes(cfg)
+                    path.write_bytes(original)
+                    for _ in range(2):
+                        cfg = prep.refreshed_config(cfg)
+                        self.assertIsNone(cfg["memory_policy"]["overrides"]["env"][key])
+                    create, _, _ = self.run_main(path)
+                    runtime = report.call_args.args[1]
+                    child = create.call_args.kwargs["env"]
+                    self.assertNotIn(key, child)
+                    self.assertNotIn(key.lower(), child)
+                    self.assertNotIn(key, runtime["memory_policy"]["sample"]["env"])
+                    if "HEADROOM" in key:
+                        self.assertEqual(runtime["memory_policy"]["sample"]["headroom_gib"], 4)
+                    self.assertNotIn(key, safe_engine_environment(runtime, {key.lower(): "8", key: "8"}))
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_managed_environment_canonicalization_preserves_static_unknown_and_posix_rules(self):
+        from tools import prepare_unsloth_q2 as prep
+        key = "STRATA_RESIDENT_HEADROOM_GIB"
+        inherited = {key: "2", "Unknown_Case": "inherited"}
+        configured = {key.lower(): "8", "Unknown_Case": "config"}
+        policy = {"version": 1, "generated_env": {key: "4"}, "overrides": {"env": {}}}
+        cfg = {"env": configured, "memory_policy": policy}
+        original = json.dumps(cfg, sort_keys=True)
+        with patch.object(server.os, "name", "nt"):
+            self.assertEqual(server.config_environment(cfg, inherited), {key: "8", "Unknown_Case": "config"})
+            static = server.config_environment({"env": configured}, inherited)
+            self.assertEqual(static, {key: "2", key.lower(): "8", "Unknown_Case": "config"})
+            self.assertEqual(prep.refreshed_config({"env": configured}), {"env": configured})
+            for layer in ("inherited", "config"):
+                aliases = {key: "8", key.lower(): 8}
+                with self.subTest(layer=layer), self.assertRaisesRegex(ValueError, "Conflicting managed"):
+                    server.config_environment({**cfg, "env": aliases} if layer == "config" else cfg,
+                                              aliases if layer == "inherited" else inherited)
+        with patch.object(server.os, "name", "posix"):
+            # Uppercase deletion stays distinct from a lowercase unknown variable on POSIX.
+            self.assertEqual(server.config_environment(cfg, inherited),
+                             {key.lower(): "8", "Unknown_Case": "config"})
+        self.assertEqual(json.dumps(cfg, sort_keys=True), original)
+
     def test_removed_headroom_admission_preserves_physical_and_commit_limits(self):
         from tools import prepare_unsloth_q2 as prep
         key = "STRATA_RESIDENT_HEADROOM_GIB"

@@ -2352,13 +2352,17 @@ def ordered_gpus(cfg: dict, scores=None) -> list[int]:
 def config_environment(cfg: dict, inherited: dict) -> dict:
     """Merge saved engine controls, honoring explicit automatic-policy removals."""
     removed = set()
-    if cfg.get("memory_policy"):
-        from tools.prepare_unsloth_q2 import memory_environment_removals
+    configured = cfg.get("env") or {}
+    policy = cfg.get("memory_policy")
+    if policy:
+        from tools.prepare_unsloth_q2 import POLICY_VERSION, memory_environment, memory_environment_removals
+        if isinstance(policy, dict) and policy.get("version") == POLICY_VERSION:
+            inherited = memory_environment(inherited)
+            configured = memory_environment(configured)
         removed = memory_environment_removals(cfg)
-    normalize = lambda key: key.upper() if os.name == "nt" else key
-    env = {key: value for key, value in inherited.items() if normalize(key) not in removed}
-    for key, value in (cfg.get("env") or {}).items():
-        if normalize(key) not in removed:
+    env = {key: value for key, value in inherited.items() if key not in removed}
+    for key, value in configured.items():
+        if key not in removed:
             env[str(key)] = str(value)
     return env
 
