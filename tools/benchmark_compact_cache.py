@@ -20,6 +20,73 @@ import time
 import urllib.request
 import urllib.error
 
+
+def worker_self_identity():
+    """Observe this interpreter itself; the pseudo-handle is never cleanup authority."""
+    if os.name != "nt":
+        raise RuntimeError("Native bootstrap identity requires Windows.")
+    import ctypes as c
+
+    class FileTime(c.Structure):
+        _fields_ = [("low", c.c_uint32), ("high", c.c_uint32)]
+
+    kernel = c.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.argtypes, kernel.GetCurrentProcess.restype = [], c.c_void_p
+    kernel.GetProcessId.argtypes, kernel.GetProcessId.restype = [c.c_void_p], c.c_uint32
+    kernel.GetProcessTimes.argtypes = [c.c_void_p] + [c.POINTER(FileTime)] * 4
+    kernel.GetProcessTimes.restype = c.c_int32
+    handle = kernel.GetCurrentProcess()
+    times = [FileTime() for _ in range(4)]
+    if not kernel.GetProcessTimes(handle, *(c.byref(value) for value in times)):
+        raise c.WinError(c.get_last_error())
+    pid = kernel.GetProcessId(handle)
+    if not pid:
+        raise c.WinError(c.get_last_error())
+    return int(pid), (int(times[0].high) << 32) | int(times[0].low)
+
+
+def worker_bootstrap(stream, worker, *, pid=None, settings=None):
+    """The direct interpreter waits here before importing site or any project code."""
+    line = stream.readline(257)
+    if len(line) > 256 or not line.endswith("\n"):
+        raise RuntimeError("Missing or oversized START envelope.")
+    envelope = json.loads(line)
+    if envelope.get("command") != "START":
+        raise RuntimeError("Bootstrap requires START.")
+    identity = envelope.get("identity", {})
+    for key, maximum in (("pid", 2**32 - 1), ("creation_filetime", 2**64 - 1)):
+        value = identity.get(key)
+        if (type(value) is not str or re.fullmatch(r"[1-9][0-9]*", value) is None
+                or len(value) > 20 or int(value) > maximum):
+            raise ValueError("Invalid native identity transport.")
+    if int(identity["pid"]) != (os.getpid() if pid is None else pid):
+        raise RuntimeError("START identity does not name this interpreter.")
+    observed = worker_self_identity()
+    if (type(observed) is not tuple or len(observed) != 2
+            or any(type(value) is not int or not 0 < value <= maximum
+                   for value, maximum in zip(observed, (2**32 - 1, 2**64 - 1)))
+            or observed != (int(identity["pid"]), int(identity["creation_filetime"]))):
+        raise RuntimeError("START does not match this interpreter's native creation identity.")
+    settings = os.environ.pop("STRATA_BENCHMARK_BOOTSTRAP", "") if settings is None else settings
+    if type(settings) is not str or len(settings) > 16384:
+        raise ValueError("Invalid bootstrap settings.")
+    settings = json.loads(settings)
+    envelope.update(args=settings["args"], python_path=settings["python_path"],
+                    work_deadline=settings["work_deadline"])
+    return worker(envelope)
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--internal-acceptance-worker"]:
+    def _after_start(envelope):
+        # -I -S prevents environment/site startup code before containment.
+        # Only the parent-selected dependency paths are installed, after START.
+        sys.path[:] = envelope["python_path"]
+        module = importlib.util.spec_from_file_location("benchmark_worker", __file__)
+        loaded = importlib.util.module_from_spec(module)
+        module.loader.exec_module(loaded)
+        return loaded.acceptance_worker(envelope)
+    raise SystemExit(worker_bootstrap(sys.stdin, _after_start))
+
 import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +95,10 @@ SCRATCH = ROOT / "build-unsloth"
 PORT = 8081
 CONTEXT = 131072
 LOG_LIMIT = 4 * 1024**2
+ACCEPTANCE_LOG_LIMIT = 1024**2
+ACCEPTANCE_ARTIFACT_LIMIT = 8 * 1024**2
+ACCEPTANCE_SECONDS = 900
+CLEANUP_SECONDS = 10
 PROFILE_ENV = {"STRATA_VERIFY_PROFILE", "STRATA_DECODE_TIMING", "STRATA_FETCH_PROFILE"}
 EVIDENCE_ENV = PROFILE_ENV | {
     "STRATA_RESIDENT_HEADROOM_GIB", "STRATA_FILE_CACHE_MIB", "STRATA_FILE_CACHE_COMPACT", "STRATA_FILE_DIRECT_UNMAP",
@@ -134,12 +205,15 @@ def safe_engine_environment(cfg, inherited):
     return effective
 
 
-def source_identity():
+def source_identity(deadline=None):
     """Working-tree evidence only: this does not claim an old executable used these sources."""
     paths = ["src", "include", "cmake", "CMakeLists.txt", "serve"]
 
     def git(*args):
-        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, timeout=30,
+        timeout = 30 if deadline is None else min(30, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("Absolute provenance deadline reached.")
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, timeout=timeout,
                               check=True).stdout
 
     names = sorted(set(git("ls-files", "-z", "--cached", "--others", "--exclude-standard",
@@ -218,7 +292,7 @@ def check_authentication(client, record, save):
     for label, headers in (("missing", {}), ("wrong", {"Authorization": "Bearer benchmark-invalid-key"})):
         request = urllib.request.Request(client.base + "/metrics", headers=headers)
         try:
-            with TimeoutOpener().open(request, timeout=20) as response:
+            with TimeoutOpener(getattr(client, "deadline", None)).open(request, timeout=20) as response:
                 code = response.status
         except urllib.error.HTTPError as exc:
             code = exc.code
@@ -342,16 +416,46 @@ def assert_idle():
 
 
 class OwnedProcess:
-    """Only retain psutil identities descended from the Popen we just created."""
+    """One cancellation owner; opt-in authority is the retained creation handle and Job."""
 
-    def __init__(self, proc):
+    def __init__(self, proc, *, native=None, deadline=None):
         self.proc = proc
+        self.native, self.deadline = native, deadline
+        self.lock = threading.RLock()
+        self.errors = []
+        self.job = None
+        self.identity = None
+        self.assigned = self.closed = self.forced = False
+        self.exit_code = None
+        self.final_accounting = {}
+        self.stopped = False
+        if native is not None:
+            # Retain Popen itself: its creation handle must outlive every wait and query.
+            self.handle = getattr(proc, "_handle", None)
+            return
         self.root = psutil.Process(proc.pid)
         self.members = {self.root}
-        self.lock = threading.Lock()
-        self.stopped = False
+
+    def contain(self):
+        with self.lock:
+            if not self.handle:
+                raise RuntimeError("Popen creation handle is missing.")
+            self.identity = native_identity(self.native.identity(self.handle))
+            if self.identity[0] != self.proc.pid:
+                raise RuntimeError("Creation handle PID differs from Popen PID.")
+            self.job = self.native.create_job()
+            self.native.configure_job(self.job)
+            self.native.assign(self.job, self.handle)
+            self.assigned = True
 
     def discover(self):
+        if self.native is not None:
+            with self.lock:
+                if self.closed:
+                    raise RuntimeError("Discovery after handle closure.")
+                if native_identity(self.native.identity(self.handle)) != self.identity:
+                    raise RuntimeError("Retained process identity changed.")
+                return self.native.active(self.job)
         try:
             if self.root.is_running():
                 self.members.update(self.root.children(recursive=True))
@@ -359,6 +463,23 @@ class OwnedProcess:
             pass
 
     def stop(self):
+        if self.native is not None:
+            with self.lock:
+                if not self.closed and not self.stopped:
+                    self.stopped = self.forced = True
+                    # A failed wait must never skip cancellation of our exact handles.
+                    try:
+                        if self.assigned:
+                            self.native.terminate_job(self.job)
+                        elif self.handle:
+                            self.native.terminate_process(self.handle)
+                        else:
+                            raise RuntimeError("Cannot cancel without creation handle.")
+                    except Exception as exc:
+                        self.errors.append("cancel: " + str(exc))
+                if self.errors:
+                    raise RuntimeError("; ".join(self.errors))
+                return
         with self.lock:
             if self.stopped:
                 return
@@ -381,12 +502,228 @@ class OwnedProcess:
             if alive:
                 raise RuntimeError("An owned benchmark process did not exit after cleanup.")
 
+    def poll(self):
+        with self.lock:
+            if self.closed:
+                return self.exit_code
+            try:
+                result = self.native.wait(self.handle, 0)
+                if result == 258:  # WAIT_TIMEOUT is ordinary only during nonblocking polling.
+                    return None
+                if result != 0:
+                    raise RuntimeError("Process wait failed: " + str(result))
+                self.exit_code = self.native.exit_code(self.handle)
+                if type(self.exit_code) is not int or not 0 <= self.exit_code <= 2**32 - 1:
+                    raise RuntimeError("Invalid native exit code.")
+                self.proc.returncode = self.exit_code
+                return self.exit_code
+            except Exception as exc:
+                self.errors.append("wait: " + str(exc))
+                raise
+
+    def finish(self):
+        """Account before closing; failures retain authority on the raised exception's owner."""
+        with self.lock:
+            if self.closed:
+                if self.errors:
+                    raise RuntimeError("; ".join(self.errors))
+                return
+            wait_ok = identity_ok = job_ok = False
+            self.final_accounting = {}
+
+            def failed(label, exc):
+                self.final_accounting[label + "_error"] = str(exc)
+                self.errors.append("account: " + str(exc))
+                try:
+                    self.stop()
+                except Exception:
+                    pass  # stop retains its own error; independent accounting must continue.
+
+            try:
+                remaining = max(0, self.deadline - time.monotonic())
+                result = self.native.wait(self.handle, int(remaining * 1000))
+                self.final_accounting["wait_result"] = result
+                if result != 0:
+                    raise RuntimeError("Final owned wait was not signaled: " + str(result))
+                self.exit_code = self.native.exit_code(self.handle)
+                if type(self.exit_code) is not int or not 0 <= self.exit_code <= 2**32 - 1:
+                    raise RuntimeError("Invalid final native exit code.")
+                self.proc.returncode = self.exit_code
+                self.final_accounting["exit_code"] = self.exit_code
+                wait_ok = True
+            except Exception as exc:
+                failed("wait", exc)
+            # These probes are independent of wait success, including after cancellation.
+            # They add evidence; neither may turn an uncertain wait into permission to close.
+            try:
+                observed = native_identity(self.native.identity(self.handle))
+                self.final_accounting["identity"] = dict(zip(("pid", "creation_filetime"), map(str, observed)))
+                if self.identity is None or observed != self.identity:
+                    raise RuntimeError("Final retained identity changed.")
+                identity_ok = True
+            except Exception as exc:
+                failed("identity", exc)
+            try:
+                if self.job is None:
+                    self.final_accounting["job"] = "not created"
+                    if self.assigned:
+                        raise RuntimeError("Assigned Job handle is missing.")
+                else:
+                    active = self.native.active(self.job)
+                    self.final_accounting["job_active"] = active
+                    if type(active) is not int or not 0 <= active <= 2**32 - 1:
+                        raise RuntimeError("Unknown Job membership.")
+                    if active:
+                        raise RuntimeError("Live Job members remain.")
+                job_ok = True
+            except Exception as exc:
+                failed("job", exc)
+            if not (wait_ok and identity_ok and job_ok):
+                raise RuntimeError("; ".join(self.errors))
+            # No wait is pending while handles are closed, including monitor cancellation.
+            try:
+                if self.job is not None:
+                    self.native.close(self.job)
+                    self.job = None
+                self.native.close_process(self.proc)
+                self.closed = True
+            except Exception as exc:
+                self.errors.append("close: " + str(exc))
+            if self.errors:
+                raise RuntimeError("; ".join(self.errors))
+
+
+def native_identity(value):
+    if (type(value) is not tuple or len(value) != 2
+            or any(type(number) is not int or not 0 < number <= maximum
+                   for number, maximum in zip(value, (2**32 - 1, 2**64 - 1)))):
+        raise ValueError("Native PID and FILETIME must be exact unsigned integers.")
+    return value
+
+
+class WindowsProcessAPI:
+    """Lazy Win32 boundary; CPU composition replaces this boundary before construction.
+
+    ABI: Microsoft GetProcessTimes, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION and WaitForSingleObject contracts.
+    Windows LLP64: DWORD=32, LARGE_INTEGER=64, SIZE_T/ULONG_PTR=pointer width.
+    No PID lookup, breakaway, process-name exception or epoch conversion is used.
+    """
+
+    def __init__(self):
+        if os.name != "nt":
+            raise RuntimeError("Contained acceptance requires Windows.")
+        import ctypes as c
+        self.c = c
+        self.dll = c.WinDLL("kernel32", use_last_error=True)
+        u32, u64, ptr = c.c_uint32, c.c_uint64, c.c_void_p
+
+        class FileTime(c.Structure):
+            _fields_ = [("low", u32), ("high", u32)]
+
+        class BasicLimit(c.Structure):
+            _fields_ = [("process_time", c.c_int64), ("job_time", c.c_int64), ("flags", u32),
+                        ("min_ws", c.c_size_t), ("max_ws", c.c_size_t), ("active_limit", u32),
+                        ("affinity", c.c_size_t), ("priority", u32), ("scheduling", u32)]
+
+        class ExtendedLimit(c.Structure):
+            _fields_ = [("basic", BasicLimit), ("io", u64 * 6),
+                        ("process_memory", c.c_size_t), ("job_memory", c.c_size_t),
+                        ("peak_process", c.c_size_t), ("peak_job", c.c_size_t)]
+
+        class Accounting(c.Structure):
+            _fields_ = [("times", c.c_int64 * 4), ("faults", u32), ("total", u32),
+                        ("active", u32), ("terminated", u32)]
+
+        self.FileTime, self.ExtendedLimit, self.Accounting = FileTime, ExtendedLimit, Accounting
+        signatures = {
+            "GetProcessId": ([ptr], u32),
+            "GetProcessTimes": ([ptr] + [c.POINTER(FileTime)] * 4, c.c_int32),
+            "CreateJobObjectW": ([ptr, c.c_wchar_p], ptr),
+            "SetInformationJobObject": ([ptr, c.c_int32, ptr, u32], c.c_int32),
+            "AssignProcessToJobObject": ([ptr, ptr], c.c_int32),
+            "QueryInformationJobObject": ([ptr, c.c_int32, ptr, u32, c.POINTER(u32)], c.c_int32),
+            "TerminateJobObject": ([ptr, u32], c.c_int32),
+            "TerminateProcess": ([ptr, u32], c.c_int32),
+            "WaitForSingleObject": ([ptr, u32], u32),
+            "GetExitCodeProcess": ([ptr, c.POINTER(u32)], c.c_int32),
+            "CloseHandle": ([ptr], c.c_int32),
+            "PeekNamedPipe": ([ptr, ptr, u32, c.POINTER(u32), c.POINTER(u32), c.POINTER(u32)], c.c_int32),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.dll, name)
+            function.argtypes, function.restype = arguments, result
+
+    def checked(self, value):
+        if not value:
+            raise self.c.WinError(self.c.get_last_error())
+        return value
+
+    def identity(self, handle):
+        times = [self.FileTime() for _ in range(4)]
+        self.checked(self.dll.GetProcessTimes(int(handle), *(self.c.byref(item) for item in times)))
+        return (int(self.checked(self.dll.GetProcessId(int(handle)))),
+                (int(times[0].high) << 32) | int(times[0].low))
+
+    def create_job(self):
+        return self.checked(self.dll.CreateJobObjectW(None, None))
+
+    def configure_job(self, job):
+        limits = self.ExtendedLimit()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        self.checked(self.dll.SetInformationJobObject(job, 9, self.c.byref(limits), self.c.sizeof(limits)))
+
+    def assign(self, job, handle):
+        self.checked(self.dll.AssignProcessToJobObject(job, int(handle)))
+
+    def active(self, job):
+        accounting = self.Accounting()
+        self.checked(self.dll.QueryInformationJobObject(job, 1, self.c.byref(accounting),
+                                                       self.c.sizeof(accounting), None))
+        return int(accounting.active)
+
+    def terminate_job(self, job):
+        self.checked(self.dll.TerminateJobObject(job, 1))
+
+    def terminate_process(self, handle):
+        self.checked(self.dll.TerminateProcess(int(handle), 1))
+
+    def wait(self, handle, milliseconds):
+        return int(self.dll.WaitForSingleObject(int(handle), milliseconds))
+
+    def exit_code(self, handle):
+        code = self.c.c_uint32()
+        self.checked(self.dll.GetExitCodeProcess(int(handle), self.c.byref(code)))
+        return int(code.value)
+
+    def close(self, handle):
+        self.checked(self.dll.CloseHandle(int(handle)))
+
+    def close_process(self, proc):
+        # CPython Handle.Close marks itself closed BEFORE CloseHandle can fail. Keep
+        # ownership on failure, and detach its destructor only after checked success.
+        self.close(proc._handle)
+        proc._handle.Detach()
+
+    def capture(self, pipe):
+        import msvcrt
+        available = self.c.c_uint32()
+        success = self.dll.PeekNamedPipe(msvcrt.get_osfhandle(pipe.fileno()), None, 0, None,
+                                        self.c.byref(available), None)
+        if not success:
+            if self.c.get_last_error() == 109:  # ERROR_BROKEN_PIPE, all inherited writers closed.
+                return b"", True
+            self.checked(success)
+        return (os.read(pipe.fileno(), min(8192, available.value)) if available.value else b"", False)
+
 
 class MemoryGuard:
-    def __init__(self, owner, engine_log, *, acceptance_floors=None):
+    def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None):
         self.owner, self.engine_log = owner, engine_log
+        self.deadline = deadline
         self.done = threading.Event()
         self.reason = None
+        self.cleanup_error = None
         self.low_samples = 0
         self.samples = 0
         self.minimum = None
@@ -439,7 +776,17 @@ class MemoryGuard:
             if self.reason is None:
                 self.reason = "Acceptance telemetry failed: " + str(exc)
                 if self.owner is not None:
-                    self.owner.stop()
+                    self.stop_owner()
+
+    def stop_owner(self):
+        """Keep the first guard reason even if its cancellation also fails."""
+        try:
+            if self.owner is not None:
+                self.owner.stop()
+        except Exception as exc:
+            if self.acceptance_floors is None:
+                raise
+            self.cleanup_error = type(exc).__name__ + ": " + str(exc)
 
     def acceptance_summary(self, start=None, end=None):
         rows = list(self.host_samples)
@@ -461,6 +808,7 @@ class MemoryGuard:
                 "raw_samples": rows, "minima": minima, "max_gap_seconds": self.max_gap_seconds,
                 "coverage_start_monotonic": start, "coverage_end_monotonic": end,
                 "sample_limit": 4096, "cuda_stage_evidence": "missing; later-stage hold",
+                "cleanup_error": self.cleanup_error,
                 "cuda_floor_mib": 256, "cuda_coverage": "stage evidence required; not collected",
                 "lifecycle_acceptance": "pending", "cleanup": "pending", "finalization": "pending"}
 
@@ -475,10 +823,11 @@ class MemoryGuard:
                            else "Available RAM stayed below 2 GiB for five consecutive samples.")
             self.owner.stop()
 
-    def monitor(self):
+    def monitor(self, *, once=False):
         try:
             while not self.done.is_set():
-                self.owner.discover()
+                if self.owner is not None:
+                    self.owner.discover()
                 if self.acceptance_floors is not None:
                     from tools.prepare_unsloth_q2 import memory_snapshot
                     started = time.monotonic()
@@ -486,8 +835,10 @@ class MemoryGuard:
                     self.acceptance_sample(snapshot, started, time.monotonic())
                     if self.reason:
                         return
-                    if self.engine_log.exists() and self.engine_log.stat().st_size > 2 * LOG_LIMIT:
+                    if self.engine_log is not None and self.engine_log.exists() and self.engine_log.stat().st_size > 2 * LOG_LIMIT:
                         raise RuntimeError("Engine log exceeded the diagnostic size limit.")
+                    if once:
+                        return
                     self.done.wait(0.25)
                     continue
                 available = psutil.virtual_memory().available  # Required for the cancellation guard.
@@ -508,12 +859,19 @@ class MemoryGuard:
                     return
                 self.done.wait(1)
         except Exception as exc:
-            self.reason = "Memory/process monitor failed: " + type(exc).__name__
-            self.owner.stop()
+            if self.acceptance_floors is None:
+                self.reason = "Memory/process monitor failed: " + type(exc).__name__
+                self.owner.stop()
+            else:
+                if self.reason is None:
+                    self.reason = "Memory/process monitor failed: " + type(exc).__name__
+                self.stop_owner()
 
     def check(self):
         if self.reason:
             raise RuntimeError(self.reason)
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TimeoutError("Absolute worker deadline reached.")
 
     def summary(self):
         if self.acceptance_floors is not None:
@@ -537,18 +895,20 @@ def valid_number(value):
 class BoundedCapture:
     """Keep a bounded head and tail while always draining the subprocess pipe."""
 
-    def __init__(self):
+    def __init__(self, limit=LOG_LIMIT):
         self.head, self.tail = bytearray(), bytearray()
         self.total = 0
+        self.limit = limit
+        self.complete, self.error = False, None
 
     def write(self, value):
         data = value.encode("utf-8") if isinstance(value, str) else value
         self.total += len(data)
-        head_size = min(len(data), LOG_LIMIT // 2 - len(self.head))
+        head_size = min(len(data), self.limit // 2 - len(self.head))
         self.head.extend(data[:head_size])
         self.tail.extend(data[head_size:])
-        if len(self.tail) > LOG_LIMIT // 2:
-            del self.tail[:-LOG_LIMIT // 2]
+        if len(self.tail) > self.limit // 2:
+            del self.tail[:-self.limit // 2]
         return len(value)
 
     def flush(self):
@@ -557,13 +917,18 @@ class BoundedCapture:
 
     def drain(self, pipe):
         try:
-            while chunk := pipe.read(8192):
-                self.write(chunk)
-        finally:
-            pipe.close()
+            try:
+                while chunk := pipe.read(8192):
+                    self.write(chunk)
+            finally:
+                pipe.close()
+            self.complete = True
+        except BaseException as exc:
+            self.error = type(exc).__name__ + ": " + str(exc)
+            raise
 
     def text(self):
-        gap = b"\n[log middle omitted]\n" if self.total > LOG_LIMIT else b""
+        gap = b"\n[log middle omitted]\n" if self.total > self.limit else b""
         return (self.head + gap + self.tail).decode("utf-8", errors="replace")
 
 
@@ -604,16 +969,22 @@ def matched_metric(response, before, after):
 
 
 class TimeoutOpener:
-    def __init__(self):
+    def __init__(self, deadline=None):
+        self.deadline = deadline
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def open(self, request, timeout=1800):
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("Absolute HTTP deadline reached.")
         return self.opener.open(request, timeout=min(timeout, 1800))
 
 
 def make_client(validation, cfg, record, save, guard, secret):
     class Client(validation.Client):
         label = "warmup"
+        deadline = guard.deadline
 
         def get(self, path):
             guard.check()
@@ -643,7 +1014,260 @@ def make_client(validation, cfg, record, save, guard, secret):
     return Client(cfg)
 
 
+def acceptance_ready():
+    # No CLI switch bypasses missing current admission, Stage C or CUDA evidence.
+    return False
+
+
+def acceptance_preflight(args):
+    raise RuntimeError("Stage C current admission and protection binding are not implemented.")
+
+
+def acceptance_protection(args):
+    # This independent external protection check must eventually compare admitted protected bytes.
+    return False
+
+
+def direct_interpreter():
+    base = Path(sys.base_prefix).resolve()
+    interpreter = Path(sys._base_executable).resolve()
+    if (interpreter != base / "python.exe" or not interpreter.is_file()
+            or (base / "pyvenv.cfg").exists()):
+        raise RuntimeError("A verified direct base interpreter is required; venv launchers are refused.")
+    return interpreter
+
+
+def bounded_write(path, data, deadline, limit=ACCEPTANCE_LOG_LIMIT):
+    """Write only provisional bytes. Check short writes and close before returning."""
+    if time.monotonic() >= deadline or len(data) > limit:
+        raise RuntimeError("Artifact exceeds its size or absolute time budget.")
+    with path.open("wb") as stream:
+        if stream.write(data) != len(data):
+            raise OSError("Short artifact write.")
+        stream.flush()
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Artifact finalization exceeded the absolute deadline.")
+
+
+def acceptance_worker(envelope):
+    args = argparse.Namespace(**envelope["args"])
+    args.config, args.output = Path(args.config), Path(args.output)
+    args.acceptance_telemetry = False
+    args.acceptance_physical_gib = args.acceptance_commit_gib = None
+    args._acceptance_deadline = envelope["work_deadline"]
+    if not valid_number(args._acceptance_deadline) or time.monotonic() >= args._acceptance_deadline:
+        raise TimeoutError("START arrived after the worker deadline.")
+    # The existing smoke helper owns an unrestricted file writer; retain its hold.
+    if args.smoke or getattr(args, "smoke_only", False):
+        raise RuntimeError("Contained smoke artifacts require the Stage C bounded writer.")
+    try:
+        acceptance_preflight(args)  # Heavy admission belongs INSIDE the supervised child.
+        _run_workload(args)
+        return 0
+    except (Exception, KeyboardInterrupt) as exc:
+        # The external capture does not read private config to learn its secret.
+        # Preserve redacted workload details in provisional artifacts, never a traceback.
+        print("Contained worker stopped (" + type(exc).__name__ + ").", file=sys.stderr)
+        return 1
+
+
+class AcceptanceFailure(RuntimeError):
+    def __init__(self, record, owner):
+        super().__init__(record.get("error") or "Contained lifecycle evidence refused.")
+        self.record, self.owner = record, owner
+
+
+def acceptance_final_predicate(record):
+    return (record.get("worker_exit") == 0 and record.get("natural_exit") is True
+            and record.get("capture_complete") is True and record.get("owned_cleanup") is True
+            and record.get("protection") is True and record.get("finalization") is True
+            and record.get("within_deadline") is True and record.get("worker_complete") is True
+            and record.get("base_host_floors_satisfied") is True
+            and record.get("memory", {}).get("host_evidence") == "satisfied"
+            and not record.get("error") and not record.get("cleanup_error"))
+
+
+def acceptance_controller(args, started):
+    """Supervise the complete child, including admission and artifact close, from outside it.
+
+    The caller must keep this controller alive. OS scheduling, filesystem and native API
+    calls are assumed to return; an arbitrary blocked controller syscall cannot be
+    preempted by its own timer. Job containment protects descendants, not that assumption.
+    Discovery is periodic accounting, never a proof of each process's birth.
+    """
+    total_deadline = started + ACCEPTANCE_SECONDS
+    work_deadline = total_deadline - CLEANUP_SECONDS
+    floors = tuple(4 if value is None else value for value in (
+        getattr(args, "acceptance_physical_gib", None), getattr(args, "acceptance_commit_gib", None)))
+    guard = MemoryGuard(None, None, acceptance_floors=floors)
+    if not acceptance_ready():
+        return _run_workload(args)  # Existing held receipt, with no native/resource entry.
+    if args.output.exists():
+        raise RuntimeError("Output directory already exists; choose a new directory.")
+    native, owner, proc = None, None, None
+    capture = BoundedCapture(ACCEPTANCE_LOG_LIMIT - 64)
+    record = {"status": "held", "lifecycle_evidence": "refused", "started_monotonic": started,
+              "total_deadline": total_deadline, "work_deadline": work_deadline,
+              "pending_stages": ["Stage C", "CUDA", "current admission"],
+              "external_limits": "Controller OS calls must return; caller must keep controller alive."}
+    coverage_start = coverage_end = None
+    eof = False
+
+    def cleanup_failure(error):
+        previous = record.get("cleanup_error")
+        record["cleanup_error"] = (previous + "; " if previous else "") + str(error)
+
+    try:
+        # Host coverage starts before any owned process/native startup work.
+        guard.monitor(once=True)
+        guard.check()
+        coverage_start = time.monotonic()
+        interpreter = direct_interpreter()
+        native = WindowsProcessAPI()
+        settings = json.dumps({"work_deadline": work_deadline, "python_path": [str(ROOT), *sys.path],
+                               "args": {key: str(value) if isinstance(value, Path) else value
+                                        for key, value in vars(args).items()}})
+        if len(settings) > 16384:
+            raise RuntimeError("Bootstrap settings exceed the environment budget.")
+        environment = dict(os.environ, STRATA_BENCHMARK_BOOTSTRAP=settings)
+        if time.monotonic() >= work_deadline:
+            raise TimeoutError("Deadline expired before creation.")
+        proc = subprocess.Popen([str(interpreter), "-I", "-S", str(Path(__file__).resolve()),
+                                 "--internal-acceptance-worker"], cwd=ROOT, env=environment,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                bufsize=0, close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        owner = OwnedProcess(proc, native=native, deadline=total_deadline)
+        owner.contain()
+        guard.owner = owner
+        guard.monitor(once=True)
+        guard.check()
+        identity = dict(zip(("pid", "creation_filetime"), map(str, owner.identity)))
+        record["identity"] = identity
+        envelope = {"command": "START", "identity": identity}
+        data = (json.dumps(envelope) + "\n").encode("utf-8")
+        # The initially empty anonymous pipe receives only this tiny control token,
+        # never dependency paths/configuration that could fill its buffer before a read.
+        if len(data) > 256 or time.monotonic() >= work_deadline:
+            raise RuntimeError("START exceeds its size or time budget.")
+        if proc.stdin.write(data) != len(data):
+            raise OSError("Short START write.")
+        proc.stdin.close()
+        while True:
+            if time.monotonic() >= work_deadline:
+                raise TimeoutError("Absolute worker deadline reached, including capture/finalization.")
+            chunk, eof = native.capture(proc.stdout)
+            capture.write(chunk)
+            if capture.total > ACCEPTANCE_LOG_LIMIT:
+                raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
+            code = owner.poll()
+            guard.monitor(once=True)
+            guard.check()
+            if code is not None:
+                record["worker_exit"] = code
+                if code != 0:
+                    raise RuntimeError("Worker exited unsuccessfully.")
+                if owner.discover() != 0:
+                    raise RuntimeError("Worker exited with live Job members.")
+                if eof:
+                    break
+            time.sleep(min(0.25, max(0, work_deadline - time.monotonic())))
+        # Explicit final edge after externally observed exit and inherited-pipe EOF.
+        time.sleep(min(0.001, max(0, total_deadline - time.monotonic())))
+        guard.monitor(once=True)
+        guard.check()
+        record["natural_exit"] = not owner.forced
+        record["capture_complete"] = eof
+    except BaseException as exc:
+        record["error"] = type(exc).__name__ + ": " + str(exc)
+        if owner is not None:
+            try:
+                owner.stop()
+            except Exception as cleanup:
+                cleanup_failure(cleanup)
+    finally:
+        if owner is not None:
+            try:
+                owner.finish()
+                record["owned_cleanup"] = owner.closed
+            except Exception as cleanup:
+                cleanup_failure(cleanup)
+            record["owned_accounting"] = dict(owner.final_accounting)
+        if proc is not None:
+            for pipe in (proc.stdin, proc.stdout):
+                try:
+                    pipe.close()
+                except Exception as cleanup:
+                    cleanup_failure(cleanup)
+        # Ownership has finished (or failed and been retained separately). Continue
+        # host reads independently, including when owned accounting was unavailable.
+        guard.owner = None
+        guard.monitor(once=True)
+        if guard.reason:
+            record.setdefault("error", guard.reason)
+        record["memory"] = guard.acceptance_summary(coverage_start, coverage_end)
+        minima = record["memory"]["minima"]
+        record["base_host_floors_satisfied"] = all(
+            minima[name] is not None and minima[name]["available_bytes"] >= 4 * 1024**3
+            for name in ("physical", "commit"))
+        if guard.cleanup_error:
+            cleanup_failure(guard.cleanup_error)
+    try:
+        if not record.get("error") and not record.get("cleanup_error"):
+            paths = list(args.output.iterdir())
+            if ({path.name for path in paths} != {"provisional.json", "server.log", "engine.log"}
+                    or any(path.is_symlink() or not path.is_file()
+                           or path.stat().st_size > ACCEPTANCE_LOG_LIMIT for path in paths)):
+                raise RuntimeError("Missing, unexpected or oversized worker artifacts.")
+            provisional = args.output / "provisional.json"
+            worker_record = json.loads(provisional.read_bytes())
+            record["worker_complete"] = worker_record.get("status") == "provisional_complete"
+            record["protection"] = acceptance_protection(args) is True
+            guard.monitor(once=True)
+            guard.check()
+        args.output.mkdir(parents=True, exist_ok=True)
+        bounded_write(args.output / "controller.log", capture.text().encode("utf-8"), total_deadline)
+        # A saved receipt always remains HELD. Only the caller can observe this function's
+        # post-close result, and must also observe its external exit before qualifying it.
+        record["memory_finalization"] = "provisional until post-artifact host edge in returned result"
+        payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
+        pending = args.output / "lifecycle.json.tmp"
+        bounded_write(pending, payload, total_deadline)
+        pending.replace(args.output / "lifecycle.json")
+        if (args.output / "lifecycle.json").read_bytes() != payload:
+            raise OSError("Final receipt readback mismatch.")
+        if sum(path.stat().st_size for path in args.output.iterdir()) > ACCEPTANCE_ARTIFACT_LIMIT:
+            raise RuntimeError("Total retained artifact budget exceeded.")
+        record["finalization"] = True
+    except Exception as exc:
+        record["finalization_error"] = type(exc).__name__ + ": " + str(exc)
+        record["finalization"] = False
+    finally:
+        # No filesystem/native finalization follows this edge. A slow returning
+        # operation is refused by the observed gap; this is not syscall preemption.
+        coverage_end = time.monotonic()
+        guard.monitor(once=True)
+        if guard.reason:
+            record.setdefault("error", guard.reason)
+        record["memory"] = guard.acceptance_summary(coverage_start, coverage_end)
+        minima = record["memory"]["minima"]
+        record["base_host_floors_satisfied"] = all(
+            minima[name] is not None and minima[name]["available_bytes"] >= 4 * 1024**3
+            for name in ("physical", "commit"))
+        record["within_deadline"] = time.monotonic() < total_deadline
+    if not acceptance_final_predicate(record):
+        raise AcceptanceFailure(record, owner)
+    record["lifecycle_evidence"] = "satisfied"
+    return record
+
+
 def run(args):
+    if getattr(args, "acceptance_telemetry", False):
+        return acceptance_controller(args, time.monotonic())
+    return _run_workload(args)
+
+
+def _run_workload(args):
+    worker_deadline = getattr(args, "_acceptance_deadline", None)
     idle_seconds = getattr(args, "idle_seconds", 0)
     held_out = getattr(args, "held_out", False)
     transfer_workload = getattr(args, "transfer_workload", False)
@@ -702,12 +1326,19 @@ def run(args):
     def save():
         if guard:
             record["memory"] = guard.summary()
+        if worker_deadline is not None:
+            snapshot = dict(record, status="provisional_" + record["status"])
+            pending = args.output / "provisional.json.tmp"
+            bounded_write(pending, (json.dumps(redact(snapshot, secret), indent=2) + "\n").encode("utf-8"),
+                          worker_deadline)
+            pending.replace(args.output / "provisional.json")
+            return
         pending = args.output / "results.json.tmp"
         pending.write_text(json.dumps(redact(record, secret), indent=2) + "\n", encoding="utf-8")
         replace_result(pending, args.output / "results.json")
 
     save()
-    record["working_tree"] = source_identity()
+    record["working_tree"] = source_identity() if worker_deadline is None else source_identity(worker_deadline)
     metadata = exe.with_name("BUILD-" + exe.stem.removeprefix("strata-") + ".json")
     record["build_metadata"] = file_identity(metadata) if metadata.is_file() else None
     SCRATCH.mkdir(exist_ok=True)
@@ -718,14 +1349,18 @@ def run(args):
             raise RuntimeError("Temporary config escaped the intended scratch directory.")
         engine_log = temp / "engine.log"
         cfg, environment = clean_environment(cfg, args.timing, fetch_timing)
-        cfg.update(host="127.0.0.1", port=PORT, log=str(engine_log))
+        cfg.update(host="127.0.0.1", port=PORT, log=None if worker_deadline is not None else str(engine_log))
         record["effective_settings"] = {key: cfg.get(key) for key in (
             "model_name", "args", "fit_max_tokens", "open_browser",
             "expert_profile_save", "expert_profile_save_every")}
         record["effective_settings"]["env"] = safe_engine_environment(cfg, environment)
         config_path = temp / "config.json"
-        config_path.write_text(json.dumps(cfg), encoding="utf-8")
-        owner, capture, pump = None, BoundedCapture(), None
+        if worker_deadline is not None:
+            bounded_write(config_path, json.dumps(cfg).encode("utf-8"), worker_deadline)
+        else:
+            config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        owner, capture, pump, proc = None, BoundedCapture(
+            ACCEPTANCE_LOG_LIMIT - 64 if worker_deadline is not None else LOG_LIMIT), None, None
         try:
             # Recheck immediately before spawning: never attach to an existing service.
             assert_idle()
@@ -733,15 +1368,16 @@ def run(args):
                                      "--config", str(config_path), "--host", "127.0.0.1", "--port", str(PORT)],
                                     cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            owner = OwnedProcess(proc)
+            owner = OwnedProcess(proc) if worker_deadline is None else None
             pump = threading.Thread(target=capture.drain, args=(proc.stdout,), daemon=True)
             pump.start()
-            guard = MemoryGuard(owner, engine_log)
-            guard.thread.start()
+            guard = MemoryGuard(owner, engine_log, deadline=worker_deadline)
+            if worker_deadline is None:
+                guard.thread.start()
             validation = load_workload("validation")
-            validation.OPENER = TimeoutOpener()
+            validation.OPENER = TimeoutOpener(worker_deadline)
             client = make_client(validation, cfg, record, save, guard, secret)
-            deadline = time.monotonic() + 600
+            deadline = min(time.monotonic() + 600, worker_deadline) if worker_deadline is not None else time.monotonic() + 600
             while time.monotonic() < deadline:
                 guard.check()
                 if proc.poll() is not None:
@@ -752,7 +1388,7 @@ def run(args):
                         break
                 except OSError:
                     pass
-                guard.done.wait(1)
+                guard.done.wait(1 if worker_deadline is None else min(1, max(0, deadline - time.monotonic())))
             else:
                 raise RuntimeError("Server did not load within 600 seconds.")
             record["health"] = health
@@ -772,6 +1408,8 @@ def run(args):
                     save()
                     print(f"Idle for {idle_seconds:g} seconds before round 2; monitoring continues.", flush=True)
                     idle_end = time.monotonic() + idle_seconds
+                    if worker_deadline is not None:
+                        idle_end = min(idle_end, worker_deadline)
                     next_notice = time.monotonic() + 30
                     while time.monotonic() < idle_end:
                         guard.check()
@@ -822,25 +1460,44 @@ def run(args):
             record["error"] = redact(str(exc) or type(exc).__name__, secret)
             raise
         finally:
-            if guard:
+            if guard and worker_deadline is None:
                 guard.done.set()
                 guard.thread.join(timeout=10)
             try:
                 if owner:
                     owner.stop()
+                elif proc is not None and worker_deadline is not None:
+                    # The controller's Job owns descendants. Stop only this retained Popen
+                    # server handle here; controller independently accounts the complete Job.
+                    proc.terminate()
+                    proc.wait(timeout=max(0, worker_deadline - time.monotonic()))
+                    record["server_cleanup"] = "retained server handle terminated and waited; controller owns descendants"
             except Exception as exc:
                 record["status"] = "failed"
-                record["error"] = redact("Process cleanup failed: " + str(exc), secret)
+                record["cleanup_error" if worker_deadline is not None else "error"] = redact(
+                    "Process cleanup failed: " + str(exc), secret)
                 raise
             finally:
                 if guard and guard.reason:
                     record["status"] = "failed"
                     record["error"] = guard.reason
                 if pump:
-                    pump.join(timeout=5)
+                    pump.join(timeout=5 if worker_deadline is None else max(0, worker_deadline - time.monotonic()))
                 try:
-                    (args.output / "server.log").write_text(redact(capture.text(), secret), encoding="utf-8")
-                    (args.output / "engine.log").write_text(redact(bounded_file(engine_log), secret), encoding="utf-8")
+                    if worker_deadline is not None:
+                        if pump and pump.is_alive():
+                            raise RuntimeError("Worker inherited server capture did not close.")
+                        if not capture.complete or capture.error:
+                            raise RuntimeError("Worker server capture failed to drain and close.")
+                        if capture.total > ACCEPTANCE_LOG_LIMIT:
+                            raise RuntimeError("Worker server capture exceeded the output budget.")
+                        bounded_write(args.output / "server.log", redact(capture.text(), secret).encode("utf-8"),
+                                      worker_deadline)
+                        bounded_write(args.output / "engine.log", b"Engine file logging held for bounded Stage C collection.\n",
+                                      worker_deadline)
+                    else:
+                        (args.output / "server.log").write_text(redact(capture.text(), secret), encoding="utf-8")
+                        (args.output / "engine.log").write_text(redact(bounded_file(engine_log), secret), encoding="utf-8")
                 except OSError as exc:
                     record["status"] = "failed"
                     record["artifact_error"] = redact(type(exc).__name__ + ": " + str(exc), secret)
@@ -879,6 +1536,10 @@ def main(argv=None):
     try:
         run(args)
     except (Exception, KeyboardInterrupt) as exc:
+        if isinstance(exc, AcceptanceFailure) and exc.owner is not None and not exc.owner.closed:
+            # An embedding caller must receive the retained authority, not only an integer
+            # that discards the unresolved handles. A CLI invocation exits nonzero normally.
+            raise
         # Arbitrary exception messages can include HTTP credentials; details are redacted on disk.
         print(f"Benchmark stopped ({type(exc).__name__}); see results.json if the run started.", file=sys.stderr)
         return 1

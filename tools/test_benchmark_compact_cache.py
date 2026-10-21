@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import io
 import json
 from pathlib import Path
@@ -377,6 +379,47 @@ class HelperTests(unittest.TestCase):
 
 
 class AcceptanceTelemetryTests(unittest.TestCase):
+    def test_actual_monitor_keeps_emergency_reason_when_owned_cleanup_fails(self):
+        from tools import prepare_unsloth_q2 as preparation
+        guard = self.guard()
+        guard.owner.stop.side_effect = RuntimeError("owned survivor")
+        with patch.object(preparation, "memory_snapshot", return_value={
+                "available_gib": 1, "commit_available_gib": 9}), \
+                patch.object(bench.time, "monotonic", side_effect=[1, 1.1]):
+            guard.monitor()
+        self.assertIn("2 GiB emergency", guard.reason)
+        self.assertEqual(guard.cleanup_error, "RuntimeError: owned survivor")
+        result = guard.acceptance_summary(1, 2)
+        self.assertEqual(result["host_evidence"], "refused")
+        self.assertEqual(result["cleanup_error"], guard.cleanup_error)
+        self.assertEqual(result["cleanup"], "pending")
+        with self.assertRaisesRegex(RuntimeError, "2 GiB emergency"):
+            guard.check()
+        self.sample(guard, 8, 8, 2)
+        guard.owner.stop.assert_called_once_with()
+
+    def test_actual_monitor_read_error_survives_owned_cleanup_failure(self):
+        from tools import prepare_unsloth_q2 as preparation
+        guard = self.guard()
+        guard.owner.stop.side_effect = RuntimeError("cleanup failed")
+        with patch.object(preparation, "memory_snapshot", side_effect=OSError("unreadable")), \
+                patch.object(bench.time, "monotonic", return_value=1):
+            guard.monitor()
+        self.assertEqual(guard.reason, "Memory/process monitor failed: OSError")
+        self.assertEqual(guard.cleanup_error, "RuntimeError: cleanup failed")
+        guard.owner.stop.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError, "monitor failed: OSError"):
+            guard.check()
+
+    def test_legacy_guard_cleanup_failure_still_propagates(self):
+        guard = bench.MemoryGuard(Mock(), Path("unused"))
+        guard.owner.stop.side_effect = RuntimeError("legacy cleanup failure")
+        with self.assertRaisesRegex(RuntimeError, "legacy cleanup failure"):
+            guard.sample(512 * 1024**2, None)
+        self.assertEqual(guard.reason, "Available RAM fell below the 1 GiB emergency floor.")
+        self.assertIsNone(guard.cleanup_error)
+        guard.owner.stop.assert_called_once_with()
+
     def guard(self, floors=(4, 4)):
         return bench.MemoryGuard(Mock(), Path("unused"), acceptance_floors=floors)
 
@@ -1086,6 +1129,750 @@ class TransferWorkloadTests(unittest.TestCase):
         self.assertEqual(record["transfer_summary"]["completion_tokens"], 80)
         self.assertEqual(record["transfer_summary"]["tokens_per_second"], 20)
         self.assertEqual(save.call_count, 2)
+
+
+class ContainedLifecycleTests(unittest.TestCase):
+    """Real public composition; only OS, workload, filesystem and missing Stage C seams are fake."""
+
+    class BlockedChild(BaseException):
+        pass
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="contained-cpu-")
+        self.root = Path(self.temporary.name)
+        self.binary = self.root / "python.exe"
+        self.binary.write_bytes(b"synthetic direct interpreter, never executed")
+        self.config = self.root / "synthetic.json"
+        self.config.write_text(json.dumps({"exe": str(self.binary), "api_key": "synthetic-key",
+                                          "fit_max_tokens": True, "open_browser": False}))
+        self.output = self.root / "output"
+        self.args = argparse.Namespace(config=self.config, output=self.output, timing=False, smoke=False,
+                                       acceptance_telemetry=True)
+        self.now, self.mode, self.started, self.samples = 100.0, "green", False, 0
+        self.events, self.requests = [], []
+        self.root_proc = types.SimpleNamespace(pid=321, _handle=1234, stdin=io.BytesIO(), stdout=io.BytesIO())
+        # Keep the START bytes inspectable after close, as a fake pipe transport would.
+        class StartPipe(io.BytesIO):
+            def close(pipe):
+                pipe.envelope = pipe.getvalue()
+        self.root_proc.stdin = StartPipe()
+        self.code, self.assigned, self.killed, self.closed = None, False, False, False
+        self.stage = None
+        self.cleanup = contextlib.ExitStack()
+        self.addCleanup(self.cleanup.close)
+        self.addCleanup(self.temporary.cleanup)
+        self.native = self.Native(self)
+        self.NativeBinding = bench.WindowsProcessAPI
+        self.SelfIdentityBinding = bench.worker_self_identity
+        from tools import prepare_unsloth_q2 as preparation
+        patches = [
+            patch.object(bench, "acceptance_ready", return_value=True),
+            patch.object(bench, "acceptance_preflight", side_effect=self.preflight),
+            patch.object(bench, "acceptance_protection", side_effect=lambda args: self.mode != "protection"),
+            patch.object(bench, "WindowsProcessAPI", side_effect=lambda: self.native),
+            patch.object(bench, "worker_self_identity", return_value=(321, 2**63 + 7)),
+            patch.object(ctypes, "WinDLL", side_effect=AssertionError("unintercepted native DLL")),
+            patch.dict(sys.modules, {"serve.winjob": types.SimpleNamespace(
+                contain=Mock(side_effect=AssertionError("server native containment boundary")))}),
+            patch.object(bench.sys, "base_prefix", str(self.root)),
+            patch.object(bench.sys, "_base_executable", str(self.binary)),
+            patch.object(bench, "SCRATCH", self.root),
+            patch.object(bench.time, "monotonic", side_effect=self.clock),
+            patch.object(bench.time, "sleep", side_effect=self.sleep),
+            patch.object(bench.subprocess, "Popen", side_effect=self.spawn),
+            patch.object(bench.subprocess, "run", side_effect=self.git),
+            patch.object(bench.psutil, "Process", side_effect=AssertionError("PID lookup forbidden")),
+            patch.object(bench.psutil, "process_iter", return_value=[]),
+            patch.object(bench.psutil, "virtual_memory", side_effect=AssertionError("real host read")),
+            patch.object(bench.psutil, "swap_memory", side_effect=AssertionError("real commit read")),
+            patch.object(preparation, "memory_snapshot", side_effect=self.sample),
+            patch.object(bench.socket, "socket", return_value=Mock(__enter__=Mock(return_value=Mock()),
+                                                                  __exit__=Mock(return_value=False))),
+            patch.object(bench, "load_workload", side_effect=self.workload),
+        ]
+        for item in patches:
+            self.cleanup.enter_context(item)
+
+    def clock(self):
+        self.now += 0.001
+        return self.now
+
+    def sleep(self, seconds):
+        self.assertGreaterEqual(seconds, 0)
+        self.now += seconds
+
+    def git(self, argv, **kwargs):
+        self.assertEqual(argv[0], "git", "Unintercepted external command")
+        data = {"ls-files": b"", "rev-parse": b"synthetic\n", "status": b""}[argv[1]]
+        return types.SimpleNamespace(stdout=data)
+
+    def preflight(self, args):
+        self.events.append("admission")
+        self.assertTrue(self.assigned)
+        self.assertTrue(self.started)
+        self.assertFalse(self.output.exists())
+        if self.mode == "blocked-admission":
+            self.stage = "admission"
+            raise self.BlockedChild()
+
+    def sample(self):
+        self.samples += 1
+        if self.mode == "missing-telemetry":
+            return {"available_gib": 8}
+        if self.mode == "missing-final-edge" and self.closed:
+            return {"available_gib": 8}
+        if self.mode == "gap" and self.samples == 2:
+            self.now += 1.1
+        if self.mode == "guard-cleanup" and self.samples >= 2:
+            return {"available_gib": 1, "commit_available_gib": 8}
+        if self.mode == "floor-fail":
+            return {"available_gib": 3, "commit_available_gib": 9}
+        return {"available_gib": 8, "commit_available_gib": 9}
+
+    def spawn(self, argv, **kwargs):
+        if argv[-1] == "--internal-acceptance-worker":
+            self.assertEqual(argv[:3], [str(self.binary), "-I", "-S"])
+            self.assertFalse(self.output.exists())
+            self.assertGreaterEqual(self.samples, 1, "Host coverage must precede owned startup")
+            self.events.append("create")
+            self.bootstrap_settings = kwargs["env"]["STRATA_BENCHMARK_BOOTSTRAP"]
+            if self.mode == "missing-handle":
+                self.root_proc._handle = None
+            return self.root_proc
+        self.assertIn("--engine", argv, "Unexpected process boundary")
+        self.assertTrue(self.assigned)
+        cfg = json.loads(Path(argv[argv.index("--config") + 1]).read_text())
+        self.assertIsNone(cfg["log"])
+        self.events.append("server")
+        return types.SimpleNamespace(stdout=io.BytesIO(b"synthetic server output\n"),
+                                     poll=lambda: None, terminate=lambda: self.events.append("server-stop"),
+                                     wait=lambda timeout: self.events.append("server-wait") or 0)
+
+    def workload(self, name):
+        test = self
+        class Client:
+            def __init__(self, cfg):
+                self.cfg, self.history = cfg, []
+
+            def get(self, path):
+                if path == "/health":
+                    return {"loaded": True, "max_context": 131072}
+                return {"engine": {}, "totals": {"requests": len(self.history)}, "requests": self.history[:]}
+
+            def chat(self, messages, max_tokens=128, **kwargs):
+                test.requests.append(messages)
+                if test.mode == "request-secret":
+                    raise OSError("synthetic-key from an HTTP failure")
+                index = len(self.history) + 1
+                self.history.append({"time": index, "output_tokens": max_tokens,
+                                     "prompt_tokens": 20, "decode_ms": 1000})
+                return {"choices": [{"message": {"content": "synthetic answer"}}],
+                        "usage": {"completion_tokens": max_tokens, "prompt_tokens": 20},
+                        "timings": {"predicted_ms": 1000}}
+        return types.SimpleNamespace(Client=Client, PROMPTS=["synthetic workload"])
+
+    class Native:
+        def __init__(self, test):
+            self.t = test
+
+        def identity(self, handle):
+            t = self.t
+            t.assertEqual(handle, 1234)
+            if t.mode == "bad-identity":
+                return 321, 123.0
+            if t.mode == "out-of-range-identity":
+                return 321, 2**64
+            if t.mode == "reused-identity" and t.started:
+                return 321, 2**63 + 8
+            return 321, 2**63 + 7
+
+        def create_job(self):
+            self.t.events.append("create-job")
+            return 5678
+
+        def configure_job(self, job):
+            self.t.events.append("kill-on-close")
+            if self.t.mode == "configure-fail":
+                raise OSError("Job configuration failed")
+
+        def assign(self, job, handle):
+            t = self.t
+            t.events.append("assign")
+            if t.mode == "assignment":
+                raise OSError("nested assignment denied")
+            t.assigned = True
+
+        def active(self, job):
+            t = self.t
+            t.assertEqual(job, 5678)
+            if t.mode == "unknown-job":
+                raise OSError("Job membership unavailable")
+            if t.mode in ("live-job", "survivor"):
+                return 1
+            return int(t.code is None)
+
+        def terminate_job(self, job):
+            t = self.t
+            t.events.append("cancel-job")
+            t.killed = True
+            if t.mode == "guard-cleanup":
+                raise OSError("synthetic cancel failure")
+            if t.mode != "survivor":
+                t.code = 1
+
+        def terminate_process(self, handle):
+            self.t.events.append("cancel-exact-handle")
+            self.t.killed, self.t.code = True, 1
+
+        def wait(self, handle, milliseconds):
+            t = self.t
+            t.events.append("wait")
+            if handle is None:
+                raise OSError("missing handle")
+            if t.mode == "wait-failed":
+                return 0xffffffff
+            if t.mode == "wait-error" and not t.killed:
+                raise OSError("synthetic wait exception")
+            if t.mode in ("wait-timeout", "survivor") and t.killed:
+                t.now += milliseconds / 1000
+                return 258
+            return 258 if t.code is None else 0
+
+        def exit_code(self, handle):
+            return self.t.code
+
+        def close(self, job):
+            t = self.t
+            t.events.append("close-job")
+            if t.mode == "close-fail":
+                raise OSError("close failed")
+
+        def close_process(self, proc):
+            if self.t.mode == "process-close-fail":
+                raise OSError("process close failed")
+            self.t.events.append("close-process")
+            self.t.closed = True
+
+        def capture(self, pipe):
+            t = self.t
+            if not t.started and not t.killed:
+                t.started = True
+                t.events.append("START")
+                if t.mode in ("hung", "late-worker", "wait-timeout", "survivor"):
+                    t.stage = "parked worker"
+                else:
+                    envelope = t.root_proc.stdin.envelope.decode("utf-8")
+                    if t.mode == "malformed-start":
+                        item = json.loads(envelope)
+                        item["identity"]["creation_filetime"] = "01"
+                        envelope = json.dumps(item) + "\n"
+                    try:
+                        t.code = bench.worker_bootstrap(io.StringIO(envelope), bench.acceptance_worker, pid=321,
+                                                       settings=t.bootstrap_settings)
+                    except t.BlockedChild:
+                        pass  # A parked external syscall: the process, not the controller, is blocked.
+                    except BaseException as exc:
+                        t.child_error = exc
+                        t.code = 1
+            return (b"X" * (bench.ACCEPTANCE_LOG_LIMIT + 1) if t.mode == "capture-overflow" else b"",
+                    t.code is not None and t.mode != "blocked-capture")
+
+    def invoke(self, mode="green"):
+        self.mode = mode
+        with contextlib.redirect_stdout(io.StringIO()):
+            return bench.run(self.args)
+
+    def refused(self, mode):
+        with self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.invoke(mode)
+        record = caught.exception.record
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        self.assertEqual(record["status"], "held")
+        self.assertEqual(record["lifecycle_evidence"], "refused")
+        for path in self.output.glob("*.json"):
+            self.assertNotEqual(json.loads(path.read_text()).get("status"), "PASS")
+        return caught.exception
+
+    def test_public_run_composes_bootstrap_existing_workload_monitor_owner_and_finalizer(self):
+        result = self.invoke()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(result["lifecycle_evidence"], "satisfied")
+        self.assertEqual(result["identity"], {"pid": "321", "creation_filetime": str(2**63 + 7)})
+        self.assertEqual(len(self.requests), 3)
+        self.assertGreaterEqual(self.samples, 3)
+        self.assertLess(self.events.index("kill-on-close"), self.events.index("assign"))
+        self.assertLess(self.events.index("assign"), self.events.index("START"))
+        self.assertLess(self.events.index("START"), self.events.index("admission"))
+        self.assertLess(self.events.index("admission"), self.events.index("server"))
+        self.assertTrue(self.closed)
+        self.assertFalse(self.killed)
+        self.assertEqual(json.loads((self.output / "provisional.json").read_text())["status"], "provisional_complete")
+        self.assertEqual(json.loads((self.output / "lifecycle.json").read_text())["status"], "held")
+        self.assertFalse((self.output / "results.json").exists())
+        self.assertLess(sum(path.stat().st_size for path in self.output.iterdir()), bench.ACCEPTANCE_ARTIFACT_LIMIT)
+
+    def test_main_uses_the_same_complete_public_composition(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = bench.main(["--config", str(self.config), "--output", str(self.output), "--acceptance-telemetry"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.requests), 3)
+        self.assertTrue(self.closed)
+
+    def test_assignment_failure_rolls_back_only_creation_handle_and_never_sends_start(self):
+        self.refused("assignment")
+        self.assertFalse(self.started)
+        self.assertNotIn("admission", self.events)
+        self.assertEqual(self.root_proc.stdin.envelope, b"")
+        self.assertIn("cancel-exact-handle", self.events)
+        self.assertNotIn("cancel-job", self.events)
+        self.assertTrue(self.closed)
+
+    def test_job_configuration_failure_retains_then_closes_owned_job(self):
+        self.refused("configure-fail")
+        self.assertFalse(self.started)
+        self.assertNotIn("assign", self.events)
+        self.assertIn("cancel-exact-handle", self.events)
+        self.assertIn("close-job", self.events)
+
+    def test_hung_worker_uses_reserved_absolute_cleanup_budget(self):
+        failure = self.refused("hung")
+        self.assertTrue(self.killed)
+        self.assertTrue(self.closed)
+        self.assertLess(self.now, failure.record["total_deadline"])
+        self.assertIn("Absolute worker deadline", failure.record["error"])
+
+    def test_blocked_admission_is_inside_independently_cancelled_process(self):
+        self.refused("blocked-admission")
+        self.assertEqual(self.stage, "admission")
+        self.assertTrue(self.killed)
+        self.assertNotIn("server", self.events)
+
+    def test_late_worker_cannot_resume_after_owned_job_cancellation(self):
+        self.refused("late-worker")
+        self.now += 1000
+        self.native.capture(self.root_proc.stdout)
+        self.assertTrue(self.killed)
+        self.assertNotIn("admission", self.events)
+        self.assertFalse((self.output / "provisional.json").exists())
+
+    def test_blocked_worker_artifact_replace_is_supervised_after_requests_and_cleanup(self):
+        real_replace = Path.replace
+        def replace(path, target):
+            if (path.name == "provisional.json.tmp"
+                    and json.loads(path.read_text()).get("status") == "provisional_complete"):
+                self.stage = "worker artifact replace"
+                raise self.BlockedChild()
+            return real_replace(path, target)
+        with patch.object(Path, "replace", replace):
+            failure = self.refused("green")
+        self.assertEqual(len(self.requests), 3)
+        self.assertIn("server-stop", self.events)
+        self.assertEqual(self.stage, "worker artifact replace")
+        self.assertTrue(self.killed)
+        self.assertTrue(self.closed)
+        self.assertIn("Absolute worker deadline", failure.record["error"])
+
+    def test_inherited_capture_without_eof_refuses_despite_worker_exit_zero(self):
+        failure = self.refused("blocked-capture")
+        self.assertEqual(failure.record["worker_exit"], 0)
+        self.assertFalse(failure.record.get("capture_complete", False))
+        self.assertTrue(self.killed)
+
+    def test_wait_failed_still_cancels_and_retains_uncertain_handles(self):
+        probes = []
+        identity, active = self.native.identity, self.native.active
+        def observe_identity(handle):
+            probes.append(("identity", self.killed))
+            return identity(handle)
+        def observe_job(job):
+            probes.append(("job", self.killed))
+            return active(job)
+        with patch.object(self.native, "identity", side_effect=observe_identity), \
+                patch.object(self.native, "active", side_effect=observe_job):
+            failure = self.refused("wait-failed")
+        self.assertTrue(self.killed)
+        self.assertFalse(self.closed)
+        self.assertIs(failure.owner.proc, self.root_proc)
+        self.assertNotIn("close-process", self.events)
+        self.assertIn(("identity", True), probes)
+        self.assertIn(("job", True), probes)
+        self.assertEqual(failure.record["owned_accounting"]["wait_result"], 0xffffffff)
+        self.assertEqual(failure.record["owned_accounting"]["identity"],
+                         {"pid": "321", "creation_filetime": str(2**63 + 7)})
+        self.assertEqual(failure.record["owned_accounting"]["job_active"], 0)
+        self.assertIn("Final owned wait was not signaled", failure.record["cleanup_error"])
+        with self.assertRaises(RuntimeError):
+            failure.owner.stop()
+
+    def test_failed_wait_and_identity_still_attempt_post_cancel_job_accounting(self):
+        identity, active = self.native.identity, self.native.active
+        probes = []
+        def observe_identity(handle):
+            if self.killed:
+                raise OSError("synthetic post-cancel identity failure")
+            return identity(handle)
+        def observe_job(job):
+            probes.append(self.killed)
+            return active(job)
+        with patch.object(self.native, "identity", side_effect=observe_identity), \
+                patch.object(self.native, "active", side_effect=observe_job):
+            failure = self.refused("wait-failed")
+        self.assertIn(True, probes)
+        self.assertIn("post-cancel identity failure", failure.record["owned_accounting"]["identity_error"])
+        self.assertEqual(failure.record["owned_accounting"]["job_active"], 0)
+        self.assertFalse(self.closed)
+
+    def test_wait_exception_cancels_then_accounts_without_erasing_the_failure(self):
+        failure = self.refused("wait-error")
+        self.assertTrue(self.killed)
+        self.assertTrue(self.closed)
+        self.assertIn("wait exception", failure.record["error"])
+        self.assertIn("wait exception", failure.record["cleanup_error"])
+
+    def test_final_wait_timeout_does_not_close_the_sole_authority(self):
+        failure = self.refused("wait-timeout")
+        self.assertTrue(self.killed)
+        self.assertFalse(self.closed)
+        self.assertIn("258", failure.record["cleanup_error"])
+        self.assertIs(failure.owner.proc, self.root_proc)
+
+    def test_close_failure_refuses_even_after_natural_exit(self):
+        failure = self.refused("close-fail")
+        self.assertIn("close failed", failure.record["cleanup_error"])
+        self.assertFalse(self.closed)
+
+    def test_process_handle_close_failure_retains_authority(self):
+        failure = self.refused("process-close-fail")
+        self.assertIn("process close failed", failure.record["cleanup_error"])
+        self.assertFalse(self.closed)
+        self.assertIs(failure.owner.proc, self.root_proc)
+
+    def test_main_preserves_unresolved_authority_for_an_embedding_caller(self):
+        self.mode = "wait-failed"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as failure:
+            bench.main(["--config", str(self.config), "--output", str(self.output), "--acceptance-telemetry"])
+        self.assertIs(failure.exception.owner.proc, self.root_proc)
+        self.assertFalse(self.closed)
+
+    def test_live_job_member_is_not_natural_success(self):
+        self.refused("live-job")
+        self.assertTrue(self.killed)
+        self.assertFalse(self.closed)
+
+    def test_unknown_job_membership_refuses_and_retains_authority(self):
+        failure = self.refused("unknown-job")
+        self.assertTrue(self.killed)
+        self.assertFalse(self.closed)
+        self.assertIs(failure.owner.proc, self.root_proc)
+
+    def test_survivor_retains_exact_authority(self):
+        failure = self.refused("survivor")
+        self.assertTrue(self.killed)
+        self.assertFalse(self.closed)
+        self.assertIs(failure.owner.proc, self.root_proc)
+
+    def test_guard_primary_reason_and_cleanup_failure_both_survive(self):
+        failure = self.refused("guard-cleanup")
+        self.assertIn("2 GiB", failure.record["error"])
+        self.assertIn("cancel failure", failure.record["cleanup_error"])
+        self.assertIn("Final owned wait was not signaled", failure.record["cleanup_error"])
+        self.assertEqual(failure.record["memory"]["minima"]["physical"]["available_bytes"], 1024**3)
+
+    def test_missing_telemetry_prevents_start(self):
+        self.refused("missing-telemetry")
+        self.assertFalse(self.started)
+
+    def test_missing_final_coverage_edge_refuses_after_successful_work(self):
+        failure = self.refused("missing-final-edge")
+        self.assertEqual(len(self.requests), 3)
+        self.assertIn("Required monotonic coverage edges", " ".join(failure.record["memory"]["errors"]))
+
+    def test_configured_floor_refuses_without_rewriting_original_emergency_threshold(self):
+        failure = self.refused("floor-fail")
+        self.assertEqual(len(self.requests), 3)
+        self.assertFalse(self.killed)
+        self.assertEqual(failure.record["memory"]["minima"]["physical"]["available_bytes"], 3 * 1024**3)
+
+    def test_lower_configured_allowance_does_not_remove_independent_four_gib_floor(self):
+        self.args.acceptance_physical_gib = 2
+        self.args.acceptance_commit_gib = 2
+        failure = self.refused("floor-fail")
+        self.assertEqual(failure.record["memory"]["host_evidence"], "satisfied")
+        self.assertFalse(failure.record["base_host_floors_satisfied"])
+
+    def test_higher_configured_allowance_is_also_required(self):
+        self.args.acceptance_physical_gib = 10
+        failure = self.refused("green")
+        self.assertEqual(failure.record["memory"]["host_evidence"], "refused")
+        self.assertTrue(failure.record["base_host_floors_satisfied"])
+
+    def test_capture_volume_is_finite_and_overflow_refuses(self):
+        failure = self.refused("capture-overflow")
+        self.assertIn("output budget", failure.record["error"])
+        self.assertTrue(self.killed)
+        self.assertLessEqual((self.output / "controller.log").stat().st_size, bench.ACCEPTANCE_LOG_LIMIT)
+
+    def test_gap_refuses_actual_controller_monitor_composition(self):
+        failure = self.refused("gap")
+        self.assertGreater(failure.record["memory"]["max_gap_seconds"], 1)
+
+    def test_changed_retained_identity_refuses(self):
+        self.refused("reused-identity")
+        self.assertTrue(self.killed)
+        self.assertFalse(self.closed)
+
+    def test_malformed_native_identity_refuses_before_start(self):
+        self.refused("bad-identity")
+        self.assertFalse(self.started)
+
+    def test_out_of_range_native_identity_refuses_actual_public_path(self):
+        self.refused("out-of-range-identity")
+        self.assertFalse(self.started)
+        self.assertIn("cancel-exact-handle", self.events)
+
+    def test_venv_configuration_refuses_before_any_process_creation(self):
+        (self.root / "pyvenv.cfg").write_text("synthetic venv launcher marker")
+        failure = self.refused("green")
+        self.assertIn("direct base interpreter", failure.record["error"])
+        self.assertNotIn("create", self.events)
+
+    def test_malformed_transport_cannot_enter_worker_admission(self):
+        self.refused("malformed-start")
+        self.assertNotIn("admission", self.events)
+
+    def test_canonical_wrong_filetime_in_external_start_pipe_refuses_before_admission(self):
+        write = self.root_proc.stdin.write
+        def corrupt_token(data):
+            token = json.loads(data)
+            token["identity"]["creation_filetime"] = "1"
+            write((json.dumps(token) + "\n").encode("utf-8"))
+            return len(data)
+        with patch.object(self.root_proc.stdin, "write", side_effect=corrupt_token):
+            failure = self.refused("green")
+        self.assertEqual(failure.record["identity"]["creation_filetime"], str(2**63 + 7))
+        self.assertIn("native creation identity", str(self.child_error))
+        self.assertNotIn("admission", self.events)
+        self.assertEqual(self.requests, [])
+        self.assertTrue(self.closed)
+
+    def test_independent_worker_self_identity_mismatch_refuses_before_admission(self):
+        with patch.object(bench, "worker_self_identity", return_value=(321, 2**63 + 8)):
+            self.refused("green")
+        self.assertNotIn("admission", self.events)
+        self.assertEqual(self.requests, [])
+        self.assertIn("native creation identity", str(self.child_error))
+
+    def test_independent_worker_self_pid_mismatch_refuses_before_admission(self):
+        with patch.object(bench, "worker_self_identity", return_value=(322, 2**63 + 7)):
+            self.refused("green")
+        self.assertNotIn("admission", self.events)
+        self.assertEqual(self.requests, [])
+
+    def test_missing_creation_handle_refuses_without_pid_fallback(self):
+        self.refused("missing-handle")
+        self.assertFalse(self.started)
+        self.assertFalse(self.closed)
+
+    def test_protection_failure_cannot_qualify_lifecycle(self):
+        self.refused("protection")
+
+    def test_partial_final_receipt_has_no_authoritative_pass(self):
+        real_open = Path.open
+        class ShortWriter(io.BytesIO):
+            def write(self, data):
+                return super().write(data[:7])
+        def open_file(path, *args, **kwargs):
+            if path.name == "lifecycle.json.tmp":
+                return ShortWriter()
+            return real_open(path, *args, **kwargs)
+        with patch.object(Path, "open", open_file):
+            failure = self.refused("green")
+        self.assertIn("Short artifact write", failure.record["finalization_error"])
+        self.assertFalse((self.output / "lifecycle.json").exists())
+
+    def test_partial_worker_artifact_cannot_return_success(self):
+        real_open = Path.open
+        class ShortWriter(io.BytesIO):
+            def write(self, data):
+                return super().write(data[:7])
+        def open_file(path, *args, **kwargs):
+            return ShortWriter() if path.name == "provisional.json.tmp" else real_open(path, *args, **kwargs)
+        with patch.object(Path, "open", open_file):
+            failure = self.refused("green")
+        self.assertEqual(failure.record["worker_exit"], 1)
+        self.assertFalse((self.output / "provisional.json").exists())
+
+    def test_worker_failure_keeps_credentials_out_of_external_capture(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            failure = self.refused("request-secret")
+        self.assertEqual(failure.record["worker_exit"], 1)
+        self.assertIn("Contained worker stopped (OSError)", stderr.getvalue())
+        self.assertNotIn("synthetic-key", stderr.getvalue())
+        provisional = (self.output / "provisional.json").read_text()
+        self.assertNotIn("synthetic-key", provisional)
+        self.assertIn("[REDACTED]", provisional)
+
+    def test_replace_failure_has_no_authoritative_pass(self):
+        real_replace = Path.replace
+        def replace(path, target):
+            if path.name == "lifecycle.json.tmp":
+                raise OSError("synthetic replace failure")
+            return real_replace(path, target)
+        with patch.object(Path, "replace", replace):
+            failure = self.refused("green")
+        self.assertIn("replace failure", failure.record["finalization_error"])
+
+    def test_artifact_close_failure_has_no_authoritative_pass(self):
+        real_open = Path.open
+        class BadClose(io.BytesIO):
+            def __exit__(self, *args):
+                super().__exit__(*args)
+                raise OSError("synthetic artifact close failure")
+        def open_file(path, *args, **kwargs):
+            return BadClose() if path.name == "lifecycle.json.tmp" else real_open(path, *args, **kwargs)
+        with patch.object(Path, "open", open_file):
+            failure = self.refused("green")
+        self.assertIn("artifact close failure", failure.record["finalization_error"])
+
+    def test_finalization_that_returns_late_still_refuses(self):
+        real_replace = Path.replace
+        def replace(path, target):
+            result = real_replace(path, target)
+            if path.name == "lifecycle.json.tmp":
+                self.now += bench.ACCEPTANCE_SECONDS
+            return result
+        with patch.object(Path, "replace", replace):
+            failure = self.refused("green")
+        self.assertFalse(failure.record["within_deadline"])
+        self.assertEqual(json.loads((self.output / "lifecycle.json").read_text())["status"], "held")
+
+    def assert_gap_within_total_deadline(self, failure):
+        self.assertTrue(failure.record["within_deadline"])
+        self.assertEqual(failure.record["memory"]["host_evidence"], "refused")
+        self.assertGreater(failure.record["memory"]["max_gap_seconds"], 1)
+        self.assertTrue(failure.record["base_host_floors_satisfied"])
+
+    def test_slow_returning_process_creation_is_covered_and_refuses_before_start(self):
+        spawn = self.spawn
+        def slow_spawn(argv, **kwargs):
+            proc = spawn(argv, **kwargs)
+            self.now += 5
+            return proc
+        with patch.object(bench.subprocess, "Popen", side_effect=slow_spawn):
+            failure = self.refused("green")
+        self.assert_gap_within_total_deadline(failure)
+        self.assertFalse(self.started)
+
+    def test_slow_returning_final_wait_cannot_escape_host_coverage(self):
+        wait = self.native.wait
+        def slow_final_wait(handle, milliseconds):
+            result = wait(handle, milliseconds)
+            if milliseconds > 0:
+                self.now += 5
+            return result
+        with patch.object(self.native, "wait", side_effect=slow_final_wait):
+            failure = self.refused("green")
+        self.assert_gap_within_total_deadline(failure)
+        self.assertEqual(len(self.requests), 3)
+        self.assertTrue(self.closed)
+
+    def test_slow_returning_protection_cannot_escape_host_coverage(self):
+        def slow_protection(args):
+            self.now += 5
+            return True
+        with patch.object(bench, "acceptance_protection", side_effect=slow_protection):
+            failure = self.refused("green")
+        self.assert_gap_within_total_deadline(failure)
+        self.assertTrue(failure.record["protection"])
+        self.assertTrue(self.closed)
+
+    def test_slow_returning_artifact_tail_cannot_escape_host_coverage(self):
+        read = Path.read_bytes
+        def slow_read(path):
+            data = read(path)
+            if path.name == "lifecycle.json":
+                self.now += 5
+            return data
+        with patch.object(Path, "read_bytes", slow_read):
+            failure = self.refused("green")
+        self.assert_gap_within_total_deadline(failure)
+        self.assertTrue(failure.record["finalization"])
+        self.assertEqual(json.loads((self.output / "lifecycle.json").read_text())["status"], "held")
+
+    def test_native_bindings_marshal_exact_widths_against_fake_dll_only(self):
+        calls = []
+        class Function:
+            def __init__(self, name):
+                self.name = name
+
+            def __call__(self, *args):
+                calls.append((self.name, args))
+                if self.name == "GetProcessTimes":
+                    args[1]._obj.low, args[1]._obj.high = 7, 2**31
+                if self.name == "GetProcessId":
+                    return 321
+                if self.name == "GetCurrentProcess":
+                    return -1
+                if self.name == "CreateJobObjectW":
+                    return 5678
+                if self.name == "WaitForSingleObject":
+                    return 0
+                if self.name == "GetExitCodeProcess":
+                    args[1]._obj.value = 0
+                return 1
+        class DLL:
+            def __init__(self):
+                self.functions = {}
+
+            def __getattr__(self, name):
+                return self.functions.setdefault(name, Function(name))
+        dll = DLL()
+        with patch.object(ctypes, "WinDLL", return_value=dll):
+            api = self.NativeBinding()
+            self.assertEqual(api.identity(1234), (321, 2**63 + 7))
+            job = api.create_job()
+            api.configure_job(job)
+            api.assign(job, 1234)
+            self.assertEqual(api.active(job), 0)
+            self.assertEqual(api.wait(1234, 0), 0)
+            self.assertEqual(api.exit_code(1234), 0)
+            api.terminate_job(job)
+            api.terminate_process(1234)
+            api.close(job)
+            previous_calls = len(calls)
+            self.assertEqual(self.SelfIdentityBinding(), (321, 2**63 + 7))
+            self.assertEqual([name for name, _ in calls[previous_calls:]],
+                             ["GetCurrentProcess", "GetProcessTimes", "GetProcessId"])
+        self.assertEqual(ctypes.sizeof(api.FileTime), 8)
+        self.assertEqual(ctypes.sizeof(api.Accounting), 48)
+        self.assertEqual(ctypes.sizeof(api.ExtendedLimit), 144 if ctypes.sizeof(ctypes.c_void_p) == 8 else 112)
+        limits = next(args for name, args in calls if name == "SetInformationJobObject")
+        self.assertEqual(limits[1], 9)
+        self.assertEqual(limits[2]._obj.basic.flags, 0x2000)
+        self.assertEqual(dll.functions["GetProcessId"].restype, ctypes.c_uint32)
+        self.assertEqual(dll.functions["CreateJobObjectW"].restype, ctypes.c_void_p)
+
+    def test_failed_native_close_does_not_detach_popen_authority(self):
+        api = object.__new__(self.NativeBinding)
+        handle = Mock()
+        api.close = Mock(side_effect=OSError("synthetic native close"))
+        with self.assertRaises(OSError):
+            api.close_process(types.SimpleNamespace(_handle=handle))
+        handle.Detach.assert_not_called()
+
+    def test_identity_rejects_float_bool_zero_negative_and_overflow(self):
+        for value in ((True, 1), (1, False), (0, 1), (-1, 1), (2**32, 1), (1, 2**64), (1, 1.0)):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                bench.native_identity(value)
+        for value in ("01", "0", "-1", "1.0", str(2**64), True, 1):
+            item = {"command": "START", "identity": {"pid": "321", "creation_filetime": value}}
+            with self.subTest(transport=value), self.assertRaises(ValueError):
+                bench.worker_bootstrap(io.StringIO(json.dumps(item) + "\n"),
+                                       lambda _: self.fail("worker entered"), pid=321)
+
+    def test_duration_and_edge_samples_fit_raw_sample_cap(self):
+        self.assertLessEqual(bench.ACCEPTANCE_SECONDS / 0.25 + 8, 4096)
 
 
 if __name__ == "__main__":
