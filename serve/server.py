@@ -2386,6 +2386,130 @@ def child_env(cfg: dict) -> dict:
     return env
 
 
+def launch_memory_evidence(cfg: dict, args: list[str], env: dict, *, automatic: bool) -> dict:
+    """A bounded public snapshot of the consumed plan and requests, never native allocations."""
+    def number(value):
+        return type(value) in (int, float) and 0 <= value <= 2**64 and math.isfinite(value)
+
+    sample = None
+    if automatic:
+        policy = cfg.get("memory_policy")
+        raw = policy.get("sample") if isinstance(policy, dict) else None
+        numeric = ("ram_gib", "vram_gib", "kv_ram_gib", "cpu_server_gib", "later_startup_gib",
+                   "headroom_gib", "vram_reserve_requested_mib", "vram_reserve_mib", "gpu_commit_gib",
+                   "expert_pool_gib", "pinned_gib", "recent_mib")
+        optional = ("available_gib", "commit_available_gib", "available_fallback_gib")
+        boolean = ("windows_commit", "automatic_host_cache", "low_memory", "over_budget")
+        if (isinstance(raw, dict) and all(number(raw.get(k)) for k in numeric) and
+                all(k in raw and (raw[k] is None or number(raw[k])) for k in optional) and
+                all(type(raw.get(k)) is bool for k in boolean)):
+            labels = {"kv_ram_gib": "kv_ram_allowance_gib", "cpu_server_gib": "cpu_server_allowance_gib",
+                      "later_startup_gib": "later_startup_allowance_gib", "gpu_commit_gib": "gpu_commit_allowance_gib",
+                      "expert_pool_gib": "expert_pool_budget_gib", "pinned_gib": "pinned_budget_gib",
+                      "recent_mib": "recent_target_mib", "available_fallback_gib": "available_fallback_estimate_gib",
+                      "headroom_gib": "headroom_requested_gib",
+                      "vram_reserve_mib": "vram_reserve_effective_request_mib"}
+            sample = {labels.get(k, k): raw[k] for k in (*numeric, *optional, *boolean)}
+
+    def control(value, integer_max=None, *, positive=False):
+        if not isinstance(value, str) or len(value) > 64:
+            return None
+        if integer_max is not None:
+            # atoi/atoll and the file-cache strtoull consumer: only whole decimal
+            # spellings with an exact, representable meaning. Prefixes stay unavailable.
+            if not re.fullmatch(r"[0-9]+", value):
+                return None
+            value = int(value)
+            return value if value <= integer_max else None
+        # Only the resident budget/headroom use atof. Match its decimal subset,
+        # with C whitespace rather than Python's wider Unicode whitespace/digits.
+        if not re.fullmatch(r"[ \t\r\n\f\v]*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \t\r\n\f\v]*", value):
+            return None
+        value = float(value)
+        return value if number(value) and (not positive or value > 0) else None
+
+    integer_args = {"--max-context": 2**63 - 1, "--kv-resident": 2**63 - 1, "--prefill": 2**63 - 1,
+                    "--expert-cache": 2**31 - 1, "--vram-reserve-mib": 2**31 - 1}
+    # The generate.cpp option loop consumes values even when they look like flags.
+    # Unknown options make this evidence unavailable; they never alter engine argv.
+    value_flags = set("""
+        --adapt-async --adapt-decay --adapt-every --adapt-swaps --batch --batch-groups
+        --control-vector --control-vector-layer-range --control-vector-scaled
+        --conversation-cache-mib --conversation-cache-min-free-mib --conversation-cache-slots
+        --cvec-dir --cvec-mode --dump-final-r --dump-halves --dump-layers --dump-logits
+        --dump-mixed --dump-residual --dump-routing --embd-gguf --eos-ids --expert-cache
+        --expert-cache-device1 --expert-cache-device2 --expert-cache-device3
+        --expert-cache-remote-placement --expert-profile --expert-profile-save
+        --expert-profile-save-every --gpu --host-core --kv --kv-resident --layer-split
+        --logits-stride --lookup-chain --lookup-chain-min --max-context --max-new --mtp
+        --mtp-draft-vocab --mtp-hnorm --mtp-max-t --mtp-q4 --mtp-window --native
+        --native-dense-gguf --native-head-gguf --pack --pcie-frac --pcie-mode
+        --peer-adapt-swaps --peer-device --peer-prefill-rows --peer-reserve-mib --peer-slots
+        --pipeline-windows --ple-delay-us --ple-gguf --ple-inflight --ple-io --ple-row-cache
+        --pool-affinity --pool-tasks --pool-workers --prefill --prefill-until --prompt-cache
+        --prompt-cache-every --prompt-cache-root --resident-budget-gib --rope-freq-base
+        --rope-freq-scale --rope-scale --rope-scaling --seed --session-min-free-mib
+        --shared-expert-arena --short-read --slots --spec --spec-corrupt --spec-follow
+        --spec-min-p --spec-oracle --split-device --suffix-draft --tail-role-token
+        --temperature --tokens --tokens-file --top-k --top-p --turn-token
+        --vram-reserve-later-mib --vram-reserve-mib --vram-segment-mib --window-hashes
+        --yarn-attn-factor --yarn-beta-fast --yarn-beta-slow --yarn-ext-factor --yarn-orig-ctx
+    """.split())
+    switches = set("""
+        --batch-mtp --check-logits --coupled-draft --cpu-oracle-q8-0 --expert-cache-cpu-order
+        --expert-cache-per-layer --gpu-only-full --gpu-stages --gr-fp32-activations
+        --gr-native-mmvf --graph-only --greedy --keep-canonical --kv-grow --mmap-experts
+        --native-bf16 --native-bf16-extra --native-flash-attn-short --native-gdn
+        --native-moe-combine --native-ple-key --native-ple-postops --native-qsa
+        --native-qsa-indexer --native-rope --native-router --no-capture --no-coupled-draft
+        --no-fast-attn --no-fast-select --no-fused-gdn --no-fused-gr --no-hit-poke
+        --no-host-worker --no-kv-grow --no-ple --no-ple-prefetch --no-pool
+        --no-prefill-borrow --no-publish-kernel --no-spec-split --no-split-rows
+        --no-token-graph --ple-sync-submit --prompt-cache-tail --remote-expert-opt
+        --resident-cpu-experts --resident-experts --serve --shared-late --spec-split
+        --split-skip-if-fits --stage-timing --stats --stop-eos --stream-token
+        --sync-every-layer --trim-stage-weights --vision --vram-elastic
+    """.split())
+    occurrences, complete, i = {}, True, 0
+    while i < len(args):
+        flag = args[i]
+        if not isinstance(flag, str) or flag not in value_flags | switches:
+            complete = False
+            break
+        size = 2 if flag == "--control-vector-layer-range" else 1 if flag in value_flags else 0
+        occurrences.setdefault(flag, []).append(args[i + 1] if size and i + size < len(args) else None)
+        if i + size >= len(args):
+            complete = False
+            break
+        i += 1 + size
+    requested_args = {}
+    for flag, choices in (("--max-context", ()), ("--resident-budget-gib", ()),
+                          ("--vram-reserve-mib", ()), ("--kv-resident", ()),
+                          ("--expert-cache", ("auto",)), ("--prefill", ("auto",)),
+                          ("--kv", ("fp16", "int8", "q4_0", "q4", "k8v4"))):
+        if flag in occurrences or (not complete and flag in args):
+            values = occurrences.get(flag, [])
+            value = values[0] if complete and len(values) == 1 else None
+            if value in choices or flag == "--kv":
+                requested_args[flag] = value if value in choices else None
+            else:
+                requested_args[flag] = control(value, integer_args.get(flag), positive=flag == "--resident-budget-gib")
+    if "--no-prefill-borrow" in occurrences or (not complete and "--no-prefill-borrow" in args):
+        requested_args["--no-prefill-borrow"] = True if complete else None
+    requested_env = {}
+    for key, choices in (("STRATA_RESIDENT_HEADROOM_GIB", ()), ("STRATA_FILE_CACHE_MIB", ()),
+                         ("STRATA_FILE_CACHE_COMPACT", ("0", "1")),
+                         ("STRATA_OWNED_PRICE", ("exact",)), ("CUDA_MODULE_LOADING", ("EAGER", "LAZY"))):
+        # Windows passes environment names without case; POSIX keeps distinct names distinct.
+        values = [v for k, v in env.items() if (k.upper() if os.name == "nt" else k) == key]
+        if values:
+            value = values[0] if len(values) == 1 else None
+            requested_env[key] = (value if value in choices else None) if choices else \
+                control(value, (2**64 - 1) >> 20 if key == "STRATA_FILE_CACHE_MIB" else None)
+    return {"cohort": "automatic" if automatic else "static", "sample_status": "available" if sample else "unavailable",
+            "sample": sample, "requested_controls": {"args": requested_args, "env": requested_env}}
+
+
 def _dir_writable(p: str) -> bool:
     try:
         with tempfile.TemporaryFile(dir=p):
@@ -2607,10 +2731,11 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, launch_memory: dict | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        self._launch_memory_json = json.dumps(launch_memory, allow_nan=False) if launch_memory is not None else None
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
@@ -3116,11 +3241,14 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        result = {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
+        if self._launch_memory_json is not None:
+            result["launch_memory"] = json.loads(self._launch_memory_json)
+        return result
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -5655,6 +5783,9 @@ def main() -> int:
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
+    ap.add_argument("--launch-memory-metrics", action="store_true",
+                    help="include the consumed launch memory plan and requested controls in /metrics "
+                         "(also \"launch_memory_metrics\": true in the config; no native allocation claim)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -5669,11 +5800,18 @@ def main() -> int:
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    diagnostic = cfg.get("launch_memory_metrics", False)
+    if type(diagnostic) is not bool:
+        ap.error('config "launch_memory_metrics" must be true or false')
+    diagnostic = a.launch_memory_metrics or diagnostic
+    launch_memory = None
+    automatic = False
     if a.engine == "strata" and cfg.get("memory_policy"):
         from tools.prepare_unsloth_q2 import prepare_launch
         gpu = (int(a.gpu) if a.gpu.strip().isdigit() else a.gpu) if a.gpu is not None else None
         try:
             cfg = prepare_launch(Path(a.config), gpu=gpu)
+            automatic = True
         except (OSError, ValueError) as e:
             ap.error(str(e))
     if a.gpu is not None:
@@ -5741,7 +5879,10 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+        args = engine_args(cfg) + (effort_end or [])
+        if diagnostic:
+            launch_memory = launch_memory_evidence(cfg, args, env, automatic=automatic)
+        engine = StrataEngine(exe, args, cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
@@ -5753,12 +5894,16 @@ def main() -> int:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+        if diagnostic:
+            launch_memory = {"cohort": "mock", "sample_status": "unavailable", "sample": None,
+                             "requested_controls": {"args": {}, "env": {}}}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
+                  launch_memory=launch_memory)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default

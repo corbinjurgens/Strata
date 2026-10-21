@@ -85,7 +85,7 @@ class Apply(unittest.TestCase):
 class Startup(unittest.TestCase):
     """Exercise public startup without opening a socket or launching an engine."""
 
-    def run_main(self, path, extra=(), before_engine=None):
+    def run_main(self, path, extra=(), before_engine=None, caller=None):
         engine = MockEngine(ByteTokenizer(), "ok", max_context=131072)
         engine.info, engine.spawn = {}, (None, [])
         with contextlib.ExitStack() as stack:
@@ -109,7 +109,7 @@ class Startup(unittest.TestCase):
                     before_engine()
                 return engine
             create = stack.enter_context(patch.object(server, "StrataEngine", side_effect=create_engine))
-            http = stack.enter_context(patch.object(server, "serve"))
+            http = stack.enter_context(patch.object(server, "serve", side_effect=caller))
             browser = stack.enter_context(patch("webbrowser.open"))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             self.assertEqual(server.main(), 0)
@@ -140,6 +140,9 @@ class Startup(unittest.TestCase):
                         patch.object(prep, "check_ready") as ready, \
                         patch.dict(os.environ, {"STRATA_API_KEY": "inherited", "STRATA_FETCH_PROFILE": "1"}, clear=True):
                     path, cfg = self.fixture(Path(directory), prep)
+                    if helper:
+                        cfg["launch_memory_metrics"] = True
+                        path.write_bytes(prep.json_bytes(cfg))
                     original = path.read_bytes()
                     sample.reset_mock()
                     gpu.reset_mock()
@@ -171,6 +174,13 @@ class Startup(unittest.TestCase):
                     if helper:
                         self.assertNotIn("STRATA_FETCH_PROFILE", env)
                     svc = http.call_args.args[0]
+                    if helper:
+                        evidence = svc.metrics()["launch_memory"]
+                        self.assertEqual((evidence["cohort"], evidence["sample_status"]), ("automatic", "available"))
+                        self.assertEqual(evidence["sample"]["ram_gib"], ram)
+                        self.assertEqual(evidence["sample"]["pinned_budget_gib"], float(budget))
+                    else:
+                        self.assertNotIn("launch_memory", svc.metrics())
                     self.assertEqual(svc.config_path, str(path))
                     self.assertEqual(svc.shared_path, str(path.with_suffix("")) + ".shared-settings.json")
                     self.assertEqual(svc.api_key, cfg["api_key"] if helper else "inherited")
@@ -181,6 +191,288 @@ class Startup(unittest.TestCase):
                     self.assertEqual((saved["host"], saved["port"], saved["api_key"]),
                                      ("0.0.0.0", 8182, cfg["api_key"]))
                     self.assertEqual(path.read_bytes(), original)
+
+    def test_launch_memory_metrics_reach_http_from_once_refreshed_consumed_plan(self):
+        from tools import prepare_unsloth_q2 as prep
+        actual_server, actual_serve = server.Server, server.serve
+        for option in ("cli", "config"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 30, "commit_available_gib": 60, "windows_commit": True}) as memory, \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}) as gpu, \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready") as ready, \
+                    patch.dict(os.environ, {"CUDA_MODULE_LOADING": "EAGER", "SECRET_SETTING": "private-value"}, clear=True):
+                path, cfg = self.fixture(Path(directory), prep)
+                if option == "config":
+                    cfg["launch_memory_metrics"] = True
+                prep.set_flag(cfg["args"], "--resident-budget-gib", "3.5")
+                cfg["env"].update(STRATA_RESIDENT_HEADROOM_GIB="6", STRATA_FILE_CACHE_MIB="768")
+                path.write_bytes(prep.json_bytes(cfg))
+                original = path.read_bytes()
+                memory.return_value["available_gib"] = 27
+                memory.reset_mock()
+                gpu.reset_mock()
+                runtime, received = {}, []
+
+                def planned(plan, consumed):
+                    runtime.update(cfg=consumed)
+                    plan["private"] = "private-value"
+                    plan["env"]["SECRET_SETTING"] = "private-value"
+
+                def engine_start():
+                    memory.assert_called_once()
+                    gpu.assert_called_once_with(0)
+                    ready.assert_called_once()
+                    runtime["cfg"]["memory_policy"]["sample"]["available_gib"] = 999
+                    runtime["cfg"]["env"]["STRATA_FILE_CACHE_MIB"] = "999"
+
+                def caller(svc, **kwargs):
+                    with patch.object(server, "Server", actual_server), patch.object(svc, "start_telemetry"):
+                        httpd = actual_serve(svc, port=0)
+                    try:
+                        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/metrics",
+                                                     headers={"Authorization": "Bearer " + cfg["api_key"]})
+                        with urllib.request.urlopen(req, timeout=10) as response:
+                            received.append(json.loads(response.read())["launch_memory"])
+                    finally:
+                        httpd.shutdown()
+                        httpd.server_close()
+                    return httpd
+
+                with patch.object(prep, "report_memory", side_effect=planned):
+                    create, http, _ = self.run_main(path, ["--launch-memory-metrics"] if option == "cli" else [],
+                                                  engine_start, caller)
+                evidence = received[0]
+                self.assertEqual(evidence["cohort"], "automatic")
+                self.assertEqual(evidence["sample_status"], "available")
+                self.assertEqual(evidence["sample"]["available_gib"], 27)
+                self.assertEqual(evidence["sample"]["headroom_requested_gib"], 6)
+                self.assertEqual(evidence["sample"]["pinned_budget_gib"], 3.5)
+                self.assertEqual(evidence["sample"]["recent_target_mib"], 768)
+                self.assertFalse(evidence["sample"]["automatic_host_cache"])
+                controls = evidence["requested_controls"]
+                self.assertEqual(controls["args"]["--max-context"], 131072)
+                self.assertEqual(controls["args"]["--resident-budget-gib"], 3.5)
+                self.assertEqual(controls["args"]["--kv"], "int8")
+                self.assertEqual(controls["env"]["STRATA_FILE_CACHE_MIB"], 768)
+                self.assertEqual(controls["env"]["CUDA_MODULE_LOADING"], "EAGER")
+                child = create.call_args.kwargs["env"]
+                self.assertEqual(child["STRATA_FILE_CACHE_MIB"], "768")
+                self.assertNotIn("launch_memory_metrics", child)
+                self.assertNotIn("--launch-memory-metrics", create.call_args.args[1])
+                encoded = json.dumps(evidence, allow_nan=False)
+                for private in ("private-value", cfg["api_key"], cfg["exe"], cfg["tokenizer"], str(path)):
+                    self.assertNotIn(private, encoded)
+                self.assertNotIn("args", evidence["sample"])
+                self.assertNotIn("env", evidence["sample"])
+                self.assertLess(len(encoded), 4096)
+                evidence["sample"]["available_gib"] = 123
+                self.assertEqual(http.call_args.args[0].metrics()["launch_memory"]["sample"]["available_gib"], 27)
+                memory.assert_called_once()
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_integer_launch_control_spellings_survive_public_startup_without_reinterpretation(self):
+        from tools import prepare_unsloth_q2 as prep
+        actual_server, actual_serve = server.Server, server.serve
+        cases = (("32768", 32768), ("32768e1", None), ("32768.0", None),
+                 ("9007199254740993", 9007199254740993), ("9007199254740993.0", None),
+                 ("9007199254740993e0", None), ("+32768", None), (" \t32768", None), ("32768private", None))
+        for automatic in (True, False):
+            for spelling, expected in cases:
+                with self.subTest(automatic=automatic, spelling=spelling), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                            "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}) as memory, \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}) as gpu, \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), patch.object(prep, "report_memory"), \
+                        patch.dict(os.environ, {}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    if not automatic:
+                        cfg.pop("memory_policy")
+                    prep.set_flag(cfg["args"], "--kv-resident", spelling)
+                    prep.set_flag(cfg["args"], "--resident-budget-gib", "3.5e0")
+                    cfg["env"].update(STRATA_RESIDENT_HEADROOM_GIB=" +3.5\t", STRATA_FILE_CACHE_MIB="1024")
+                    path.write_bytes(prep.json_bytes(cfg))
+                    original = path.read_bytes()
+                    memory.reset_mock()
+                    gpu.reset_mock()
+                    received = []
+
+                    def caller(svc, **kwargs):
+                        with patch.object(server, "Server", actual_server), patch.object(svc, "start_telemetry"):
+                            httpd = actual_serve(svc, port=0)
+                        try:
+                            request = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/metrics",
+                                                             headers={"Authorization": "Bearer " + cfg["api_key"]})
+                            with urllib.request.urlopen(request, timeout=10) as response:
+                                received.append(json.loads(response.read())["launch_memory"])
+                        finally:
+                            httpd.shutdown()
+                            httpd.server_close()
+                        return httpd
+
+                    create, _, _ = self.run_main(path, ["--launch-memory-metrics"], caller=caller)
+                    args, env = create.call_args.args[1], create.call_args.kwargs["env"]
+                    self.assertEqual(args[args.index("--kv-resident") + 1], spelling)
+                    self.assertEqual(args[args.index("--resident-budget-gib") + 1], "3.5e0")
+                    self.assertEqual(env["STRATA_RESIDENT_HEADROOM_GIB"], " +3.5\t")
+                    evidence = received[0]
+                    controls = evidence["requested_controls"]
+                    self.assertEqual(controls["args"]["--kv-resident"], expected)
+                    if expected is not None:
+                        self.assertIs(type(controls["args"]["--kv-resident"]), int)
+                    self.assertEqual(controls["args"]["--resident-budget-gib"], 3.5)
+                    self.assertEqual(controls["env"]["STRATA_RESIDENT_HEADROOM_GIB"], 3.5)
+                    self.assertEqual(controls["env"]["STRATA_FILE_CACHE_MIB"], 1024)
+                    self.assertEqual(evidence["cohort"], "automatic" if automatic else "static")
+                    self.assertEqual(evidence["sample_status"], "available" if automatic else "unavailable")
+                    self.assertEqual(memory.call_count, int(automatic))
+                    self.assertEqual(gpu.call_count, int(automatic))
+                    self.assertEqual(path.read_bytes(), original)
+                    encoded = json.dumps(evidence, allow_nan=False)
+                    self.assertNotIn("private", encoded)
+                    self.assertNotIn(cfg["api_key"], encoded)
+
+    def test_launch_memory_public_startup_distinguishes_options_from_pack_values(self):
+        from tools import prepare_unsloth_q2 as prep
+        for pack, standalone in (("normal-pack", False), ("--no-prefill-borrow", False), ("normal-pack", True)):
+            with self.subTest(pack=pack, standalone=standalone), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 32, "available_gib": 27,
+                        "commit_available_gib": 60, "windows_commit": True}), \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready"), patch.object(prep, "report_memory"), \
+                    patch.dict(os.environ, {}, clear=True):
+                path, cfg = self.fixture(Path(directory), prep)
+                cfg.pop("memory_policy")
+                cfg["args"] = ["--pack", pack, "--max-context", "131072"]
+                if standalone:
+                    cfg["args"].append("--no-prefill-borrow")
+                path.write_bytes(prep.json_bytes(cfg))
+                original = path.read_bytes()
+                create, http, _ = self.run_main(path, ["--launch-memory-metrics"])
+                self.assertEqual(create.call_args.args[1], cfg["args"])
+                controls = http.call_args.args[0].metrics()["launch_memory"]["requested_controls"]["args"]
+                self.assertEqual(controls.get("--no-prefill-borrow", False), standalone)
+                self.assertEqual(controls["--max-context"], 131072)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_launch_memory_default_metrics_and_consumed_controls_are_unchanged(self):
+        from tools import prepare_unsloth_q2 as prep
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                    "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}), \
+                patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                patch.object(prep, "check_ready"), patch.dict(os.environ, {}, clear=True):
+            path, cfg = self.fixture(Path(directory), prep)
+            original = path.read_bytes()
+            with patch.object(server.time, "time", return_value=123):
+                create, http, _ = self.run_main(path)
+            default = http.call_args.args[0]
+            self.assertNotIn("launch_memory", default.metrics())
+            self.assertEqual(path.read_bytes(), original)
+            with patch.object(server.time, "time", return_value=123):
+                expected = json.dumps(default.metrics(), sort_keys=True)
+            for extra, enabled in ((["--launch-memory-metrics"], True), ([], False)):
+                cfg["launch_memory_metrics"] = False
+                path.write_bytes(prep.json_bytes(cfg))
+                saved = path.read_bytes()
+                with patch.object(server.time, "time", return_value=123):
+                    other, http, _ = self.run_main(path, extra)
+                    metrics = http.call_args.args[0].metrics()
+                self.assertEqual(other.call_args, create.call_args)
+                self.assertEqual("launch_memory" in metrics, enabled)
+                metrics.pop("launch_memory", None)
+                self.assertEqual(json.dumps(metrics, sort_keys=True), expected)
+                self.assertEqual(path.read_bytes(), saved)
+            self.assertEqual(json.loads(original)["args"], cfg["args"])
+
+    def test_launch_memory_static_has_no_sample_and_does_not_prepare_or_resample(self):
+        from tools import prepare_unsloth_q2 as prep
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                    "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}) as memory, \
+                patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}) as gpu, \
+                patch.object(prep.setup, "find_nvcc", return_value=(None, None)), patch.dict(os.environ, {}, clear=True):
+            path, cfg = self.fixture(Path(directory), prep)
+            cfg.pop("memory_policy")
+            cfg["launch_memory_metrics"] = True
+            path.write_bytes(prep.json_bytes(cfg))
+            original = path.read_bytes()
+            memory.reset_mock()
+            gpu.reset_mock()
+            with patch.object(prep, "prepare_launch", side_effect=AssertionError("static refresh")):
+                create, http, _ = self.run_main(path)
+            evidence = http.call_args.args[0].metrics()["launch_memory"]
+            self.assertEqual((evidence["cohort"], evidence["sample_status"], evidence["sample"]),
+                             ("static", "unavailable", None))
+            self.assertEqual(evidence["requested_controls"]["args"]["--resident-budget-gib"], 12)
+            self.assertEqual(create.call_args.args[1][create.call_args.args[1].index("--resident-budget-gib") + 1], "12")
+            memory.assert_not_called()
+            gpu.assert_not_called()
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_invalid_launch_memory_optin_refuses_before_sampling_or_process_work(self):
+        from tools import prepare_unsloth_q2 as prep
+        for value in (None, 0, 1, "true", [], {}):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "profile.json"
+                path.write_text(json.dumps({"launch_memory_metrics": value, "memory_policy": {"version": 1}}))
+                original = path.read_bytes()
+                with patch.object(sys, "argv", ["server.py", "--engine", "strata", "--config", str(path),
+                                                 "--launch-memory-metrics"]), \
+                        patch.object(prep, "prepare_launch") as prepare, \
+                        patch.object(prep, "detected_memory") as memory, patch.object(prep, "detected_gpu") as gpu, \
+                        patch.object(server, "StrataEngine") as engine, patch.object(server, "Server") as listener, \
+                        patch.object(server, "hub_from_config") as hub, patch.object(server, "serve") as http, \
+                        patch.object(server.subprocess, "Popen") as process, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    server.main()
+                self.assertEqual(error.exception.code, 2)
+                for seam in (prepare, memory, gpu, engine, listener, hub, http, process):
+                    seam.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_launch_memory_mock_startup_never_claims_saved_automatic_sample(self):
+        from tools import prepare_unsloth_q2 as prep
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                    "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}), \
+                patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                patch.object(prep.setup, "find_nvcc", return_value=(None, None)), patch.dict(os.environ, {}, clear=True):
+            path, _ = self.fixture(Path(directory), prep)
+            original = path.read_bytes()
+            with patch.object(prep, "prepare_launch", side_effect=AssertionError("mock refresh")):
+                create, http, _ = self.run_main(path, ["--engine", "mock", "--launch-memory-metrics"])
+            create.assert_not_called()
+            self.assertEqual(http.call_args.args[0].metrics()["launch_memory"], {
+                "cohort": "mock", "sample_status": "unavailable", "sample": None,
+                "requested_controls": {"args": {}, "env": {}}})
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_malformed_consumed_launch_sample_is_explicitly_unavailable(self):
+        from tools import prepare_unsloth_q2 as prep
+        for malformed in (None, {}, "private-value", {"available_gib": 0}):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 30.88,
+                        "available_gib": 27, "commit_available_gib": 60, "windows_commit": True}) as memory, \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 16, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "check_ready"), patch.dict(os.environ, {}, clear=True):
+                path, _ = self.fixture(Path(directory), prep)
+                original = path.read_bytes()
+                memory.reset_mock()
+                def corrupt(plan, cfg):
+                    cfg["memory_policy"]["sample"] = malformed
+                with patch.object(prep, "report_memory", side_effect=corrupt):
+                    _, http, _ = self.run_main(path, ["--launch-memory-metrics"])
+                evidence = http.call_args.args[0].metrics()["launch_memory"]
+                self.assertEqual((evidence["cohort"], evidence["sample_status"], evidence["sample"]),
+                                 ("automatic", "unavailable", None))
+                memory.assert_called_once()
+                self.assertEqual(path.read_bytes(), original)
 
     def test_policy_headroom_removals_reach_public_engine_environment(self):
         from tools import prepare_unsloth_q2 as prep
@@ -208,12 +500,15 @@ class Startup(unittest.TestCase):
                         self.assertIsNone(refreshed["memory_policy"]["overrides"]["env"][key])
                         self.assertNotIn(key, refreshed["env"])
                     sample.reset_mock()
-                    create, _, _ = self.run_main(path)
+                    create, http, _ = self.run_main(path, ["--launch-memory-metrics"])
                     sample.assert_called_once()
                     self.assertEqual(admit.call_args.args[0]["headroom_gib"], 4)
                     self.assertTrue(admit.call_args.args[0]["automatic_host_cache"])
                     env = create.call_args.kwargs["env"]
                     self.assertNotIn(key, env)
+                    evidence = http.call_args.args[0].metrics()["launch_memory"]
+                    self.assertNotIn(key, evidence["requested_controls"]["env"])
+                    self.assertEqual(evidence["sample"]["headroom_requested_gib"], 4)
                     self.assertEqual(env["UNRELATED_CONTROL"], "keep")
                     self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0")
                     self.assertEqual(path.read_bytes(), original)
@@ -332,13 +627,17 @@ class Startup(unittest.TestCase):
                         self.assertIs(type(values[key]), type(raw))
                     self.assertEqual(cfg["env"][key.lower()], "saved-lower")
                     self.assertEqual(cfg["env"][key.title()], "saved-mixed")
-                create, _, _ = self.run_main(path)
+                create, http, _ = self.run_main(path, ["--launch-memory-metrics"])
                 runtime = report.call_args.args[1]
                 plan = runtime["memory_policy"]["sample"]
+                public = http.call_args.args[0].metrics()["launch_memory"]
+                self.assertEqual(public["sample_status"], "available")
                 if key == "STRATA_RESIDENT_HEADROOM_GIB":
                     self.assertEqual(plan["headroom_gib"], float(raw))
+                    self.assertEqual(public["requested_controls"]["env"][key], float(raw))
                 elif key == "STRATA_FILE_CACHE_MIB":
                     self.assertEqual(plan["recent_mib"], int(raw))
+                    self.assertEqual(public["requested_controls"]["env"][key], int(raw))
                 self.assertEqual(runtime["env"][key], raw)
                 self.assertIs(type(runtime["env"][key]), type(raw))
                 self.assertEqual(plan["env"][key], raw)
@@ -485,7 +784,7 @@ class Startup(unittest.TestCase):
                     original = prep.json_bytes(cfg)
                     path.write_bytes(original)
                     sample.reset_mock()
-                    create, _, _ = self.run_main(path)
+                    create, http, _ = self.run_main(path, ["--launch-memory-metrics"])
                     sample.assert_called_once()
                     runtime = report.call_args.args[1]
                     plan = runtime["memory_policy"]["sample"]
@@ -496,6 +795,9 @@ class Startup(unittest.TestCase):
                     child = create.call_args.kwargs["env"]
                     self.assertEqual(child[key], str(raw))
                     self.assertNotIn(spelling, child)
+                    public = http.call_args.args[0].metrics()["launch_memory"]
+                    self.assertEqual(public["requested_controls"]["env"][key], float(raw))
+                    self.assertNotIn(spelling, public["requested_controls"]["env"])
                     inherited = {key.lower(): "2", "Unknown_Case": "keep"}
                     effective = server.config_environment(runtime, inherited)
                     self.assertEqual(effective[key], child[key])
