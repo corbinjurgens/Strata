@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -382,7 +383,7 @@ class OwnedProcess:
 
 
 class MemoryGuard:
-    def __init__(self, owner, engine_log):
+    def __init__(self, owner, engine_log, *, acceptance_floors=None):
         self.owner, self.engine_log = owner, engine_log
         self.done = threading.Event()
         self.reason = None
@@ -391,7 +392,77 @@ class MemoryGuard:
         self.minimum = None
         self.max_pagefile = None
         self.pagefile_unavailable_reason = None
+        self.acceptance_floors = acceptance_floors
+        if acceptance_floors is not None:
+            if len(acceptance_floors) != 2:
+                raise ValueError("Acceptance requires physical and commit floors.")
+            for value in acceptance_floors:
+                if not valid_number(value) or value <= 0 or not valid_number(value * 1024**3):
+                    raise ValueError("Acceptance floors must be finite positive GiB values.")
+        self.host_samples = []
+        self.max_gap_seconds = 0
         self.thread = threading.Thread(target=self.monitor, daemon=True)
+
+    def acceptance_sample(self, snapshot, started, finished):
+        """Record unadjusted host availability; pagefile use is never commit availability."""
+        if self.reason is not None:
+            return
+        try:
+            if not all(valid_number(value) for value in (started, finished)) or finished < started:
+                raise ValueError("Invalid monotonic sample interval.")
+            values = [snapshot[key] for key in ("available_gib", "commit_available_gib")]
+            if not all(valid_number(value) and value >= 0 and valid_number(value * 1024**3)
+                       for value in values):
+                raise ValueError("Physical and available-commit telemetry are required.")
+            physical, commit = [value * 1024**3 for value in values]
+            if not all(value.is_integer() if isinstance(value, float) else True
+                       for value in (physical, commit)):
+                raise ValueError("Host telemetry must represent whole bytes.")
+            gap = finished - self.host_samples[-1]["finished_monotonic"] if self.host_samples else 0
+            if self.host_samples and (started < self.host_samples[-1]["finished_monotonic"] or gap <= 0):
+                raise ValueError("Host sample clock did not advance monotonically.")
+            if len(self.host_samples) >= 4096:
+                raise ValueError("Acceptance raw sample limit reached; evidence is incomplete.")
+            self.host_samples.append({"started_monotonic": started, "finished_monotonic": finished,
+                                      "physical_available_bytes": int(physical),
+                                      "commit_available_bytes": int(commit)})
+            self.samples += 1
+            self.max_gap_seconds = max(self.max_gap_seconds, gap, finished - started)
+            self.low_samples = self.low_samples + 1 if physical < 2.5 * 1024**3 or commit < 4 * 1024**3 else 0
+            if physical < 2 * 1024**3 or commit < 2 * 1024**3:
+                raise ValueError("Physical or available commit fell below the original 2 GiB emergency floor.")
+            if self.low_samples >= 5:
+                raise ValueError("Physical below 2.5 GiB or available commit below 4 GiB for five consecutive samples.")
+            if self.max_gap_seconds > 1:
+                raise ValueError("Host sampling gap or read duration exceeded one second.")
+        except (KeyError, TypeError, ValueError) as exc:
+            if self.reason is None:
+                self.reason = "Acceptance telemetry failed: " + str(exc)
+                if self.owner is not None:
+                    self.owner.stop()
+
+    def acceptance_summary(self, start=None, end=None):
+        rows = list(self.host_samples)
+        errors = [self.reason] if self.reason else []
+        if (not all(valid_number(value) for value in (start, end)) or end <= start
+                or len(rows) < 2 or rows[0]["finished_monotonic"] > start
+                or rows[-1]["started_monotonic"] < end):
+            errors.append("Required monotonic coverage edges are missing or insufficient.")
+        minima = {}
+        for name, floor in zip(("physical", "commit"), self.acceptance_floors):
+            row = min(rows, key=lambda item: item[name + "_available_bytes"]) if rows else None
+            minima[name] = ({"available_bytes": row[name + "_available_bytes"],
+                             "started_monotonic": row["started_monotonic"],
+                             "finished_monotonic": row["finished_monotonic"]} if row else None)
+            if row is None or row[name + "_available_bytes"] < floor * 1024**3:
+                errors.append(name + " configured headroom evidence failed.")
+        return {"host_evidence": "refused" if errors else "satisfied",
+                "errors": errors, "floors_gib": dict(zip(("physical", "commit"), self.acceptance_floors)),
+                "raw_samples": rows, "minima": minima, "max_gap_seconds": self.max_gap_seconds,
+                "coverage_start_monotonic": start, "coverage_end_monotonic": end,
+                "sample_limit": 4096, "cuda_stage_evidence": "missing; later-stage hold",
+                "cuda_floor_mib": 256, "cuda_coverage": "stage evidence required; not collected",
+                "lifecycle_acceptance": "pending", "cleanup": "pending", "finalization": "pending"}
 
     def sample(self, available, pagefile):
         self.samples += 1
@@ -408,6 +479,17 @@ class MemoryGuard:
         try:
             while not self.done.is_set():
                 self.owner.discover()
+                if self.acceptance_floors is not None:
+                    from tools.prepare_unsloth_q2 import memory_snapshot
+                    started = time.monotonic()
+                    snapshot = memory_snapshot()
+                    self.acceptance_sample(snapshot, started, time.monotonic())
+                    if self.reason:
+                        return
+                    if self.engine_log.exists() and self.engine_log.stat().st_size > 2 * LOG_LIMIT:
+                        raise RuntimeError("Engine log exceeded the diagnostic size limit.")
+                    self.done.wait(0.25)
+                    continue
                 available = psutil.virtual_memory().available  # Required for the cancellation guard.
                 pagefile = None
                 if self.pagefile_unavailable_reason is None:
@@ -434,6 +516,8 @@ class MemoryGuard:
             raise RuntimeError(self.reason)
 
     def summary(self):
+        if self.acceptance_floors is not None:
+            return self.acceptance_summary()
         return {"samples": self.samples, "min_available_gib": self.minimum / 1024**3
                 if self.minimum is not None else None, "max_pagefile_used_gib": self.max_pagefile / 1024**3
                 if self.max_pagefile is not None else None,
@@ -441,6 +525,13 @@ class MemoryGuard:
                 "pagefile_unavailable_reason": self.pagefile_unavailable_reason or
                 ("No pagefile sample was collected." if self.max_pagefile is None else None),
                 "stop_reason": self.reason}
+
+
+def valid_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 class BoundedCapture:
@@ -559,6 +650,13 @@ def run(args):
     long_context = getattr(args, "long_context", False)
     validation_only = getattr(args, "validation_only", False)
     fetch_timing = getattr(args, "fetch_timing", False)
+    acceptance = getattr(args, "acceptance_telemetry", False)
+    floors = (getattr(args, "acceptance_physical_gib", None),
+              getattr(args, "acceptance_commit_gib", None))
+    if not acceptance and any(value is not None for value in floors):
+        raise ValueError("Acceptance floors require --acceptance-telemetry.")
+    acceptance_guard = (MemoryGuard(None, None, acceptance_floors=tuple(
+        4 if value is None else value for value in floors)) if acceptance else None)
     if validation_only and not (held_out or transfer_workload or long_context or args.smoke
                                or getattr(args, "smoke_only", False)):
         raise ValueError("validation_only requires held_out, transfer_workload, long_context or smoke.")
@@ -573,6 +671,19 @@ def run(args):
     if held_out or transfer_workload or long_context:
         if cfg.get("fit_max_tokens") is not True or cfg.get("open_browser") is not False:
             raise ValueError("Acceptance requires fit_max_tokens=true and open_browser=false in the source config.")
+    if acceptance_guard is not None:
+        # This is the actual future run's guard and environment composition, not a launch clearance.
+        prepared, environment = clean_environment(cfg, args.timing, fetch_timing)
+        record = {"status": "held", "acceptance_telemetry": True,
+                  "effective_environment": safe_engine_environment(prepared, environment),
+                  "memory": acceptance_guard.summary(),
+                  "pending_stages": {"B": "Whole-owner deadline, output, external exit and native cleanup.",
+                                     "C": "Workload, protection, provenance and cohort binding."}}
+        args.output.mkdir(parents=True, exist_ok=False)
+        pending = args.output / "results.json.tmp"
+        pending.write_text(json.dumps(redact(record, secret), indent=2) + "\n", encoding="utf-8")
+        replace_result(pending, args.output / "results.json")
+        raise RuntimeError("Acceptance telemetry preparation held: Stage B/C and CUDA stage evidence are missing.")
     assert_idle()
     exe = Path(cfg["exe"])
     if not exe.is_absolute():
@@ -758,6 +869,12 @@ def main(argv=None):
                         help="Run warmup and selected acceptance checks without the six throughput cases")
     parser.add_argument("--idle-seconds", type=float, default=0,
                         help="Idle 0-600 seconds between timed rounds while keeping the memory guard active")
+    parser.add_argument("--acceptance-telemetry", action="store_true",
+                        help="Prepare opt-in host acceptance telemetry; runtime remains held for Stage B/C")
+    parser.add_argument("--acceptance-physical-gib", type=float,
+                        help="Opt-in physical headroom floor in GiB (default 4)")
+    parser.add_argument("--acceptance-commit-gib", type=float,
+                        help="Opt-in available-commit headroom floor in GiB (default 4)")
     args = parser.parse_args(argv)
     try:
         run(args)

@@ -376,6 +376,149 @@ class HelperTests(unittest.TestCase):
         factory.return_value.open.assert_called_once_with("fake-request", timeout=1800)
 
 
+class AcceptanceTelemetryTests(unittest.TestCase):
+    def guard(self, floors=(4, 4)):
+        return bench.MemoryGuard(Mock(), Path("unused"), acceptance_floors=floors)
+
+    def sample(self, guard, physical=4, commit=4, start=1, end=None):
+        guard.acceptance_sample({"available_gib": physical, "commit_available_gib": commit},
+                                start, start if end is None else end)
+
+    def test_exact_floors_raw_bytes_independent_minimum_timestamps_and_pending_lifecycle(self):
+        guard = self.guard()
+        self.sample(guard, 4, 7, 1)
+        self.sample(guard, 6, 4, 2)
+        result = guard.acceptance_summary(1, 2)
+        self.assertEqual(result["host_evidence"], "satisfied")
+        self.assertEqual(result["minima"]["physical"], {
+            "available_bytes": 4 * 1024**3, "started_monotonic": 1, "finished_monotonic": 1})
+        self.assertEqual(result["minima"]["commit"]["finished_monotonic"], 2)
+        self.assertEqual(result["max_gap_seconds"], 1)
+        self.assertEqual(result["raw_samples"][1]["commit_available_bytes"], 4 * 1024**3)
+        self.assertEqual(result["lifecycle_acceptance"], "pending")
+        self.assertEqual(result["cleanup"], "pending")
+        self.assertEqual(result["finalization"], "pending")
+        self.assertIn("missing", result["cuda_stage_evidence"])
+        self.assertEqual(result["cuda_floor_mib"], 256)
+        guard.owner.stop.assert_not_called()
+
+    def test_configured_floors_are_separate_from_emergency(self):
+        for physical, commit in ((4 - 1 / 1024**3, 8), (8, 4 - 1 / 1024**3)):
+            with self.subTest(physical=physical, commit=commit):
+                guard = self.guard()
+                self.sample(guard, physical, commit, 1)
+                self.sample(guard, physical, commit, 2)
+                self.assertEqual(guard.acceptance_summary(1, 2)["host_evidence"], "refused")
+                guard.check()  # Acceptance refusal is distinct from the original emergency cancellation.
+                guard.owner.stop.assert_not_called()
+
+    def test_each_immediate_emergency_dimension_and_exact_boundary(self):
+        for physical, commit in ((2 - 1 / 1024**3, 9), (9, 2 - 1 / 1024**3)):
+            guard = self.guard()
+            self.sample(guard, physical, commit)
+            guard.owner.stop.assert_called_once_with()
+            with self.assertRaisesRegex(RuntimeError, "2 GiB emergency"):
+                guard.check()
+        guard = self.guard()
+        self.sample(guard, 2, 2)
+        guard.owner.stop.assert_not_called()
+
+    def test_original_five_sample_rule_and_reset(self):
+        for physical, commit in ((2.5 - 1 / 1024**3, 9), (9, 4 - 1 / 1024**3)):
+            guard = self.guard()
+            for index in range(4):
+                self.sample(guard, physical, commit, index)
+            self.sample(guard, 2.5, 4, 4)  # Exact boundaries reset both dimensions.
+            for index in range(5, 9):
+                self.sample(guard, physical, commit, index)
+            guard.owner.stop.assert_not_called()
+            self.sample(guard, physical, commit, 9)
+            guard.owner.stop.assert_called_once_with()
+            with self.assertRaisesRegex(RuntimeError, "five consecutive"):
+                guard.check()
+
+    def test_missing_invalid_nonfinite_and_bool_telemetry_fail_closed(self):
+        cases = ({}, {"available_gib": 8}, {"available_gib": None, "commit_available_gib": 8})
+        cases += tuple({"available_gib": value, "commit_available_gib": 8}
+                       for value in (True, "8", -1, float("nan"), float("inf"), 0.1 / 1024**3))
+        cases += tuple({"available_gib": 8, "commit_available_gib": value}
+                       for value in (None, False, float("nan"), float("inf")))
+        for snapshot in cases:
+            with self.subTest(snapshot=snapshot):
+                guard = self.guard()
+                guard.acceptance_sample(snapshot, 1, 1)
+                guard.owner.stop.assert_called_once_with()
+                self.assertEqual(guard.acceptance_summary(1, 2)["host_evidence"], "refused")
+                self.assertEqual(guard.host_samples, [])
+
+    def test_clock_gap_read_duration_and_coverage_edges_refuse(self):
+        for start, end in ((float("nan"), 1), (1, float("inf")), (True, 1), (2, 1)):
+            guard = self.guard()
+            self.sample(guard, start=start, end=end)
+            guard.owner.stop.assert_called_once_with()
+        for start, end in ((2.0001, 2.0001), (0.9, 1.1), (1, 1), (1, 2.0001)):
+            guard = self.guard()
+            self.sample(guard)
+            self.sample(guard, start=start, end=end)
+            self.assertEqual(guard.acceptance_summary(1, 2)["host_evidence"], "refused")
+            guard.owner.stop.assert_called_once_with()
+        guard = self.guard()
+        self.sample(guard, start=1, end=1.1)
+        self.sample(guard, start=2, end=2.1)
+        for start, end in ((None, None), (1, 2), (1.1, 2.1), (2, 1), (True, 2), (1, float("nan"))):
+            self.assertEqual(guard.acceptance_summary(start, end)["host_evidence"], "refused")
+        self.assertEqual(guard.acceptance_summary(1.1, 2)["host_evidence"], "satisfied")
+
+    def test_missing_samples_and_bounded_storage_refuse(self):
+        guard = self.guard()
+        self.assertEqual(guard.summary()["host_evidence"], "refused")
+        self.sample(guard)
+        self.assertEqual(guard.acceptance_summary(1, 2)["host_evidence"], "refused")
+        guard.host_samples *= 4096
+        self.sample(guard, start=2)
+        self.assertEqual(len(guard.host_samples), 4096)
+        guard.owner.stop.assert_called_once_with()
+
+    def test_actual_monitor_uses_repository_commit_snapshot_not_swap_usage(self):
+        from tools import prepare_unsloth_q2 as preparation
+        guard = self.guard()
+        guard.done = Mock()
+        guard.done.is_set.side_effect = [False, False, True]
+        with patch.object(preparation, "memory_snapshot", side_effect=[
+                {"available_gib": 4, "commit_available_gib": 5},
+                {"available_gib": 5, "commit_available_gib": 4}]) as snapshot, \
+                patch.object(bench.time, "monotonic", side_effect=[1, 1.1, 1.5, 1.6]), \
+                patch.object(bench.psutil, "swap_memory", side_effect=AssertionError("not commit")):
+            guard.monitor()
+        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(guard.acceptance_summary(1.1, 1.5)["host_evidence"], "satisfied")
+        guard.owner.stop.assert_not_called()
+        self.assertEqual(guard.done.wait.call_args.args, (0.25,))
+
+    def test_actual_monitor_read_failure_is_fatal_and_retains_prior_rows(self):
+        from tools import prepare_unsloth_q2 as preparation
+        guard = self.guard()
+        guard.done = Mock()
+        guard.done.is_set.side_effect = [False, False]
+        with patch.object(preparation, "memory_snapshot", side_effect=[
+                {"available_gib": 8, "commit_available_gib": 8}, OSError("unreadable")]), \
+                patch.object(bench.time, "monotonic", side_effect=[1, 1.1, 1.5]):
+            guard.monitor()
+        self.assertEqual(len(guard.host_samples), 1)
+        guard.owner.stop.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError, "monitor failed: OSError"):
+            guard.check()
+
+    def test_fatal_reason_and_raw_failure_are_sticky(self):
+        guard = self.guard()
+        self.sample(guard, 1, 8)
+        failed_rows, reason = list(guard.host_samples), guard.reason
+        self.sample(guard, 8, 8, 2)
+        self.assertEqual(guard.host_samples, failed_rows)
+        self.assertEqual(guard.reason, reason)
+        guard.owner.stop.assert_called_once_with()
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         scratch = bench.ROOT / "build-unsloth"
@@ -410,6 +553,51 @@ class RunTests(unittest.TestCase):
                 bench.run(self.args)
         popen.assert_not_called()
         self.assertEqual(sentinel.read_text(), "untouched")
+
+    def test_acceptance_public_preparation_uses_real_guard_and_environment_but_refuses_launch(self):
+        self.args.acceptance_telemetry = True
+        self.args.acceptance_physical_gib = 6
+        self.args.acceptance_commit_gib = 8
+        from tools import prepare_unsloth_q2 as preparation
+        with patch.dict(bench.os.environ, {}, clear=True), \
+                patch.object(bench.subprocess, "Popen") as popen, \
+                patch.object(bench, "assert_idle") as idle, \
+                patch.object(preparation, "memory_snapshot") as snapshot:
+            with self.assertRaisesRegex(RuntimeError, "Stage B/C"):
+                bench.run(self.args)
+        popen.assert_not_called()
+        idle.assert_not_called()
+        snapshot.assert_not_called()
+        saved = json.loads((self.output / "results.json").read_text())
+        self.assertEqual(saved["status"], "held")
+        self.assertEqual(saved["memory"]["floors_gib"], {"physical": 6, "commit": 8})
+        self.assertEqual(saved["memory"]["host_evidence"], "refused")
+        self.assertEqual(saved["memory"]["raw_samples"], [])
+        self.assertEqual(saved["memory"]["cleanup"], "pending")
+        self.assertEqual(saved["memory"]["finalization"], "pending")
+        self.assertEqual(saved["effective_environment"], {"STRATA_FILE_CACHE_MIB": "4096"})
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertNotIn(self.secret, (self.output / "results.json").read_text())
+
+    def test_invalid_acceptance_floors_refuse_before_config_or_resources(self):
+        for value in (True, 0, -1, "4", float("nan"), float("inf")):
+            with self.subTest(value=value):
+                self.args.acceptance_telemetry = True
+                self.args.acceptance_physical_gib = value
+                self.args.config = self.root / "missing.json"
+                with patch.object(bench.subprocess, "Popen") as popen, \
+                        patch.object(bench, "assert_idle") as idle:
+                    with self.assertRaises(ValueError):
+                        bench.run(self.args)
+                popen.assert_not_called()
+                idle.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_acceptance_floor_flags_require_opt_in(self):
+        self.args.acceptance_commit_gib = 4
+        with self.assertRaisesRegex(ValueError, "require --acceptance-telemetry"):
+            bench.run(self.args)
+        self.assertFalse(self.output.exists())
 
     def test_startup_refusal_creates_no_output_and_launches_nothing(self):
         with patch.object(bench, "assert_idle", side_effect=RuntimeError("A Strata engine is already running")), \
