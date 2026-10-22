@@ -392,15 +392,32 @@ def normal_comparison_environment(cfg, inherited, *, server_log=False):
             "controls": controls, "environment_sha256": json_digest(sorted(pairs)), "exclusions": exclusions}
 
 
+def normal_comparison_launch_environment(cfg, inherited, *, server_log=False):
+    """Retain source classification without claiming a final automatic environment binding."""
+    evidence = normal_comparison_environment(cfg, inherited, server_log=server_log)
+    return normal_comparison_binding(cfg, evidence)
+
+
+def normal_comparison_binding(cfg, evidence):
+    """Apply launch binding after callers have used the source classification."""
+    # The server refreshes policy-owned values after this classification. Its
+    # numeric launch metrics cannot recover the exact final name/value bytes.
+    if cfg.get("memory_policy"):
+        evidence.update(complete=False, eligible=False, environment_sha256=None)
+        evidence["exclusions"].append({"reason": "automatic-environment-unbound"})
+    return evidence
+
+
 def consume_normal_comparison(record, cfg, inherited, *, server_log=False):
     """Recompute from independently supplied inputs; old/partial/mutated records fail closed.
 
-    This consumes environment classification only. Workload and lifecycle outcomes
-    retain their own predicates, including for useful diagnostic/UNKNOWN records.
+    Automatic launches remain unbound even when all prelaunch controls are reviewed.
+    Workload and lifecycle outcomes retain their own predicates, including for useful
+    diagnostic/UNKNOWN records.
     """
     if type(record) is not dict:
         return normal_comparison_excluded("missing-or-inconsistent-classification")
-    expected = normal_comparison_environment(cfg, inherited, server_log=server_log)
+    expected = normal_comparison_launch_environment(cfg, inherited, server_log=server_log)
     observed = record.get("normal_comparison")
     def same(actual, wanted):
         # Traverse only the bounded expected shape, never serialize untrusted data.
@@ -2039,10 +2056,12 @@ def _run_workload(args):
         engine_log = temp / "engine.log"
         cfg, environment = (clean_environment(cfg, args.timing, fetch_timing, acceptance=True)
                             if selection else clean_environment(cfg, args.timing, fetch_timing))
-        record["normal_comparison"] = normal_comparison_environment(cfg, environment,
-                                                                   server_log=worker_deadline is None)
-        record["timing_diagnostic"] = record["timing_diagnostic"] or any(
-            item.get("active") is True for item in record["normal_comparison"]["controls"])
+        classification = normal_comparison_environment(cfg, environment, server_log=worker_deadline is None)
+        # A refused source inventory cannot establish that instrumentation is absent.
+        # Final automatic binding alone does not change diagnostic classification.
+        record["timing_diagnostic"] = (record["timing_diagnostic"] or not classification["complete"] or any(
+            item.get("active") is True for item in classification["controls"]))
+        record["normal_comparison"] = normal_comparison_binding(cfg, classification)
         cfg.update(host="127.0.0.1", port=PORT, log=None if worker_deadline is not None else str(engine_log))
         record["effective_settings"] = {key: cfg.get(key) for key in (
             "model_name", "args", "fit_max_tokens", "open_browser",

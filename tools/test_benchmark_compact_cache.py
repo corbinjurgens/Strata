@@ -1912,7 +1912,7 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.args.cohort = "saved-static" if selection == "short" else "automatic"
         if selection == "near-full":
             cfg = json.loads(self.config.read_text())
-            cfg["memory_policy"] = {"version": 1}
+            cfg.setdefault("memory_policy", {"version": 1})
             self.config.write_text(json.dumps(cfg))
         adapter = types.SimpleNamespace(args=self.args, count=StageCSourceTests.count, calls=[], change=None,
             metric_change=None, reference_text="synthetic reference with planted codes")
@@ -2827,16 +2827,260 @@ class StageCRepairTests(unittest.TestCase):
 
 
 class NormalComparisonTests(unittest.TestCase):
-    def source(self):
+    def source(self, *, automatic=False):
         case = StageCSourceTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
+        if not automatic:
+            # Control-classification tests use a launch whose controls cannot refresh.
+            case.cfg.pop("memory_policy")
+            case.args.cohort = "saved-static"
+            case.args.acceptance_workload = "short"
+            case.config.write_text(json.dumps(case.cfg))
         return case
 
     @staticmethod
     def effective(case):
         from serve.server import config_environment
         return config_environment(case.clones[0], case.server_environments[0])
+
+    def test_public_active_profile_with_invalid_name_retains_diagnostic_label_on_failure(self):
+        for cohort in ("automatic", "saved-static", "frozen-control"):
+            for failed in (False, True):
+                with self.subTest(cohort=cohort, failed=failed):
+                    case = self.source(automatic=cohort == "automatic")
+                    case.args.cohort = cohort
+                    case.cfg["env"] = {"STRATA_VERIFY_PROFILE": "0", "STRATA_BAD-NAME": "0"}
+                    case.config.write_text(json.dumps(case.cfg))
+                    if failed:
+                        target = "near-full-sustained" if cohort == "automatic" else "sustained-1"
+                        case.change = lambda label, response: response["usage"].update(
+                            completion_tokens=511) if label == target else None
+                    with patch.dict(bench.os.environ, {}, clear=True):
+                        if failed:
+                            with self.assertRaisesRegex(RuntimeError, "Acceptance workload check"):
+                                case.invoke()
+                            result = case.saved()
+                        else:
+                            result = case.invoke()
+                    self.assertEqual(bench.active_diagnostics(self.effective(case)), ["STRATA_VERIFY_PROFILE"])
+                    self.assertTrue(result["timing_diagnostic"])
+                    self.assertEqual(result["acceptance_workload_passed"], not failed)
+                    self.assertEqual(result["status"], "provisional_failed" if failed else "complete")
+                    self.assertEqual(result["normal_comparison"]["controls"], [])
+                    self.assertFalse(result["normal_comparison"]["complete"])
+                    self.assertFalse(result["normal_comparison"]["eligible"])
+                    self.assertIsNone(result["normal_comparison"]["environment_sha256"])
+                    self.assertEqual(bench.consume_normal_comparison(
+                        result, case.clones[0], case.server_environments[0]), result["normal_comparison"])
+
+    def test_public_early_inventory_refusal_is_diagnostically_uncertain_without_unbounded_parsing(self):
+        specimens = [
+            ({"STRATA_IO_STATS": "9" * 4097}, {}, "control-inventory-limit"),
+            ({"STRATA_PRIVATE_" + str(i): "0" for i in range(129)}, {}, "control-inventory-limit"),
+            ({"STRATA_PRIVATE_" + str(i): "x" * 4096 for i in range(17)}, {}, "control-inventory-limit"),
+            ({}, {"OTHER_" + str(i): "0" for i in range(4097)}, "environment-limit"),
+            ({"STRATA_BAD-NAME": "PRIVATE-VALUE-SENTINEL"}, {}, "invalid-environment"),
+            ({"strata_file_copy_ready": "1", "STRATA_FILE_COPY_READY": "0"}, {}, "ambiguous-windows-alias"),
+        ]
+        for automatic in (False, True):
+            for configured, inherited, reason in specimens:
+                with self.subTest(automatic=automatic, reason=reason):
+                    case = self.source(automatic=automatic)
+                    case.cfg["env"] = configured
+                    case.config.write_text(json.dumps(case.cfg))
+                    with patch.dict(bench.os.environ, inherited, clear=True), \
+                            patch.object(bench, "active_diagnostics", side_effect=AssertionError("unbounded diagnostic scan")):
+                        result = case.invoke()
+                    self.assertTrue(result["timing_diagnostic"])
+                    self.assertTrue(result["acceptance_workload_passed"])
+                    self.assertEqual(result["normal_comparison"]["exclusions"][0], {"reason": reason})
+                    self.assertFalse(result["normal_comparison"]["complete"])
+                    self.assertFalse(result["normal_comparison"]["eligible"])
+                    self.assertIsNone(result["normal_comparison"]["environment_sha256"])
+                    self.assertNotIn("PRIVATE", json.dumps(result["normal_comparison"]))
+
+    def test_public_complete_source_inventory_keeps_diagnostic_gates_separate_from_binding(self):
+        specimens = [({}, "cuda", False), ({"STRATA_PRIVATE_UNKNOWN": "0"}, "cuda", False),
+            ({"STRATA_VERIFY_PROFILE": ""}, "cuda", True), ({"STRATA_VERIFY_PROFILE": "0"}, "cuda", True),
+            ({"STRATA_FETCH_PROFILE": "0"}, "cuda", False), ({"STRATA_FETCH_PROFILE": "1"}, "cuda", True),
+            ({"CUDA_LAUNCH_BLOCKING": "1"}, "hip", False), ({"CUDA_LAUNCH_BLOCKING": "1"}, "cuda", True)]
+        for cohort in ("automatic", "saved-static", "frozen-control"):
+            for controls, backend, diagnostic in specimens:
+                with self.subTest(cohort=cohort, controls=controls, backend=backend):
+                    case = self.source(automatic=cohort == "automatic")
+                    case.args.cohort = cohort
+                    case.cfg.update(env=controls, backend=backend)
+                    case.config.write_text(json.dumps(case.cfg))
+                    with patch.dict(bench.os.environ, {}, clear=True):
+                        result = case.invoke()
+                    self.assertEqual(result["timing_diagnostic"], diagnostic)
+                    self.assertTrue(result["acceptance_workload_passed"])
+                    classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
+                    self.assertTrue(classified["complete"])
+                    self.assertEqual(result["normal_comparison"]["complete"], cohort != "automatic")
+
+    def test_automatic_refresh_public_worker_and_outer_consumer_have_no_final_digest(self):
+        from tools import prepare_unsloth_q2 as prep
+        case = ContainedLifecycleTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        plan = prep.memory_plan(64, 6, 131072, available_gib=56, commit_available_gib=60)
+        cfg = json.loads(case.config.read_text())
+        cfg.update(args=plan["args"], env=plan["env"], memory_policy={
+            "version": 1, "generated_args": plan["args"], "generated_env": plan["env"],
+            "overrides": {"args": {}, "env": {}}})
+        case.config.write_text(json.dumps(cfg))
+        observed = []
+        original_spawn = case.spawn
+
+        def spawn(argv, **kwargs):
+            if "--engine" in argv:
+                path = Path(argv[argv.index("--config") + 1])
+                template = json.loads(path.read_text())
+                before = bench.normal_comparison_environment(template, kwargs["env"])
+                # Execute the server's actual refresh/planner/admission owners;
+                # GPU/host discovery and model-file readiness are external fakes.
+                with patch.dict(bench.os.environ, kwargs["env"], clear=True), \
+                        patch.object(prep, "check_ready", return_value=None), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    refreshed = prep.prepare_launch(path)
+                after = bench.normal_comparison_environment(refreshed, kwargs["env"])
+                self.assertTrue(before["eligible"])
+                self.assertTrue(after["eligible"])
+                self.assertNotEqual(template["env"]["STRATA_FILE_CACHE_MIB"],
+                                    refreshed["env"]["STRATA_FILE_CACHE_MIB"])
+                self.assertNotEqual(before["environment_sha256"], after["environment_sha256"])
+                self.assertEqual(json.loads(path.read_text()), template)
+                observed.append((before, after))
+            return original_spawn(argv, **kwargs)
+
+        sample = {"ram_gib": 64, "available_gib": 40, "commit_available_gib": 50, "windows_commit": True}
+        with patch.dict(bench.os.environ, {}, clear=True), \
+                patch.object(bench.subprocess, "Popen", side_effect=spawn), \
+                patch.object(prep, "memory_snapshot", side_effect=lambda: dict(case.sample(), **sample)), \
+                patch.object(prep.setup, "gpu_info", return_value={"index": 0, "vram_gb": 6}):
+            result = case.invoke_selected(selection="near-full")
+        self.assertEqual(len(observed), 1)
+        worker = json.loads((case.output / "provisional.json").read_text())
+        for record in (worker, result):
+            evidence = record["normal_comparison"]
+            self.assertFalse(evidence["eligible"])
+            self.assertFalse(evidence["complete"])
+            self.assertIsNone(evidence["environment_sha256"])
+            self.assertEqual(evidence["controls"], observed[0][0]["controls"])
+            self.assertEqual(evidence["exclusions"], [{"reason": "automatic-environment-unbound"}])
+        self.assertEqual(worker["status"], "provisional_complete")
+        self.assertTrue(worker["acceptance_workload_passed"])
+        self.assertFalse(worker["timing_diagnostic"])
+        self.assertTrue(result["worker_complete"])
+        self.assertTrue(bench.acceptance_final_predicate(result))  # Existing CPU lifecycle predicate only.
+        self.assertEqual(json.loads((case.output / "lifecycle.json").read_text())["status"], "held")
+        case.doCleanups()
+        self.assertFalse(bench.acceptance_ready())
+
+    def test_automatic_unbound_retains_diagnostics_unknowns_and_failed_workload_evidence(self):
+        unknown = "STRATA_PRIVATE_UNKNOWN_SENTINEL"
+        for controls, reason, diagnostic in (({}, None, False),
+                ({unknown: ""}, "unclassified-control", False),
+                ({unknown: "0"}, "unclassified-control", False),
+                ({"STRATA_VERIFY_PROFILE": "0"}, "active-diagnostic", True)):
+            for failed in (False, True):
+                with self.subTest(controls=controls, failed=failed):
+                    case = self.source(automatic=True)
+                    case.cfg["env"] = controls
+                    case.config.write_text(json.dumps(case.cfg))
+                    if failed:
+                        case.change = lambda label, response: response["usage"].update(
+                            completion_tokens=511) if label == "near-full-sustained" else None
+                    with patch.dict(bench.os.environ, {}, clear=True):
+                        if failed:
+                            with self.assertRaisesRegex(RuntimeError, "Acceptance workload check"):
+                                case.invoke()
+                            result = case.saved()
+                        else:
+                            result = case.invoke()
+                    classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
+                    evidence = result["normal_comparison"]
+                    self.assertEqual(classified["eligible"], reason is None)
+                    self.assertTrue(classified["complete"])
+                    self.assertIsNotNone(classified["environment_sha256"])
+                    self.assertFalse(evidence["complete"])
+                    self.assertFalse(evidence["eligible"])
+                    self.assertIsNone(evidence["environment_sha256"])
+                    self.assertEqual(evidence["controls"], classified["controls"])
+                    self.assertEqual(evidence["exclusions"], classified["exclusions"] +
+                                     [{"reason": "automatic-environment-unbound"}])
+                    self.assertEqual(result["timing_diagnostic"], diagnostic)
+                    self.assertEqual(result["acceptance_workload_passed"], not failed)
+                    self.assertEqual(result["status"], "provisional_failed" if failed else "complete")
+                    self.assertEqual(len(result["requests"]), 3)
+                    self.assertNotIn(unknown, json.dumps(evidence))
+                    self.assertEqual(bench.consume_normal_comparison(
+                        result, case.clones[0], case.server_environments[0]), evidence)
+
+    def test_policy_removed_frozen_and_static_launches_keep_exact_classification(self):
+        from tools import prepare_unsloth_q2 as prep
+        plan = prep.memory_plan(64, 6, 131072, available_gib=56, commit_available_gib=60)
+        for cohort in ("saved-static", "frozen-control"):
+            with self.subTest(cohort=cohort):
+                case = self.source()
+                case.args.cohort = cohort
+                case.cfg.update(args=plan["args"], env=plan["env"])
+                case.config.write_text(json.dumps(case.cfg))
+                with patch.dict(bench.os.environ, {}, clear=True):
+                    result = case.invoke()
+                self.assertNotIn("memory_policy", case.clones[0])
+                classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
+                self.assertEqual(result["normal_comparison"], classified)
+                self.assertTrue(classified["complete"])
+                self.assertTrue(classified["eligible"])
+                pairs = sorted([name, value] for name, value in self.effective(case).items()
+                               if name.startswith("STRATA_") or name == "CUDA_MODULE_LOADING")
+                expected = hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest()
+                self.assertEqual(classified["environment_sha256"], expected)
+                self.assertEqual(bench.consume_normal_comparison(
+                    result, case.clones[0], case.server_environments[0]), classified)
+                self.assertTrue(result["acceptance_workload_passed"])
+
+    def test_automatic_consumer_refuses_legacy_forged_and_typed_binding_claims(self):
+        cfg = {"memory_policy": {"version": 1}, "env": {"STRATA_FILE_CACHE_MIB": "4096"}}
+        classified = bench.normal_comparison_environment(cfg, {})
+        self.assertTrue(classified["eligible"])  # The pure classifier retains its original scope.
+        unbound = dict(classified, complete=False, eligible=False, environment_sha256=None,
+                       exclusions=[{"reason": "automatic-environment-unbound"}])
+        self.assertEqual(bench.consume_normal_comparison({"normal_comparison": unbound}, cfg, {}), unbound)
+        for evidence in (None, classified, dict(unbound, eligible=True), dict(unbound, eligible=0),
+                         dict(unbound, complete=0), dict(unbound, controls=[]), dict(unbound, exclusions=[]),
+                         dict(unbound, environment_sha256=classified["environment_sha256"]),
+                         dict(unbound, exclusions=[{"reason": "PRIVATE-FORGED-SENTINEL"}])):
+            result = bench.consume_normal_comparison({"normal_comparison": evidence}, cfg, {})
+            self.assertFalse(result["eligible"])
+            self.assertFalse(result["complete"])
+            self.assertIsNone(result["environment_sha256"])
+            self.assertEqual(result["exclusions"], [{"reason": "missing-or-inconsistent-classification"}])
+            self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_legacy_automatic_public_flow_retains_results_without_a_final_binding(self):
+        case = RunTests()
+        case.setUp()
+        self.addCleanup(case.tearDown)
+        cfg = json.loads(case.config.read_text())
+        cfg["memory_policy"] = {"version": 1}
+        case.config.write_text(json.dumps(cfg))
+        case.original = case.config.read_bytes()
+        with patch.dict(bench.os.environ, {}, clear=True):
+            result = case.invoke()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(len(result["rows"]), 6)
+        self.assertEqual(len(result["requests"]), 7)
+        self.assertEqual(result["summary"]["completion_tokens"], 960)
+        self.assertFalse(result["timing_diagnostic"])
+        self.assertFalse(result["normal_comparison"]["complete"])
+        self.assertFalse(result["normal_comparison"]["eligible"])
+        self.assertIsNone(result["normal_comparison"]["environment_sha256"])
+        self.assertEqual(result["normal_comparison"]["exclusions"], [{"reason": "automatic-environment-unbound"}])
+        case.assert_safe_artifacts()
 
     def test_public_known_tuning_controls_are_preserved_and_explicitly_normal(self):
         controls = {"STRATA_FILE_CACHE_MIB": "4096", "STRATA_FILE_COPY_READY": "1",
@@ -2959,7 +3203,10 @@ class NormalComparisonTests(unittest.TestCase):
                         encoded = json.dumps(sorted([name, value] for name, value in expected.items()),
                                              separators=(",", ":")).encode()
                         self.assertEqual(evidence["environment_sha256"], hashlib.sha256(encoded).hexdigest())
-                        self.assertEqual(bench.consume_normal_comparison({"normal_comparison": evidence}, cfg, inherited), evidence)
+                        consumed = bench.consume_normal_comparison({"normal_comparison": evidence}, cfg, inherited)
+                        self.assertFalse(consumed["complete"])
+                        self.assertFalse(consumed["eligible"])
+                        self.assertIsNone(consumed["environment_sha256"])
                         self.assertNotIn("PRIVATE-REMOVED-TUNING-SENTINEL", json.dumps(evidence))
 
     def test_amd_setup_case_aliases_preserve_platform_and_conflict_rules(self):
@@ -3032,7 +3279,7 @@ class NormalComparisonTests(unittest.TestCase):
 
     def test_public_removals_classify_effective_state_without_stripping_unknown_nulls(self):
         for unknown in (False, True):
-            case = self.source()
+            case = self.source(automatic=True)
             key = "STRATA_RESIDENT_HEADROOM_GIB"
             secret = "REMOVED-PRIVATE-CONTROL-SENTINEL"
             case.cfg["memory_policy"] = {"version": 1, "generated_env": {key: "8"}, "overrides": {"env": {key: None}}}
@@ -3044,7 +3291,11 @@ class NormalComparisonTests(unittest.TestCase):
                 result = case.invoke()
             effective = self.effective(case)
             self.assertNotIn(key, effective)
-            self.assertEqual(result["normal_comparison"]["eligible"], not unknown)
+            classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
+            self.assertEqual(classified["eligible"], not unknown)
+            self.assertFalse(result["normal_comparison"]["eligible"])
+            self.assertFalse(result["normal_comparison"]["complete"])
+            self.assertIsNone(result["normal_comparison"]["environment_sha256"])
             if unknown:
                 self.assertEqual(effective["STRATA_NOT_A_MANAGED_REMOVAL"], "None")
             self.assertNotIn(secret, json.dumps(result))
