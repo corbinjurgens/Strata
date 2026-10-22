@@ -134,6 +134,9 @@ EVIDENCE_ENV = PROFILE_ENV | {
 # generate.cpp: host/cache budgets, KV growth, pin cap, pricing, pipeline gate/theta;
 # expert_source.cpp: file I/O/release/ready-copy, partial pin, batching/registration;
 # verify.cpp: device planning, quantization reuse and coherent/resident placement.
+# prefill/gemm.cu: HIP tuning-table path selects GEMM algorithms; table contents are unbound;
+# core/pinned.cu: NO_ARENA_THP presence skips the non-Windows arena's THP request;
+# program/generate.cpp: RESIDENT_PIN exact "0" selects pageable resident experts.
 # Review means tuning rather than diagnostic instrumentation, not runtime admission
 # or permission to pool different treatments. New names are unclassified by default.
 NORMAL_ENV = {
@@ -144,6 +147,7 @@ NORMAL_ENV = {
     "STRATA_FETCH_PVM", "STRATA_FILE_COPY_READY", "STRATA_PIPELINE_DEBUG", "STRATA_PIPELINE_THETA",
     "STRATA_VERIFY_DEVICE_PLAN", "STRATA_VERIFY_QDEDUP", "STRATA_VERIFY_COHERENT",
     "STRATA_VERIFY_ALL_RESIDENT", "CUDA_MODULE_LOADING",
+    "STRATA_HIPBLASLT_TUNING", "STRATA_NO_ARENA_THP", "STRATA_RESIDENT_PIN",
 }
 NORMAL_CONTROL_LIMIT = 128
 NORMAL_ENVIRONMENT_LIMIT = 64 * 1024

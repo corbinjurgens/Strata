@@ -2883,6 +2883,122 @@ class NormalComparisonTests(unittest.TestCase):
                     self.assertNotIn(secret, path.read_text())
                     self.assertNotIn(case.cfg["api_key"], path.read_text())
 
+    def test_amd_setup_controls_are_reviewed_treatments_and_bind_exact_values(self):
+        controls = {
+            "STRATA_HIPBLASLT_TUNING": ("", "0", "C:/PRIVATE-TUNING-PATH-SENTINEL/table.txt"),
+            "STRATA_NO_ARENA_THP": ("", "0", "1"),
+            "STRATA_RESIDENT_PIN": ("", "0", "1", "00"),
+        }
+        absent = bench.normal_comparison_environment({"backend": "hip", "env": {}}, {})
+        self.assertTrue(absent["eligible"])
+        self.assertEqual(absent["controls"], [])
+        for key, values in controls.items():
+            for value in values:
+                with self.subTest(control=key, value=value):
+                    cfg = {"backend": "hip", "env": {key: value}}
+                    evidence = bench.normal_comparison_environment(cfg, {})
+                    self.assertTrue(evidence["complete"])
+                    self.assertTrue(evidence["eligible"])
+                    self.assertEqual(evidence["exclusions"], [])
+                    self.assertEqual(evidence["controls"], [{"control": key, "kind": "reviewed-normal"}])
+                    encoded = json.dumps([[key, value]], separators=(",", ":")).encode()
+                    self.assertEqual(evidence["environment_sha256"], hashlib.sha256(encoded).hexdigest())
+                    self.assertEqual(bench.consume_normal_comparison({"normal_comparison": evidence}, cfg, {}), evidence)
+                    changed = {"backend": "hip", "env": {key: value + "-changed"}}
+                    rejected = bench.consume_normal_comparison({"normal_comparison": evidence}, changed, {})
+                    self.assertFalse(rejected["eligible"])
+                    self.assertFalse(rejected["complete"])
+                    self.assertNotIn("PRIVATE-TUNING-PATH-SENTINEL", json.dumps(evidence))
+
+    def test_public_combined_amd_setup_environment_preserves_layers_and_private_paths(self):
+        controls = {"STRATA_HIPBLASLT_TUNING": "C:/PRIVATE-TUNING-PATH-SENTINEL/table.txt",
+                    "STRATA_NO_ARENA_THP": "1", "STRATA_RESIDENT_PIN": "0"}
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                case = self.source()
+                case.cfg["backend"] = "hip"
+                if explicit:
+                    case.cfg["env"] = dict(controls)
+                case.config.write_text(json.dumps(case.cfg))
+                inherited = {key: "INHERITED-PRIVATE-PATH-SENTINEL" for key in controls} if explicit else controls
+                with patch.dict(bench.os.environ, inherited, clear=True):
+                    result = case.invoke()
+                effective = self.effective(case)
+                for key, value in controls.items():
+                    self.assertEqual(effective[key], value)
+                evidence = result["normal_comparison"]
+                self.assertEqual(result["status"], "complete")
+                self.assertTrue(result["acceptance_workload_passed"])
+                self.assertFalse(result["timing_diagnostic"])
+                self.assertTrue(evidence["complete"])
+                self.assertTrue(evidence["eligible"])
+                self.assertEqual(evidence["exclusions"], [])
+                selected = [item for item in evidence["controls"] if item["control"] in controls]
+                self.assertEqual(selected, [{"control": key, "kind": "reviewed-normal"} for key in sorted(controls)])
+                self.assertEqual(bench.consume_normal_comparison(result, case.clones[0], case.server_environments[0]), evidence)
+                for path in case.args.output.iterdir():
+                    text = path.read_text()
+                    for secret in ("PRIVATE-TUNING-PATH-SENTINEL", "INHERITED-PRIVATE-PATH-SENTINEL", case.cfg["api_key"]):
+                        self.assertNotIn(secret, text)
+
+    def test_amd_setup_removal_and_null_follow_actual_nonmanaged_composition(self):
+        from serve.server import config_environment
+        controls = {"STRATA_HIPBLASLT_TUNING": "PRIVATE-REMOVED-TUNING-SENTINEL",
+                    "STRATA_NO_ARENA_THP": "1", "STRATA_RESIDENT_PIN": "0"}
+        for key in controls:
+            for inherited in ({}, {key: controls[key]}):
+                for configured, expected in (({}, inherited), ({key: None}, {key: "None"}), ({key: ""}, {key: ""})):
+                    with self.subTest(control=key, inherited=bool(inherited), configured=configured):
+                        # Setup controls are not managed memory-policy removals: None is the literal "None".
+                        cfg = {"memory_policy": {"version": 1}, "env": configured}
+                        self.assertEqual(config_environment(cfg, inherited), expected)
+                        evidence = bench.normal_comparison_environment(cfg, inherited)
+                        self.assertTrue(evidence["eligible"])
+                        self.assertEqual(evidence["controls"], [{"control": name, "kind": "reviewed-normal"}
+                                                               for name in sorted(expected)])
+                        encoded = json.dumps(sorted([name, value] for name, value in expected.items()),
+                                             separators=(",", ":")).encode()
+                        self.assertEqual(evidence["environment_sha256"], hashlib.sha256(encoded).hexdigest())
+                        self.assertEqual(bench.consume_normal_comparison({"normal_comparison": evidence}, cfg, inherited), evidence)
+                        self.assertNotIn("PRIVATE-REMOVED-TUNING-SENTINEL", json.dumps(evidence))
+
+    def test_amd_setup_case_aliases_preserve_platform_and_conflict_rules(self):
+        from serve.server import config_environment
+        for key in ("STRATA_HIPBLASLT_TUNING", "STRATA_NO_ARENA_THP", "STRATA_RESIDENT_PIN"):
+            for platform in ("nt", "posix"):
+                with self.subTest(control=key, platform=platform), patch.object(bench.os, "name", platform):
+                    cfg = {"env": {key.lower(): "0"}}
+                    evidence = bench.normal_comparison_environment(cfg, {})
+                    self.assertTrue(evidence["eligible"])
+                    self.assertEqual(evidence["controls"], [{"control": key, "kind": "reviewed-normal"}]
+                                     if platform == "nt" else [])
+                    self.assertEqual(config_environment(cfg, {key: "1"}), {key: "1", key.lower(): "0"})
+                    conflict = bench.normal_comparison_environment(cfg, {key: "1"})
+                    self.assertEqual(conflict["eligible"], platform == "posix")
+                    self.assertEqual(conflict["complete"], platform == "posix")
+                    same = bench.normal_comparison_environment(cfg, {key: "0"})
+                    self.assertTrue(same["eligible"])
+                    self.assertEqual(same["controls"], [{"control": key, "kind": "reviewed-normal"}])
+                    self.assertEqual(bench.consume_normal_comparison({"normal_comparison": same}, cfg, {key: "0"}), same)
+
+    def test_amd_setup_controls_do_not_admit_unknown_or_diagnostic_treatments(self):
+        controls = {"STRATA_HIPBLASLT_TUNING": "C:/PRIVATE-TUNING-PATH-SENTINEL/table.txt",
+                    "STRATA_NO_ARENA_THP": "1", "STRATA_RESIDENT_PIN": "0"}
+        unknown = "STRATA_PRIVATE_UNKNOWN_NAME_SENTINEL"
+        for key, values, reason in ((unknown, ("", "0"), "unclassified-control"),
+                                    ("STRATA_VERIFY_PROFILE", ("", "0"), "active-diagnostic")):
+            for value in values:
+                cfg = {"backend": "hip", "env": dict(controls, **{key: value})}
+                evidence = bench.normal_comparison_environment(cfg, {})
+                identifier = "sha256:" + hashlib.sha256(unknown.encode()).hexdigest() if key == unknown else key
+                self.assertTrue(evidence["complete"])
+                self.assertFalse(evidence["eligible"])
+                self.assertEqual(evidence["exclusions"], [{"reason": reason, "control": identifier}])
+                self.assertEqual(bench.consume_normal_comparison({"normal_comparison": evidence}, cfg, {}), evidence)
+                serialized = json.dumps(evidence)
+                self.assertNotIn(unknown, serialized)
+                self.assertNotIn("PRIVATE-TUNING-PATH-SENTINEL", serialized)
+
     def test_r5_exact_public_specimens_follow_actual_cleaning_and_source_gates(self):
         controls = {"STRATA_PIPELINE_DEBUG": "1", "STRATA_PIPELINE_FORCE_MISS": "1", "STRATA_LAYER_SPLIT_GATE": "0"}
         for explicit in (False, True):
