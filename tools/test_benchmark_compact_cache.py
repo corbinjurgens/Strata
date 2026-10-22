@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -564,8 +565,7 @@ class AcceptanceTelemetryTests(unittest.TestCase):
 
 class RunTests(unittest.TestCase):
     def setUp(self):
-        scratch = bench.ROOT / "build-unsloth"
-        scratch.mkdir(exist_ok=True)
+        scratch = Path(tempfile.gettempdir())
         self.temporary = tempfile.TemporaryDirectory(prefix="p1-u2-fixture-", dir=scratch)
         self.root = Path(self.temporary.name).resolve()
         self.assertEqual(self.root.parent, scratch.resolve())
@@ -583,7 +583,7 @@ class RunTests(unittest.TestCase):
         self.args = argparse.Namespace(config=self.config, output=self.output, timing=False, smoke=False)
 
     def tearDown(self):
-        # The resolved unique fixture directory was checked against build-unsloth in setUp.
+        # The resolved unique fixture directory was checked against system temp in setUp.
         self.temporary.cleanup()
 
     def test_output_collision_refuses_before_reading_config_or_starting_process(self):
@@ -1873,6 +1873,1258 @@ class ContainedLifecycleTests(unittest.TestCase):
 
     def test_duration_and_edge_samples_fit_raw_sample_cap(self):
         self.assertLessEqual(bench.ACCEPTANCE_SECONDS / 0.25 + 8, 4096)
+
+    def test_selected_workload_cannot_qualify_a_complete_cpu_receipt_without_runtime_evidence(self):
+        self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        def workload(validation, client, record, save, guard):
+            record.update(acceptance_workload_passed=True, acceptance_cases=[{"passed": True}] * 11,
+                          final_idle={"completed": True, "started_monotonic": 10, "finished_monotonic": 40})
+            save()
+        with patch.object(bench, "acceptance_workload_tests", side_effect=workload), \
+                patch.object(bench, "check_authentication"):
+            error = self.refused("green")
+        result = error.record
+        self.assertEqual(result["worker_exit"], 0)
+        self.assertTrue(result["natural_exit"])
+        self.assertTrue(result["capture_complete"])
+        self.assertTrue(result["owned_cleanup"])
+        self.assertFalse(result["worker_complete"])
+        self.assertTrue(result["workload_evidence"]["acceptance_workload_passed"])
+        self.assertTrue(result["workload_evidence"]["missing_evidence"])
+        self.assertTrue(self.closed)
+
+    def test_selected_workload_controller_refuses_a_different_cohort_in_the_worker_receipt(self):
+        self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        def workload(validation, client, record, save, guard):
+            record.update(acceptance_workload_passed=True, acceptance_cases=[{"passed": True}] * 11,
+                          final_idle={"completed": True, "started_monotonic": 10, "finished_monotonic": 40},
+                          cohort="frozen-control", missing_evidence=[])
+            save()
+        with patch.object(bench, "acceptance_workload_tests", side_effect=workload), \
+                patch.object(bench, "check_authentication"):
+            error = self.refused("green")
+        self.assertFalse(error.record["worker_complete"])
+        self.assertEqual(error.record["workload_evidence"]["cohort"], "frozen-control")
+
+    def invoke_selected(self, mutate=None, selection="short", missing=False):
+        self.args.acceptance_workload = selection
+        self.args.expected_context = 131072
+        self.args.cohort = "saved-static" if selection == "short" else "automatic"
+        if selection == "near-full":
+            cfg = json.loads(self.config.read_text())
+            cfg["memory_policy"] = {"version": 1}
+            self.config.write_text(json.dumps(cfg))
+        adapter = types.SimpleNamespace(args=self.args, count=StageCSourceTests.count, calls=[], change=None,
+            metric_change=None, reference_text="synthetic reference with planted codes")
+        base_client = StageCSourceTests.client_type(adapter)
+        guards = []
+        real_guard, real_workload, real_idle, real_read = (bench.MemoryGuard, bench.acceptance_workload_tests,
+                                                         bench.acceptance_idle, Path.read_bytes)
+        def make_guard(*args, **kwargs):
+            guard = real_guard(*args, **kwargs)
+            guards.append(guard)
+            return guard
+        def advance(seconds):
+            while seconds > 0:
+                step = min(0.25, seconds)
+                self.now += step
+                seconds -= step
+                guards[0].monitor(once=True)  # Simulate the independent controller sampler during worker time.
+        class Client(base_client):
+            def chat(client, *args, **kwargs):
+                response = super().chat(*args, **kwargs)
+                advance(3.6)
+                return response
+        validation = types.SimpleNamespace(Client=Client,
+            long_messages=lambda cfg, target: StageCSourceTests.long_messages(adapter, cfg, target))
+        def idle(guard, record, save):
+            with patch.object(guard.done, "wait", side_effect=advance):
+                real_idle(guard, record, save)
+        def workload(*args):
+            real_workload(*args)
+            record, save = args[2:4]
+            if not missing:
+                record["missing_evidence"] = []  # Only this CPU fixture supplies the remaining producer seams.
+            save()
+        def read(path):
+            data = real_read(path)
+            if mutate and path == self.output / "provisional.json" and self.code == 0:
+                item = json.loads(data)
+                mutate(item)
+                return json.dumps(item).encode()
+            return data
+        with patch.object(bench, "MemoryGuard", side_effect=make_guard), \
+                patch.object(bench, "load_workload", return_value=validation), \
+                patch.object(bench, "prompt_counter", return_value=StageCSourceTests.count), \
+                patch.object(bench, "check_authentication"), \
+                patch.object(bench, "acceptance_workload_tests", side_effect=workload), \
+                patch.object(bench, "acceptance_idle", side_effect=idle), patch.object(Path, "read_bytes", read), \
+                patch.object(bench.time, "time", side_effect=lambda: 1800000000 + self.now):
+            return self.invoke()
+
+
+class StageCSourceTests(unittest.TestCase):
+    """Reach the existing worker body with CPU transports; native/admission stay held."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="stage-c-source-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.config, self.binary = self.root / "saved.json", self.root / "saved.exe"
+        self.binary.write_bytes(b"synthetic saved executable, never executed")
+        self.cfg = {"exe": str(self.binary), "api_key": "stage-c-private-test-key", "model_name": "synthetic",
+                    "fit_max_tokens": True, "open_browser": False, "args": ["--max-context", "131072"],
+                    "memory_policy": {"version": 1}, "env": {}}
+        self.config.write_text(json.dumps(self.cfg))
+        self.args = argparse.Namespace(config=self.config, output=self.root / "output", timing=False,
+            smoke=False, acceptance_telemetry=False, acceptance_workload="near-full", cohort="automatic",
+            expected_context=131072, _acceptance_deadline=bench.time.monotonic() + 120)
+        self.original = self.config.read_bytes()
+        self.change = None
+        self.metric_change = None
+        self.reference_text = "synthetic reference with planted codes"
+        self.calls, self.clones, self.processes = [], [], []
+        self.server_environments = []
+
+    @staticmethod
+    def count(messages):
+        system = messages[0].get("content", "")
+        if system.startswith("reference-"):
+            return int(system.split("-")[1]) + (80 if len(messages) > 2 else 0)
+        if system.startswith("Independent sustained"):
+            return 128100
+        return 60 + 40 * (len(messages) - 1)
+
+    def long_messages(self, cfg, target):
+        return ([{"role": "system", "content": "reference-" + str(target)},
+                 {"role": "user", "content": self.reference_text}],
+                ["field-cedar-284", "marble-finch-693", "cove-lantern-517"], target)
+
+    def client_type(self):
+        test = self
+        class Client:
+            def __init__(self, cfg):
+                self.cfg, self.history = cfg, []
+
+            def get(self, path):
+                if path == "/health":
+                    return {"loaded": True, "max_context": test.args.expected_context}
+                return {"engine": {"arena_mib": 4096, "expert_cache_mib": 1024},
+                        "totals": {"requests": len(self.history)}, "requests": self.history[:]}
+
+            def chat(self, messages, max_tokens=128, **kwargs):
+                test.calls.append((self.label, bench.copy.deepcopy(messages), max_tokens, kwargs))
+                count = test.count(messages)
+                cached = max(1, count - 80) if "cached" in self.label or "followup" in self.label else 0
+                if self.label in ("startup-exact", "short-exact"):
+                    text = "391"
+                elif self.label == "short-cached-followup":
+                    text = "400"
+                elif "followup" in self.label:
+                    text = "133"
+                elif self.label.endswith("-fresh"):
+                    text = "field-cedar-284 marble-finch-693 cove-lantern-517"
+                elif self.label.endswith("-cached"):
+                    text = "cove-lantern-517 391"
+                else:
+                    text = "A detailed synthetic tutorial."
+                generated = 512 if "sustained" in self.label and "followup" not in self.label else 20
+                response = {"choices": [{"message": {"role": "assistant", "content": text},
+                                          "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": count, "completion_tokens": generated},
+                            "timings": {"cache_n": cached, "prompt_n": count - cached,
+                                        "prompt_ms": 1200, "predicted_ms": 2400},
+                            "first_token_s": 0.25, "wall_seconds": 3.6}
+                if test.change:
+                    test.change(self.label, response)
+                self.history.append({"time": len(self.history) + 1, "prompt_tokens": response["usage"]["prompt_tokens"],
+                    "output_tokens": response["usage"]["completion_tokens"], "decode_ms": 2400,
+                    "prompt_ms": response["timings"]["prompt_ms"], "reused": response["timings"]["cache_n"],
+                    "prompt_total": count, "prompt_read": count - cached,
+                    "engine_generated": response["usage"]["completion_tokens"],
+                    "finish": response["choices"][0]["finish_reason"]})
+                if test.metric_change:
+                    test.metric_change(self.history[-1])
+                return response
+        return Client
+
+    def invoke(self):
+        validation = types.SimpleNamespace(Client=self.client_type(), long_messages=self.long_messages)
+        def spawn(argv, **kwargs):
+            self.assertIn("--config", argv, "Only the intercepted server boundary may be reached")
+            clone = json.loads(Path(argv[argv.index("--config") + 1]).read_text())
+            self.clones.append(clone)
+            self.server_environments.append(dict(kwargs["env"]))
+            if self.args.cohort == "automatic":
+                self.assertIn("memory_policy", clone, "Automatic policy must reach the real server consumer unchanged")
+            else:
+                self.assertNotIn("memory_policy", clone, "Static/frozen cohorts must not acquire automatic policy")
+            proc = types.SimpleNamespace(stdout=io.BytesIO(b"synthetic server output\n"), poll=lambda: None,
+                                         terminate=Mock(), wait=Mock(return_value=0))
+            self.processes.append(proc)
+            return proc
+        real_idle = bench.acceptance_idle
+        def bounded_idle(guard, record, save):
+            now = [bench.time.monotonic()]
+            def wait(seconds):
+                now[0] += seconds
+            with patch.object(bench.time, "monotonic", side_effect=lambda: now[0]), \
+                    patch.object(guard.done, "wait", side_effect=wait):
+                real_idle(guard, record, save)
+        from tools import prepare_unsloth_q2 as prep
+        with patch.object(bench, "SCRATCH", self.root), patch.object(bench, "assert_idle"), \
+                patch.object(bench, "source_identity", return_value={"head": "synthetic-current-head"}), \
+                patch.object(bench, "load_workload", return_value=validation), \
+                patch.object(bench, "prompt_counter", return_value=self.count), \
+                patch.object(bench, "check_authentication"), \
+                patch.object(bench, "acceptance_idle", side_effect=bounded_idle), \
+                patch.object(bench.subprocess, "Popen", side_effect=spawn), \
+                patch.object(bench.subprocess, "run", side_effect=AssertionError("external command forbidden")), \
+                patch.object(bench, "WindowsProcessAPI", side_effect=AssertionError("native forbidden")), \
+                patch.object(bench.psutil, "virtual_memory", side_effect=AssertionError("host read forbidden")), \
+                patch.object(bench.psutil, "swap_memory", side_effect=AssertionError("commit read forbidden")), \
+                patch.object(prep, "memory_snapshot", side_effect=AssertionError("resource sample forbidden")):
+            return bench.run(self.args)
+
+    def saved(self):
+        return json.loads((self.args.output / "provisional.json").read_text())
+
+    def test_public_near_full_body_records_separate_fresh_sustained_request_and_actual_history(self):
+        result = self.invoke()
+        self.assertTrue(result["acceptance_workload_passed"])
+        self.assertEqual([row[0] for row in self.calls], ["near-full-fresh", "near-full-cached", "near-full-sustained"])
+        self.assertEqual([row[2] for row in self.calls], [2048, 128, 2048])
+        self.assertEqual([row["local_prompt_tokens"] for row in result["acceptance_cases"]], [128000, 128080, 128100])
+        self.assertEqual(result["acceptance_cases"][2]["response"]["usage"]["completion_tokens"], 512)
+        first_answer = result["requests"][0]["response"]["choices"][0]["message"]
+        self.assertEqual(self.calls[1][1][2], first_answer)
+        self.assertEqual(self.calls[1][1][:2], self.calls[0][1])
+        self.assertNotEqual(self.calls[2][1][0], self.calls[0][1][0])
+        self.assertTrue(all(row[3]["stream"] for row in self.calls))
+        for row in result["requests"]:
+            self.assertEqual(row["first_content_seconds"], 0.25)
+            self.assertEqual(row["client_wall_seconds"], 3.6)
+            content = row["response"]["choices"][0]["message"]["content"]
+            self.assertEqual(row["output_sha256"], hashlib.sha256(content.encode()).hexdigest())
+            self.assertEqual(row["cached_tokens"], row["metric"]["reused"])
+        self.assertTrue(result["protection"]["unchanged"])
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertTrue(result["final_idle"]["completed"])
+        self.assertGreaterEqual(result["final_idle"]["finished_monotonic"] - result["final_idle"]["started_monotonic"], 30)
+        self.assertEqual(result["executable_provenance"]["saved"]["source_provenance"], "source-unproven")
+        self.assertEqual(result["rows"], [])
+        self.assertTrue(result["missing_evidence"])
+        self.assertFalse(bench.acceptance_ready())
+        self.assertEqual(self.saved()["status"], "provisional_complete")
+        self.processes[0].terminate.assert_called_once()
+        self.processes[0].wait.assert_called_once()
+
+    def test_original_eleven_request_short_sequence_is_distinct_from_near_full(self):
+        self.args.acceptance_workload = "short"
+        self.args.expected_context = 65536
+        self.cfg["args"] = ["--max-context", "65536"]
+        self.config.write_text(json.dumps(self.cfg))
+        self.original = self.config.read_bytes()
+        result = self.invoke()
+        self.assertEqual([row[0] for row in self.calls], ["startup-exact", "short-exact", "short-cached-followup",
+            "sustained-1", "sustained-1-followup", "sustained-2", "sustained-2-followup",
+            "sustained-3", "sustained-3-followup", "2k-fresh", "2k-cached"])
+        self.assertEqual([row[2] for row in self.calls], [32, 32, 32, 512, 32, 512, 32, 512, 32, 128, 128])
+        self.assertEqual(result["expected_max_context"], 65536)
+        self.assertTrue(result["acceptance_workload_passed"])
+        self.assertNotIn("long_context", result)
+        self.assertEqual(result["final_idle"]["required_seconds"], 30)
+
+    def test_near_full_history_remains_on_wire_while_provisional_artifacts_remain_bounded(self):
+        self.reference_text = "synthetic reference data " * 30000
+        result = self.invoke()
+        self.assertEqual(self.calls[0][1][1]["content"], self.reference_text)
+        self.assertEqual(self.calls[1][1][1]["content"], self.reference_text)
+        for request, wire in zip(result["requests"], self.calls):
+            expected = json.dumps(wire[1], sort_keys=True, separators=(",", ":")).encode()
+            self.assertEqual(request["messages_sha256"], hashlib.sha256(expected).hexdigest())
+            self.assertNotIn("messages", request)
+        self.assertLess((self.args.output / "provisional.json").stat().st_size, 1024**2)
+        self.assertTrue(result["acceptance_workload_passed"])
+
+    def test_short_natural_early_stop_keeps_partial_checks_and_owned_cleanup(self):
+        self.args.acceptance_workload = "short"
+        self.change = lambda label, response: response["usage"].update(completion_tokens=511) if label == "sustained-1" else None
+        with self.assertRaisesRegex(RuntimeError, "sustained-1"):
+            self.invoke()
+        result = self.saved()
+        self.assertEqual(result["status"], "provisional_failed")
+        self.assertEqual(len(result["acceptance_cases"]), 4)
+        self.assertFalse(result["acceptance_cases"][-1]["checks"]["completion_length"])
+        self.assertFalse(result["acceptance_workload_passed"])
+        self.assertNotIn("final_idle", result)
+        self.processes[0].terminate.assert_called_once()
+
+    def test_near_full_refuses_wrong_code_cache_history_count_and_short_sustained_output(self):
+        changes = [
+            ("near-full-fresh", lambda r: r["choices"][0]["message"].update(content="field-cedar-2840 marble-finch-693 cove-lantern-517")),
+            ("near-full-fresh", lambda r: r["usage"].update(prompt_tokens=127999)),
+            ("near-full-fresh", lambda r: r["timings"].update(cache_n=1, prompt_n=127999)),
+            ("near-full-cached", lambda r: r["choices"][0]["message"].update(content="cove-lantern-517 390")),
+            ("near-full-cached", lambda r: r["timings"].update(cache_n=0, prompt_n=128080)),
+            ("near-full-cached", lambda r: r["usage"].update(prompt_tokens=128079)),
+            ("near-full-sustained", lambda r: r["usage"].update(completion_tokens=511)),
+            ("near-full-sustained", lambda r: r["usage"].update(completion_tokens=2049)),
+            ("near-full-sustained", lambda r: r["timings"].update(cache_n=128000, prompt_n=100)),
+        ]
+        for index, (label, change) in enumerate(changes):
+            with self.subTest(label=label, index=index):
+                self.args.output = self.root / ("output-" + str(index))
+                self.change = lambda name, row: change(row) if name == label else None
+                with self.assertRaisesRegex(RuntimeError, "Acceptance workload check|Invalid request metric evidence"):
+                    self.invoke()
+                self.assertFalse(self.saved()["acceptance_workload_passed"])
+                self.assertEqual(self.saved()["status"], "provisional_failed")
+                self.assertTrue(self.saved()["protection"]["unchanged"])
+
+    def test_missing_stream_latency_is_a_failure_with_answer_and_redacted_receipt(self):
+        def change(label, response):
+            response.pop("first_token_s")
+            response["choices"][0]["message"]["content"] = self.cfg["api_key"]
+        self.change = change
+        with self.assertRaisesRegex(RuntimeError, "streaming evidence"):
+            self.invoke()
+        result = self.saved()
+        self.assertEqual(result["requests"][0]["response"]["choices"][0]["message"]["content"], "[REDACTED]")
+        self.assertEqual(result["requests"][0]["output_sha256"], hashlib.sha256(self.cfg["api_key"].encode()).hexdigest())
+        for path in self.args.output.iterdir():
+            self.assertNotIn(self.cfg["api_key"], path.read_text())
+
+    def test_prefill_and_cached_token_metrics_must_belong_to_the_returned_response(self):
+        for field, value in (("prompt_ms", 1201), ("reused", 1)):
+            self.args.output = self.root / field
+            self.metric_change = lambda metric: metric.update({field: value})
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "does not agree|streaming evidence|Invalid request metric evidence"):
+                self.invoke()
+            result = self.saved()
+            self.assertEqual(result["status"], "provisional_failed")
+            self.assertEqual(result["requests"][0]["response"]["usage"]["completion_tokens"], 20)
+            self.assertEqual(result["requests"][0]["metric"][field], value)
+
+    def test_protected_input_mutation_refuses_after_successful_requests_and_preserves_original_receipt(self):
+        def change(label, response):
+            if label == "near-full-sustained":
+                self.binary.write_bytes(b"changed synthetic executable")
+        self.change = change
+        with self.assertRaisesRegex(RuntimeError, "Benchmark was cancelled"):
+            self.invoke()
+        result = self.saved()
+        self.assertTrue(result["acceptance_workload_passed"])
+        self.assertFalse(result["protection"]["unchanged"])
+        self.assertEqual(result["status"], "provisional_failed")
+        self.assertIn("Protected benchmark inputs changed", result["error"])
+
+    def test_consumed_configuration_must_match_the_before_hash_before_server_creation(self):
+        snapshot = bench.protection_snapshot
+        def changed(paths):
+            self.config.write_bytes(self.original + b"\n")
+            return snapshot(paths)
+        with patch.object(bench, "assert_idle"), patch.object(bench, "protection_snapshot", side_effect=changed), \
+                patch.object(bench.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "changed while binding"):
+                bench.run(self.args)
+        popen.assert_not_called()
+        self.assertFalse(self.args.output.exists())
+
+    def test_selected_cohort_cannot_silently_turn_automatic_into_frozen_budgets(self):
+        self.args.acceptance_workload = "short"
+        for cohort in ("saved-static", "frozen-control"):
+            with self.subTest(cohort=cohort), patch.object(bench, "assert_idle"), \
+                    patch.object(bench.subprocess, "Popen", side_effect=AssertionError("process forbidden")):
+                self.args.cohort = cohort
+                with self.assertRaisesRegex(ValueError, "cohort disagrees"):
+                    bench.run(self.args)
+                self.assertFalse(self.args.output.exists())
+
+    def test_saved_static_and_frozen_cohorts_preserve_their_explicit_budgets(self):
+        self.args.acceptance_workload = "short"
+        self.cfg.pop("memory_policy")
+        self.cfg["args"] += ["--resident-budget-gib", "39", "--expert-cache", "1"]
+        self.cfg["env"] = {"STRATA_FILE_CACHE_MIB": "4096"}
+        self.config.write_text(json.dumps(self.cfg))
+        self.original = self.config.read_bytes()
+        for cohort in ("saved-static", "frozen-control"):
+            self.args.cohort = cohort
+            self.args.output = self.root / cohort
+            result = self.invoke()
+            self.assertEqual(result["cohort"], cohort)
+            self.assertEqual(self.clones[-1]["args"], ["--max-context", "131072", "--resident-budget-gib", "39", "--expert-cache", "1"])
+            self.assertEqual(self.clones[-1]["env"]["STRATA_FILE_CACHE_MIB"], "4096")
+            self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_public_opt_in_is_held_before_native_resource_or_model_entry(self):
+        self.args.acceptance_telemetry = True
+        del self.args._acceptance_deadline
+        from tools import prepare_unsloth_q2 as prep
+        with patch.object(bench.subprocess, "Popen", side_effect=AssertionError("process forbidden")), \
+                patch.object(bench, "WindowsProcessAPI", side_effect=AssertionError("native forbidden")), \
+                patch.object(bench, "assert_idle", side_effect=AssertionError("inventory forbidden")), \
+                patch.object(prep, "memory_snapshot", side_effect=AssertionError("resource sample forbidden")):
+            with self.assertRaisesRegex(RuntimeError, "held"):
+                bench.run(self.args)
+        result = json.loads((self.args.output / "results.json").read_text())
+        self.assertEqual(result["acceptance_workload"], "near-full")
+        self.assertEqual(result["cohort"], "automatic")
+        self.assertEqual(result["status"], "held")
+        self.assertEqual(result["effective_environment"], {"CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0"})
+
+    def test_cli_selects_workload_context_cohort_candidate_and_exact_protected_files(self):
+        with patch.object(bench, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bench.main(["--config", str(self.config), "--output", str(self.args.output),
+                "--acceptance-telemetry", "--acceptance-workload", "short", "--expected-context", "65536",
+                "--cohort", "saved-static", "--candidate-exe", str(self.binary),
+                "--protect-input", str(self.config)]), 0)
+        args = run.call_args.args[0]
+        self.assertEqual((args.acceptance_workload, args.expected_context, args.cohort), ("short", 65536, "saved-static"))
+        self.assertEqual(args.protect_input, [str(self.config)])
+        self.assertEqual(args.candidate_exe, self.binary)
+
+    def test_conflicting_or_uncontained_selections_refuse_before_reading_config(self):
+        changes = [{"_acceptance_deadline": None}, {"cohort": None}, {"cohort": "saved-static"},
+                   {"expected_context": 65536}, {"long_context": True}, {"smoke": True},
+                   {"idle_seconds": 1}, {"expected_context": True}, {"acceptance_workload": "unknown"}]
+        for changed in changes:
+            args = argparse.Namespace(**vars(self.args))
+            args.config = self.root / "absent.json"
+            vars(args).update(changed)
+            with self.subTest(changed=changed), patch.object(bench.subprocess, "Popen") as popen:
+                with self.assertRaises(ValueError):
+                    bench.run(args)
+                popen.assert_not_called()
+                self.assertFalse(args.output.exists())
+
+    def test_clean_acceptance_environment_removes_inherited_treatments_and_preserves_explicit_ones(self):
+        from serve.server import config_environment
+        inherited = {"CUDA_MODULE_LOADING": "LAZY", "STRATA_FILE_COPY_READY": "1",
+                     "STRATA_VERIFY_PROFILE": "1", "STRATA_SPLIT_TIMING": "1", "STRATA_TRACE": "1",
+                     "CUDA_LAUNCH_BLOCKING": "1", "STRATA_API_KEY": "inherited-private", "KEEP": "value"}
+        cfg = {"env": {"STRATA_FILE_CACHE_MIB": "4096"}}
+        with patch.dict(bench.os.environ, inherited, clear=True):
+            clean, environment = bench.clean_environment(cfg, False, acceptance=True)
+        self.assertEqual(environment, {"KEEP": "value"})
+        self.assertEqual(config_environment(clean, environment), {"KEEP": "value", "STRATA_FILE_CACHE_MIB": "4096",
+            "CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0"})
+        self.assertEqual(cfg, {"env": {"STRATA_FILE_CACHE_MIB": "4096"}})
+        explicit = {"env": {"CUDA_MODULE_LOADING": "LAZY", "STRATA_FILE_COPY_READY": "1",
+                            "STRATA_VERIFY_PROFILE": "1", "STRATA_API_KEY": "another-private-key"}}
+        with patch.dict(bench.os.environ, inherited, clear=True):
+            treatment, environment = bench.clean_environment(explicit, False, acceptance=True)
+        self.assertEqual(config_environment(treatment, environment), {"KEEP": "value", "CUDA_MODULE_LOADING": "LAZY",
+            "STRATA_FILE_COPY_READY": "1", "STRATA_VERIFY_PROFILE": "1"})
+
+    def test_saved_and_candidate_executable_provenance_are_separate_and_receipts_are_claims(self):
+        candidate = self.root / "strata-candidate.exe"
+        candidate.write_bytes(b"synthetic candidate executable")
+        receipt = self.root / "BUILD-candidate.json"
+        receipt.write_text(json.dumps({"commit": "older-receipt-commit", "version": "synthetic-version",
+            "src": "synthetic-source", "ggml": "synthetic-dependencies",
+            "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()}))
+        launcher = self.root / "saved-launcher.bat"
+        launcher.write_bytes(b"synthetic launcher, never executed")
+        self.args.candidate_exe, self.args.protect_input = candidate, [str(launcher)]
+        result = self.invoke()
+        saved, selected = (result["executable_provenance"][key] for key in ("saved", "selected"))
+        self.assertEqual(saved["executable"]["path"], str(self.binary))
+        self.assertEqual(saved["source_provenance"], "source-unproven")
+        self.assertIsNone(saved["build_claim"])
+        self.assertEqual(selected["executable"]["path"], str(candidate))
+        self.assertEqual(selected["build_claim"]["commit"], "older-receipt-commit")
+        self.assertIn("admission still required", selected["source_provenance"])
+        self.assertNotEqual(selected["build_claim"]["commit"], result["working_tree"]["head"])
+        self.assertEqual(self.clones[0]["exe"], str(candidate))
+        self.assertEqual(self.clones[0]["build_metadata"], str(receipt))
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertIn(str(launcher), [row["path"] for row in result["protection"]["after"]])
+
+    def test_mismatched_build_receipt_refuses_before_the_server_boundary(self):
+        receipt = self.root / "BUILD-saved.json"
+        receipt.write_text(json.dumps({"commit": "invented", "sha256": "0" * 64}))
+        with patch.object(bench, "assert_idle"), patch.object(bench.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "receipt does not match"):
+                bench.run(self.args)
+        popen.assert_not_called()
+        self.assertFalse(self.args.output.exists())
+
+    def test_full_chat_output_room_refuses_before_request_and_generator_count_is_independently_checked(self):
+        validation = types.SimpleNamespace(long_messages=Mock(return_value=(
+            [{"role": "user", "content": "synthetic"}], ["a", "b", "c"], 128000)))
+        client = Mock(cfg={})
+        record = {"expected_max_context": 131072, "acceptance_workload": "near-full", "requests": []}
+        for count in (128257, 127743, 128001):
+            with self.subTest(count=count), self.assertRaisesRegex(RuntimeError, "did not reach"):
+                bench.acceptance_retrieval(validation, client, record, Mock(), lambda _: count, 128000)
+        client.chat.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "output room"):
+            bench.acceptance_request(client, record, Mock(), lambda _: 129020,
+                                     "near-full-fresh", [])
+        client.chat.assert_not_called()
+
+    def test_actual_readonly_generator_and_server_template_count_leave_unclipped_2048_room(self):
+        from serve.server import ByteTokenizer, MockEngine, Service
+        from serve.frontend import ChatTemplate
+        from tools import needle_bench
+        tokenizer = self.root / "tokenizer"
+        tokenizer.mkdir()
+        (tokenizer / "vocab.json").write_text("{}")
+        (tokenizer / "merges.txt").write_text("")
+        (tokenizer / "token_type.json").write_text("[]")
+        (tokenizer / "chat_template.jinja").write_bytes((bench.ROOT / "serve/chat_template.jinja").read_bytes())
+        cfg = {"tokenizer": str(tokenizer)}
+        validation = bench.load_workload("validation")
+        with patch.dict(sys.modules, {"strata_tokenizer": types.SimpleNamespace(Tokenizer=lambda *args: ByteTokenizer())}), \
+                patch.object(needle_bench, "haystack", side_effect=lambda n: ("synthetic reference data " * (n // 25 + 1))[:n]):
+            messages, codes, count = validation.long_messages(cfg, 128000)
+            measured = bench.prompt_counter(cfg)(messages)
+        self.assertEqual(count, 128000)
+        self.assertEqual(measured, 128000)
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, " ".join(codes), max_context=131072)
+        service = Service(engine, tok, ChatTemplate(tokenizer / "chat_template.jinja"), fit_max_tokens=True)
+        ids, _, max_new = service.prepare(messages, None, {"enable_thinking": False}, 2048)
+        self.assertEqual(len(ids), 128000)
+        self.assertEqual(max_new, 2048)
+        self.assertLessEqual(len(ids) + max_new + 8, 131072)
+        generated = list(engine.generate(ids, max_new, {}, bench.threading.Event()))
+        self.assertEqual(tok.decode(generated[:-1]), "field-cedar-284 marble-finch-693 cove-lantern-517")
+        self.assertEqual(engine.last_prompt, ids)
+
+    def test_existing_stream_client_clocks_first_content_and_matches_the_same_request_metric(self):
+        validation = bench.load_workload("validation")
+        now, total = [100.0], [0]
+        metric = {"time": 1, "prompt_tokens": 20, "output_tokens": 2,
+                  "prompt_ms": 200, "decode_ms": 1000, "reused": 3}
+        class Stream:
+            def __enter__(stream): return stream
+            def __exit__(stream, *args): return False
+            def __iter__(stream):
+                frames = [(101.0, {"choices": [{"delta": {"role": "assistant"}}]}),
+                          (102.5, {"choices": [{"delta": {"content": "OK"}}]}),
+                          (104.0, {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                                   "usage": {"prompt_tokens": 20, "completion_tokens": 2},
+                                   "timings": {"prompt_ms": 200, "predicted_ms": 1000, "cache_n": 3, "prompt_n": 17}})]
+                for at, frame in frames:
+                    now[0] = at
+                    yield b"data: " + json.dumps(frame).encode() + b"\n\n"
+                yield b"data: [DONE]\n\n"
+        def open_request(request, **kwargs):
+            if request.full_url.endswith("/metrics"):
+                return io.BytesIO(json.dumps({"totals": {"requests": total[0]},
+                                              "requests": [metric] if total[0] else []}).encode())
+            body = json.loads(request.data)
+            self.assertIs(body["stream"], True)
+            total[0] += 1
+            return Stream()
+        record = {"requests": [], "acceptance_workload": "short"}
+        guard = bench.MemoryGuard(None, None, deadline=200)
+        cfg = {"model_name": "synthetic", "api_key": "synthetic-key", "port": 8081}
+        validation.OPENER = types.SimpleNamespace(open=open_request)
+        with patch.object(bench.time, "monotonic", side_effect=lambda: now[0]):
+            client = bench.make_client(validation, cfg, record, Mock(), guard, "synthetic-key")
+            response = client.chat([{"role": "user", "content": "hello"}], 32)
+        self.assertEqual(response["choices"][0]["message"]["content"], "OK")
+        self.assertEqual(record["requests"][0]["first_content_seconds"], 2.5)
+        self.assertEqual(record["requests"][0]["client_wall_seconds"], 4)
+        self.assertEqual(record["requests"][0]["metric"], metric)
+        self.assertEqual(record["requests"][0]["actual_completion_tokens"], 2)
+        self.assertEqual(record["requests"][0]["cached_tokens"], 3)
+
+
+class StageCRepairTests(unittest.TestCase):
+    def source(self):
+        case = StageCSourceTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
+    def contained(self):
+        case = ContainedLifecycleTests()
+        case.setUp()
+        return case
+
+    def test_shared_matcher_rejects_invalid_counts_and_timings_before_comparison(self):
+        good = {"choices": [], "usage": {"prompt_tokens": 60, "completion_tokens": 20},
+                "timings": {"predicted_ms": 2400, "prompt_ms": 1200, "cache_n": 0, "prompt_n": 60}}
+        metric = {"time": 1, "prompt_tokens": 60, "output_tokens": 20, "decode_ms": 2400,
+                  "prompt_ms": 1200, "reused": 0}
+        before = {"totals": {"requests": 0}, "requests": []}
+        fields = [("response", "usage", "prompt_tokens"), ("response", "usage", "completion_tokens"),
+                  ("response", "timings", "predicted_ms"), ("response", "timings", "prompt_ms"),
+                  ("response", "timings", "cache_n"), ("response", "timings", "prompt_n"),
+                  *[("metric", None, name) for name in ("time", "prompt_tokens", "output_tokens", "decode_ms", "prompt_ms", "reused")]]
+        for owner, section, key in fields:
+            for bad in (None, float("nan"), float("inf"), -1, True, "2400"):
+                if owner == "metric" and key == "reused" and bad is None:
+                    continue  # The actual server uses null for older native telemetry.
+                response, changed = bench.copy.deepcopy(good), dict(metric)
+                target = response[section] if owner == "response" else changed
+                target[key] = bad
+                with self.subTest(owner=owner, key=key, bad=bad), self.assertRaises(RuntimeError):
+                    bench.matched_metric(response, before, {"totals": {"requests": 1}, "requests": [changed]})
+        self.assertEqual(bench.matched_metric(good, before, {"totals": {"requests": 1}, "requests": [metric]}), metric)
+
+    def test_legacy_null_native_counts_survive_but_invalid_known_counts_refuse(self):
+        response = {"usage": {"prompt_tokens": 60, "completion_tokens": 20},
+                    "timings": {"predicted_ms": 2400, "cache_n": 0}}
+        metric = {"time": 1, "prompt_tokens": 60, "output_tokens": 20, "decode_ms": 2400,
+                  "prompt_total": 60, "prompt_read": None, "engine_generated": None, "reused": None}
+        before = {"totals": {"requests": 0}, "requests": []}
+        def match(row):
+            return bench.matched_metric(response, before, {"totals": {"requests": 1}, "requests": [row]})
+        self.assertEqual(match(metric), metric)
+        for key, bad in (("prompt_total", float("nan")), ("prompt_total", 59),
+                         ("prompt_read", 61), ("prompt_read", True), ("engine_generated", -1)):
+            with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
+                match(dict(metric, **{key: bad}))
+        class Client:
+            def __init__(self, cfg): self.done = False
+            def get(self, path):
+                return {"totals": {"requests": int(self.done)}, "requests": [metric] if self.done else []}
+            def chat(self, *args, **kwargs): self.done = True; return response
+        record = {"requests": []}
+        client = bench.make_client(types.SimpleNamespace(Client=Client), {}, record, lambda: None,
+                                   types.SimpleNamespace(deadline=None, check=lambda: None), "key")
+        self.assertEqual(client.chat([{"role": "user", "content": "test"}]), response)
+
+    def test_public_reasoning_wrap_up_preserves_distinct_delivered_and_native_counts(self):
+        import threading
+        from serve.test_server import ThinkingEngine, ByteTokenizer, ChatTemplate, Service
+        from serve.server import openai_chunks, openai_collect
+        class MeteredThinking(ThinkingEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                count = 0
+                try:
+                    for token in super().generate(ids, max_new, sampling, cancel, embeddings):
+                        count += 1
+                        yield token
+                finally:
+                    self.last = {"generated": count, "prompt_ms": 100., "decode_ms": 200.,
+                                 "reused": 0, "prompt_read": len(ids), "finish": "stop"}
+        for budget in (0, 20):
+            tok = ByteTokenizer()
+            engine = MeteredThinking(tok)
+            service = Service(engine, tok, ChatTemplate(Path(__file__).resolve().parents[1] / "serve/chat_template.jinja"))
+            ids, thinking, limit = service.prepare([{"role": "user", "content": "2+2?"}], [], {}, 400)
+            sampling = {"reasoning_budget_tokens": budget}
+            with contextlib.redirect_stdout(io.StringIO()):
+                events = list(service.run(ids, thinking, [], limit, sampling, threading.Event()))
+            response = openai_collect(openai_chunks(service, sampling, ids, thinking, [], limit,
+                                                   threading.Event(), run=iter(events)))
+            metric = dict(service.history[-1])
+            matched = bench.matched_metric(response, {"totals": {"requests": 0}, "requests": []},
+                                            {"totals": {"requests": 1}, "requests": [metric]})
+            self.assertEqual(matched, metric)
+            self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+            self.assertEqual(response["choices"][0]["message"]["content"], "The answer is 4.")
+            if budget:
+                self.assertGreater(response["usage"]["completion_tokens"], metric["engine_generated"])
+
+    def test_selected_native_counters_cannot_be_missing_or_exceed_the_request(self):
+        for key, bad in (("prompt_total", float("nan")), ("prompt_read", 999999),
+                         ("engine_generated", 999999), ("prompt_read", None), ("engine_generated", None)):
+            case = self.source()
+            case.metric_change = lambda metric, key=key, bad=bad: metric.update({key: bad})
+            with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeError):
+                case.invoke()
+            self.assertNotEqual(case.saved()["status"], "complete")
+
+    def test_selected_finish_must_be_successful_and_match_the_response(self):
+        for state in (None, "error", "cancel", "disconnect", "length", False):
+            case = self.source()
+            case.metric_change = lambda metric, state=state: metric.update(finish=state)
+            with self.subTest(producer=state), self.assertRaises(RuntimeError):
+                case.invoke()
+            case = self.contained()
+            try:
+                def mutation(record):
+                    for row in (record["acceptance_cases"][0], record["requests"][0]):
+                        row["metric"]["finish"] = state
+                with self.subTest(consumer=state), self.assertRaises(bench.AcceptanceFailure):
+                    case.invoke_selected(mutation)
+            finally:
+                case.doCleanups()
+
+    def test_known_cache_read_counts_must_agree_without_requiring_legacy_nulls(self):
+        response = {"usage": {"prompt_tokens": 60, "completion_tokens": 20},
+                    "timings": {"predicted_ms": 2400, "cache_n": 10, "prompt_n": 50}}
+        metric = {"time": 1, "prompt_tokens": 60, "output_tokens": 20, "decode_ms": 2400,
+                  "prompt_total": 60, "prompt_read": 50, "reused": 10}
+        before = {"totals": {"requests": 0}, "requests": []}
+        def match(reply, row):
+            return bench.matched_metric(reply, before, {"totals": {"requests": 1}, "requests": [row]})
+        self.assertEqual(match(response, metric), metric)
+        for cached, read in ((61, 0), (10, 60), (0, 59)):
+            changed = bench.copy.deepcopy(response)
+            changed["timings"].update(cache_n=cached, prompt_n=read)
+            with self.subTest(cached=cached, read=read), self.assertRaises(RuntimeError):
+                match(changed, dict(metric, reused=cached, prompt_read=read))
+        with self.assertRaises(RuntimeError):
+            match(response, dict(metric, reused=None, prompt_read=60))
+        legacy = dict(metric, reused=None, prompt_read=None)
+        self.assertEqual(match(response, legacy), legacy)
+
+    def test_selected_protection_must_include_every_explicit_input(self):
+        for omitted in (False, True):
+            case = self.contained()
+            try:
+                required = case.root / "required.bin"
+                required.write_bytes(b"protected input")
+                case.args.protect_input = [str(required)]
+                def mutation(record):
+                    for field in ("before", "after"):
+                        record["protection"][field] = [row for row in record["protection"][field]
+                                                         if row["path"] != str(required)]
+                if omitted:
+                    with self.assertRaises(bench.AcceptanceFailure) as caught:
+                        case.invoke_selected(mutation)
+                    self.assertFalse(caught.exception.record["worker_complete"])
+                    self.assertIn("workload_error", caught.exception.record)
+                else:
+                    self.assertTrue(bench.acceptance_final_predicate(case.invoke_selected()))
+            finally:
+                case.doCleanups()
+
+    def test_remaining_source_diagnostics_are_cleaned_recorded_and_classified(self):
+        presence = {"STRATA_STATE_HASH", "STRATA_VERIFY_NODES", "STRATA_DBG_FEAT",
+                    "STRATA_DBG_ROUTE_OVERRIDE", "STRATA_DBG_CPU_GATE"}
+        for key in (*sorted(presence), "STRATA_FILE_COPY_STATS", "STRATA_IO_STATS", "STRATA_FS_VERIFY",
+                    "STRATA_TEST_VERIFY_STALL", "STRATA_PREFILL_DEMAND_STATS", "STRATA_DBG_GDN",
+                    "STRATA_DBG_FORCE_SLOW_LAYER", "STRATA_TEST_PAGEABLE", "STRATA_TEST_CACHE_FAIL"):
+            for value in ("", "0", "1"):
+                for explicit in (False, True):
+                    case = self.source()
+                    if explicit:
+                        case.cfg["env"] = {key: value}
+                        case.config.write_text(json.dumps(case.cfg))
+                    with self.subTest(key=key, value=value, explicit=explicit), \
+                            patch.dict(bench.os.environ, {key: "1"}, clear=True):
+                        record = case.invoke()
+                    self.assertEqual(record["timing_diagnostic"], explicit and (key in presence or value == "1"))
+                    if explicit:
+                        self.assertEqual(record["effective_settings"]["env"][key], value)
+                    else:
+                        self.assertNotIn(key, record["effective_settings"]["env"])
+                        self.assertNotIn(key, case.server_environments[0])
+        self.assertTrue(bench.diagnostic_environment({"STRATA_PREFILL_DEMAND_STATS": "10"}))
+        self.assertTrue(bench.diagnostic_environment({"STRATA_DBG_GDN": "10"}))
+        self.assertTrue(bench.diagnostic_environment({"STRATA_TEST_PAGEABLE": "10"}))
+        self.assertFalse(bench.diagnostic_environment({"STRATA_TEST_PAGEABLE": "01"}))
+        self.assertTrue(bench.diagnostic_environment({"STRATA_TEST_CACHE_FAIL": "2"}))
+        self.assertFalse(bench.diagnostic_environment({"STRATA_TEST_CACHE_FAIL": "-1"}))
+        self.assertFalse(bench.diagnostic_environment({"STRATA_DBG_GDN": "01"}))
+        self.assertFalse(bench.diagnostic_environment({"STRATA_DBG_FEAT_LAYERS": "3"}))
+        self.assertTrue(bench.diagnostic_environment({"STRATA_DBG_FEAT_LAYERS": "3", "STRATA_DBG_FEAT": ""}))
+        for key in ("STRATA_VERIFY_DEVICE_PLAN", "STRATA_VERIFY_QDEDUP", "STRATA_VERIFY_COHERENT",
+                    "STRATA_VERIFY_ALL_RESIDENT"):
+            with patch.dict(bench.os.environ, {key: "1"}, clear=True):
+                cfg, inherited = bench.clean_environment({"env": {}}, False, acceptance=True)
+            self.assertEqual(inherited[key], "1")
+            self.assertEqual(bench.safe_engine_environment(cfg, inherited, acceptance=True)[key], "1")
+            self.assertFalse(bench.diagnostic_environment({key: "1"}))
+
+    def test_selected_public_body_refuses_nonfinite_decode_metric_with_partial_answer(self):
+        for bad in (None, float("nan"), float("inf"), -1, True):
+            case = self.source()
+            case.metric_change = lambda metric: metric.update(decode_ms=bad)
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                case.invoke()
+            self.assertEqual(case.saved()["status"], "provisional_failed")
+            self.assertIn("response", case.saved()["requests"][0])
+            case.processes[0].terminate.assert_called_once()
+
+    def test_complete_selected_public_composition_accepts_only_the_complete_synthetic_evidence(self):
+        for selection in ("short", "near-full"):
+            case = self.contained()
+            try:
+                result = case.invoke_selected(selection=selection)
+                self.assertTrue(bench.acceptance_final_predicate(result))
+                self.assertTrue(result["worker_complete"])
+                saved = json.loads((case.output / "provisional.json").read_bytes())
+                self.assertEqual(len(saved["acceptance_cases"]), 11 if selection == "short" else 3)
+                self.assertTrue(all(row["passed"] for row in saved["acceptance_cases"]))
+                self.assertTrue(all("response" in row and "metric" in row for row in saved["requests"]))
+            finally:
+                case.doCleanups()
+
+    def test_complete_public_composition_rejects_malformed_failed_or_mismatched_case_and_request_evidence(self):
+        def field(path, value):
+            def mutate(record):
+                owner = record
+                for key in path[:-1]: owner = owner[key]
+                owner[path[-1]] = value
+            return mutate
+        def both_response(row_index, section, key, value):
+            def mutate(record):
+                for row in (record["acceptance_cases"][row_index], record["requests"][row_index]):
+                    row["response"][section][key] = value
+            return mutate
+        def short_output(record):
+            for item in (record["acceptance_cases"][3], record["requests"][3]):
+                item["response"]["usage"]["completion_tokens"] = 511
+                item["metric"]["output_tokens"] = 511
+            record["requests"][3]["actual_completion_tokens"] = 511
+        def no_cache(record):
+            for item in (record["acceptance_cases"][2], record["requests"][2]):
+                item["response"]["timings"].update(cache_n=0, prompt_n=item["response"]["usage"]["prompt_tokens"])
+                item["metric"]["reused"] = 0
+            record["requests"][2]["cached_tokens"] = 0
+        def wrong_answer(record):
+            for item in (record["acceptance_cases"][0], record["requests"][0]):
+                item["response"]["choices"][0]["message"]["content"] = "390"
+            record["requests"][0]["output_sha256"] = hashlib.sha256(b"390").hexdigest()
+        mutations = {
+            "empty_cases": field(("acceptance_cases",), [{}] * 11),
+            "missing_case": lambda r: r["acceptance_cases"].pop(),
+            "malformed_case": field(("acceptance_cases", 0), None),
+            "false_row": field(("acceptance_cases", 3, "passed"), False),
+            "nonbool_passed": field(("acceptance_cases", 3, "passed"), 1),
+            "false_check": field(("acceptance_cases", 3, "checks", "completion_length"), False),
+            "missing_check": lambda r: r["acceptance_cases"][0]["checks"].pop("exact_answer"),
+            "wrong_label": field(("acceptance_cases", 0, "case"), "near-full-sustained"),
+            "duplicate_case": lambda r: r["acceptance_cases"].__setitem__(1, r["acceptance_cases"][0]),
+            "case_order": lambda r: r["acceptance_cases"].reverse(),
+            "no_requests": field(("requests",), []),
+            "missing_request": lambda r: r["requests"].pop(),
+            "malformed_request": field(("requests", 0), {}),
+            "duplicate_request": lambda r: r["requests"].__setitem__(1, r["requests"][0]),
+            "request_order": lambda r: r["requests"].reverse(),
+            "wrong_request_label": field(("requests", 0, "label"), "invented"),
+            "mismatched_response": field(("requests", 0, "response", "usage", "completion_tokens"), 19),
+            "wrong_output_digest": field(("requests", 0, "output_sha256"), "0" * 64),
+            "missing_first_content": lambda r: r["requests"][0].pop("first_content_seconds"),
+            "malformed_wall_clock": field(("requests", 0, "started_unix"), float("nan")),
+            "false_completion_count": field(("requests", 0, "actual_completion_tokens"), 21),
+            "wrong_max_tokens": field(("requests", 0, "max_tokens"), 31),
+            "false_actual_length": both_response(3, "usage", "completion_tokens", 511),
+            "false_actual_cache": both_response(2, "timings", "cache_n", 0),
+            "coherent_short_output": short_output,
+            "coherent_no_cache": no_cache,
+            "coherent_wrong_answer": wrong_answer,
+            "nonfinite_actual_timing": both_response(0, "timings", "predicted_ms", float("nan")),
+            "wrong_target_count": field(("acceptance_cases", 9, "local_prompt_tokens"), 1024),
+            "wrong_expected_answer": field(("acceptance_cases", 0, "expected"), [390]),
+            "false_aggregate": field(("acceptance_summary", "completion_tokens"), 1),
+            "history_missing": lambda r: r["requests"][2]["message_digests"].pop(1),
+            "history_wrong_answer": field(("requests", 2, "message_digests", 1, "content_sha256"), "0" * 64),
+            "history_wrong_message": field(("requests", 2, "message_digests", 1, "message_sha256"), "0" * 64),
+            "false_idle": field(("final_idle", "completed"), False),
+            "short_idle": lambda r: r["final_idle"].update(finished_monotonic=r["final_idle"]["started_monotonic"] + 29),
+            "future_idle": field(("final_idle", "finished_monotonic"), 900),
+            "missing_protection": field(("protection", "before"), []),
+            "changed_protection": field(("protection", "after", 0, "sha256"), "0" * 64),
+            "malformed_protection": field(("protection", "before", 0, "bytes"), True),
+        }
+        for name, mutate in mutations.items():
+            case = self.contained()
+            try:
+                with self.subTest(name=name), self.assertRaises(bench.AcceptanceFailure) as caught:
+                    case.invoke_selected(mutate)
+                result = caught.exception.record
+                self.assertEqual(result["worker_exit"], 0, "Mutation must reach the external consumer")
+                self.assertFalse(result["worker_complete"])
+                self.assertIn("workload_error", result)
+                self.assertFalse(bench.acceptance_final_predicate(result))
+            finally:
+                case.doCleanups()
+
+    def test_near_full_public_consumer_rechecks_fresh_output_room_and_sustained_length(self):
+        def wrong(record, field, value):
+            row, request = record["acceptance_cases"][2], record["requests"][2]
+            for item in (row, request): item["response"]["usage"][field] = value
+        mutations = [lambda r: wrong(r, "completion_tokens", 511),
+                     lambda r: r["acceptance_cases"][2].update(local_prompt_tokens=129100),
+                     lambda r: r["requests"][2]["message_digests"].__setitem__(0, r["requests"][0]["message_digests"][0])]
+        for mutate in mutations:
+            case = self.contained()
+            try:
+                with self.assertRaises(bench.AcceptanceFailure) as caught:
+                    case.invoke_selected(mutate, selection="near-full")
+                self.assertEqual(caught.exception.record["worker_exit"], 0)
+                self.assertFalse(caught.exception.record["worker_complete"])
+            finally:
+                case.doCleanups()
+
+    def test_complete_selected_evidence_still_refuses_real_missing_producer_holds(self):
+        case = self.contained()
+        try:
+            with self.assertRaises(bench.AcceptanceFailure) as caught:
+                case.invoke_selected(missing=True)
+            self.assertFalse(caught.exception.record["worker_complete"])
+            self.assertTrue(caught.exception.record["workload_evidence"]["missing_evidence"])
+        finally:
+            case.doCleanups()
+
+    def test_source_established_diagnostic_modes_layers_and_effective_values(self):
+        presence = ("STRATA_POOL_TRACE", "STRATA_RSS_TRACE", "STRATA_TRACE_ADAPT", "STRATA_VERIFY_DEBUG",
+                    "STRATA_DRAFT_TIMING", "STRATA_PREFILL_TIMING", "STRATA_VERIFY_PROFILE",
+                    "STRATA_DECODE_TIMING", "STRATA_SPLIT_TIMING", "STRATA_TRACE", "STRATA_LOGPOS", "STRATA_DUMP_FIRST_LOGITS",
+                    "STRATA_VERIFY_ARENA", "STRATA_DBG_NAN", "STRATA_IDX_FP16_CHECK", "STRATA_QSA_DUMP",
+                    "STRATA_PREFILL_DUMP_R", "STRATA_PREFILL_DUMP_R_ALL", "STRATA_STATE_HASH_GDN", "STRATA_SNAPSHOT_VERIFY")
+        for key in presence + ("STRATA_BATCH_TRACE", "STRATA_DEBUG", "STRATA_FETCH_PROFILE", "STRATA_VERIFY_TRACE"):
+            for value in ("", "0", "1"):
+                with self.subTest(key=key, value=value):
+                    with patch.dict(bench.os.environ, {key: value, "STRATA_FILE_CACHE_MIB": "4096", "STRATA_PIPELINE_THETA": "0.8"}, clear=True):
+                        cfg, inherited = bench.clean_environment({"env": {}}, False, acceptance=True)
+                        self.assertNotIn(key, inherited)
+                        self.assertEqual(inherited["STRATA_PIPELINE_THETA"], "0.8")
+                        self.assertEqual(inherited["STRATA_FILE_CACHE_MIB"], "4096")
+                        legacy_cfg, legacy = bench.clean_environment({"env": {key: value}}, False)
+                        if key not in ("STRATA_VERIFY_PROFILE", "STRATA_DECODE_TIMING", "STRATA_FETCH_PROFILE"):
+                            self.assertEqual(legacy[key], value)
+                            self.assertEqual(legacy_cfg["env"][key], value)
+                    with patch.dict(bench.os.environ, {}, clear=True):
+                        cfg, inherited = bench.clean_environment({"env": {key: value}}, False, acceptance=True)
+                    evidence = bench.safe_engine_environment(cfg, inherited, acceptance=True)
+                    self.assertEqual(evidence[key], value)
+                    expected = key in presence or (bool(value) if key in ("STRATA_BATCH_TRACE", "STRATA_DEBUG") else value == "1")
+                    self.assertEqual(bench.diagnostic_environment(evidence), expected)
+                    if key in ("STRATA_BATCH_TRACE", "STRATA_DEBUG"):
+                        self.assertEqual(inherited[key], value)
+        for gate in ("0", "1"):
+            with patch.dict(bench.os.environ, {"STRATA_PIPELINE_DEBUG": gate, "STRATA_PIPELINE_LOG": "0",
+                                             "STRATA_PIPELINE_FORCE_MISS": "1"}, clear=True):
+                cfg, inherited = bench.clean_environment({"env": {}}, False, acceptance=True)
+                self.assertEqual(inherited["STRATA_PIPELINE_DEBUG"], gate)
+                self.assertNotIn("STRATA_PIPELINE_FORCE_MISS", inherited)
+                self.assertNotIn("STRATA_PIPELINE_LOG", inherited)
+                cfg, inherited = bench.clean_environment({"env": {"STRATA_PIPELINE_LOG": "0"}}, False, acceptance=True)
+                self.assertEqual(bench.diagnostic_environment(bench.safe_engine_environment(cfg, inherited, acceptance=True)), gate == "1")
+        for name in ("STRATA_LOGPOS_EXTRA", "STRATA_LOGPOS_TOPK", "STRATA_QSA_DUMP_LAST"):
+            parent = "STRATA_QSA_DUMP" if name == "STRATA_QSA_DUMP_LAST" else "STRATA_LOGPOS"
+            self.assertFalse(bench.diagnostic_environment({name: "1"}))
+            self.assertTrue(bench.diagnostic_environment({name: "1", parent: ""}))
+        for name in ("STRATA_HC_UPMIX_CHECK", "STRATA_CVEC_FUSE_CHECK"):
+            for value, expected in (("0", False), ("-1", False), ("2", True), (" 2suffix", True)):
+                self.assertEqual(bench.diagnostic_environment({name: value}), expected)
+        self.assertFalse(bench.diagnostic_environment({"STRATA_REQUEST_LINES": "0"}, server_log=False))
+        self.assertTrue(bench.diagnostic_environment({"STRATA_REQUEST_LINES": "0"}, server_log=True))
+        for value, expected in (("00", False), ("foo", False), ("-1", True), (" 01suffix", True)):
+            self.assertEqual(bench.diagnostic_environment({"CUDA_LAUNCH_BLOCKING": value}), expected)
+        self.assertFalse(bench.diagnostic_environment({"CUDA_LAUNCH_BLOCKING": "1"}, backend="hip"))
+
+    def test_selected_launch_removes_inherited_aliases_and_records_explicit_presence_zero(self):
+        keys = ("STRATA_BATCH_TRACE", "STRATA_POOL_TRACE", "STRATA_RSS_TRACE", "STRATA_TRACE_ADAPT")
+        for explicit in (False, True):
+            case = self.source()
+            if explicit:
+                case.cfg["env"] = {key: "0" for key in keys}
+                case.config.write_text(json.dumps(case.cfg))
+            with patch.dict(bench.os.environ, {key: "1" for key in keys}, clear=True):
+                result = case.invoke()
+            self.assertEqual(result["timing_diagnostic"], explicit)
+            for key in keys:
+                if explicit:
+                    self.assertEqual(result["effective_settings"]["env"][key], "0")
+                else:
+                    self.assertNotIn(key, result["effective_settings"]["env"])
+                    self.assertNotIn(key, case.server_environments[0])
+            if explicit:
+                self.assertEqual(case.server_environments[0]["STRATA_BATCH_TRACE"], "0")
+
+
+class NormalComparisonTests(unittest.TestCase):
+    def source(self):
+        case = StageCSourceTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
+    @staticmethod
+    def effective(case):
+        from serve.server import config_environment
+        return config_environment(case.clones[0], case.server_environments[0])
+
+    def test_public_known_tuning_controls_are_preserved_and_explicitly_normal(self):
+        controls = {"STRATA_FILE_CACHE_MIB": "4096", "STRATA_FILE_COPY_READY": "1",
+                    "STRATA_PIPELINE_DEBUG": "1", "STRATA_PIPELINE_THETA": "0.8",
+                    "STRATA_VERIFY_DEVICE_PLAN": "1", "STRATA_VERIFY_QDEDUP": "1",
+                    "STRATA_VERIFY_COHERENT": "1", "STRATA_VERIFY_ALL_RESIDENT": "0"}
+        case = self.source()
+        case.cfg["env"] = dict(controls)
+        case.config.write_text(json.dumps(case.cfg))
+        with patch.dict(bench.os.environ, {}, clear=True):
+            result = case.invoke()
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["acceptance_workload_passed"])
+        self.assertTrue(result["normal_comparison"]["complete"])
+        self.assertTrue(result["normal_comparison"]["eligible"])
+        self.assertEqual(result["normal_comparison"]["exclusions"], [])
+        self.assertFalse(result["timing_diagnostic"])
+        effective = self.effective(case)
+        for key, value in controls.items():
+            self.assertEqual(effective[key], value)
+        self.assertEqual({item["kind"] for item in result["normal_comparison"]["controls"]}, {"reviewed-normal"})
+
+    def test_public_unseen_controls_survive_both_layers_even_empty_or_zero_without_value_leaks(self):
+        key, secret = "STRATA_FUTURE_TREATMENT_74B9", "UNCLASSIFIED-SECRET-SENTINEL-20261022"
+        for value in ("", "0", secret):
+            for explicit in (False, True):
+                case = self.source()
+                if explicit:
+                    case.cfg["env"] = {key: value}
+                    case.config.write_text(json.dumps(case.cfg))
+                with self.subTest(value_empty=value == "", explicit=explicit), \
+                        patch.dict(bench.os.environ, {key: value}, clear=True):
+                    result = case.invoke()
+                self.assertEqual(self.effective(case)[key], value)
+                self.assertTrue(result["normal_comparison"]["complete"])
+                self.assertFalse(result["normal_comparison"]["eligible"])
+                self.assertEqual(result["normal_comparison"]["exclusions"], [{"reason": "unclassified-control",
+                    "control": "sha256:" + hashlib.sha256(key.encode()).hexdigest()}])
+                self.assertTrue(result["acceptance_workload_passed"])
+                self.assertEqual(result["status"], "complete")
+                self.assertFalse(result["timing_diagnostic"])
+                self.assertNotIn(key, json.dumps(result["normal_comparison"]))
+                for path in case.args.output.iterdir():
+                    self.assertNotIn(secret, path.read_text())
+                    self.assertNotIn(case.cfg["api_key"], path.read_text())
+
+    def test_r5_exact_public_specimens_follow_actual_cleaning_and_source_gates(self):
+        controls = {"STRATA_PIPELINE_DEBUG": "1", "STRATA_PIPELINE_FORCE_MISS": "1", "STRATA_LAYER_SPLIT_GATE": "0"}
+        for explicit in (False, True):
+            case = self.source()
+            if explicit:
+                case.cfg["env"] = dict(controls)
+                case.config.write_text(json.dumps(case.cfg))
+            with patch.dict(bench.os.environ, controls, clear=True):
+                result = case.invoke()
+            effective = self.effective(case)
+            self.assertEqual(effective["STRATA_PIPELINE_DEBUG"], "1")
+            self.assertEqual(result["normal_comparison"]["eligible"], not explicit)
+            self.assertEqual(result["timing_diagnostic"], explicit)
+            self.assertEqual(result["status"], "complete")
+            for key in ("STRATA_PIPELINE_FORCE_MISS", "STRATA_LAYER_SPLIT_GATE"):
+                if explicit:
+                    self.assertEqual(effective[key], controls[key])
+                else:
+                    self.assertNotIn(key, effective)
+        for gate in ("", "0", "1"):
+            for value in ("", "0", "-1", "1", " 2suffix", "-4294967295"):
+                cfg = {"env": {"STRATA_PIPELINE_DEBUG": gate, "STRATA_PIPELINE_FORCE_MISS": value}}
+                evidence = bench.normal_comparison_environment(cfg, {})
+                self.assertEqual(evidence["eligible"], not (gate == "1" and value in ("1", " 2suffix", "-4294967295")))
+        self.assertFalse(bench.normal_comparison_environment(
+            {"env": {"STRATA_TEST_CACHE_FAIL": "-4294967295"}}, {})["eligible"])
+        for value in ("", "0"):
+            evidence = bench.normal_comparison_environment({"env": {"STRATA_LAYER_SPLIT_GATE": value}}, {})
+            self.assertFalse(evidence["eligible"])
+            self.assertEqual(evidence["exclusions"], [{"reason": "active-diagnostic", "control": "STRATA_LAYER_SPLIT_GATE"}])
+
+    def test_public_removals_classify_effective_state_without_stripping_unknown_nulls(self):
+        for unknown in (False, True):
+            case = self.source()
+            key = "STRATA_RESIDENT_HEADROOM_GIB"
+            secret = "REMOVED-PRIVATE-CONTROL-SENTINEL"
+            case.cfg["memory_policy"] = {"version": 1, "generated_env": {key: "8"}, "overrides": {"env": {key: None}}}
+            case.cfg["env"] = {key: None}
+            if unknown:
+                case.cfg["env"]["STRATA_NOT_A_MANAGED_REMOVAL"] = None
+            case.config.write_text(json.dumps(case.cfg))
+            with patch.dict(bench.os.environ, {key: secret}, clear=True):
+                result = case.invoke()
+            effective = self.effective(case)
+            self.assertNotIn(key, effective)
+            self.assertEqual(result["normal_comparison"]["eligible"], not unknown)
+            if unknown:
+                self.assertEqual(effective["STRATA_NOT_A_MANAGED_REMOVAL"], "None")
+            self.assertNotIn(secret, json.dumps(result))
+            self.assertTrue(result["acceptance_workload_passed"])
+
+    def test_environment_case_and_typed_conflicts_match_actual_server_composition(self):
+        from serve.server import config_environment
+        for platform in ("nt", "posix"):
+            with patch.object(bench.os, "name", platform):
+                cfg = {"env": {"strata_fresh_unreviewed": "0"}}
+                self.assertEqual(config_environment(cfg, {}), {"strata_fresh_unreviewed": "0"})
+                self.assertEqual(bench.normal_comparison_environment(cfg, {})["eligible"], platform == "posix")
+                cfg = {"memory_policy": {"version": 1}, "env": {"strata_file_cache_mib": "128"}}
+                inherited = {"STRATA_FILE_CACHE_MIB": "64"}
+                expected = ({"STRATA_FILE_CACHE_MIB": "128"} if platform == "nt" else
+                            {"STRATA_FILE_CACHE_MIB": "64", "strata_file_cache_mib": "128"})
+                self.assertEqual(config_environment(cfg, inherited), expected)
+                self.assertTrue(bench.normal_comparison_environment(cfg, inherited)["eligible"])
+                conflict = {"memory_policy": {"version": 1},
+                            "env": {"STRATA_FILE_CACHE_MIB": 1, "strata_file_cache_mib": True}}
+                if platform == "nt":
+                    for operation in (config_environment, bench.normal_comparison_environment):
+                        with self.assertRaisesRegex(ValueError, "Conflicting managed environment aliases"):
+                            operation(conflict, {})
+                else:
+                    self.assertEqual(config_environment(conflict, {}), {"STRATA_FILE_CACHE_MIB": "1", "strata_file_cache_mib": "True"})
+        with patch.object(bench.os, "name", "nt"):
+            evidence = bench.normal_comparison_environment({"env": {"strata_file_copy_ready": "1"}},
+                                                          {"STRATA_FILE_COPY_READY": "0"})
+            self.assertFalse(evidence["eligible"])
+            self.assertFalse(evidence["complete"])
+
+    def test_invalid_or_oversized_effective_inventories_refuse_without_false_completeness(self):
+        specimens = [
+            {"STRATA_SECRET=PRIVATE-NAME-SENTINEL": "PRIVATE-VALUE-SENTINEL"},
+            {"STRATA_\nPRIVATE-NAME-SENTINEL": "PRIVATE-VALUE-SENTINEL"},
+            {"STRATA_" + "X" * 129: "PRIVATE-VALUE-SENTINEL"},
+            {"STRATA_FUTURE": "PRIVATE-VALUE-SENTINEL\0"},
+            {"STRATA_FUTURE": "X" * 4097},
+            {"STRATA_FUTURE_" + str(index): "0" for index in range(129)},
+            {"STRATA_FUTURE_" + str(index): "X" * 4096 for index in range(17)},
+            {"OTHER_" + str(index): "0" for index in range(4097)},
+        ]
+        for environment in specimens:
+            result = bench.normal_comparison_environment({"env": environment}, {})
+            self.assertFalse(result["complete"])
+            self.assertFalse(result["eligible"])
+            self.assertIsNone(result["environment_sha256"])
+            self.assertEqual(result["controls"], [])
+            self.assertLess(len(json.dumps(result)), 512)
+            self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_ordinary_windows_names_outside_scope_do_not_refuse_classification(self):
+        inherited = {"ProgramFiles(x86)": "C:\\Program Files (x86)", "CommonProgramFiles(x86)": "C:\\Common",
+                     "ASL.LOG": "Destination=file", "=C:": "C:\\Users", "OTHER": "PRIVATE\0VALUE"}
+        for platform in ("nt", "posix"):
+            with patch.object(bench.os, "name", platform):
+                for extra, eligible in (({}, True), ({"STRATA_FUTURE_74B9": "0"}, False)):
+                    result = bench.normal_comparison_environment(
+                        {"env": {"STRATA_FILE_CACHE_MIB": "4096"}}, dict(inherited, **extra))
+                    self.assertTrue(result["complete"])
+                    self.assertEqual(result["eligible"], eligible)
+                    self.assertNotIn("PRIVATE", json.dumps(result))
+                    self.assertNotIn("Program", json.dumps(result))
+        case = self.source()
+        with patch.dict(bench.os.environ, {"ProgramFiles(x86)": "C:\\Program Files (x86)"}, clear=True):
+            result = case.invoke()
+        self.assertTrue(result["normal_comparison"]["complete"])
+        self.assertTrue(result["normal_comparison"]["eligible"])
+
+    def test_public_invalid_unknown_name_keeps_workload_outcome_and_redacts_inventory(self):
+        case = self.source()
+        case.cfg["env"] = {"STRATA_BAD=PRIVATE-NAME-SENTINEL": "PRIVATE-VALUE-SENTINEL"}
+        case.config.write_text(json.dumps(case.cfg))
+        with patch.dict(bench.os.environ, {}, clear=True):
+            result = case.invoke()
+        self.assertEqual(self.effective(case)["STRATA_BAD=PRIVATE-NAME-SENTINEL"], "PRIVATE-VALUE-SENTINEL")
+        self.assertTrue(result["acceptance_workload_passed"])
+        self.assertFalse(result["normal_comparison"]["eligible"])
+        self.assertFalse(result["normal_comparison"]["complete"])
+        for path in case.args.output.iterdir():
+            self.assertNotIn("PRIVATE-NAME-SENTINEL", path.read_text())
+            self.assertNotIn("PRIVATE-VALUE-SENTINEL", path.read_text())
+
+    def test_byte_binding_is_unambiguous_but_does_not_review_an_unknown_control(self):
+        # These collide under concatenated name/value encoding, but not JSON pairs.
+        first = bench.normal_comparison_environment({"env": {"STRATA_A": "bSTRATA_Bc", "STRATA_B": "d"}}, {})
+        second = bench.normal_comparison_environment({"env": {"STRATA_A": "b", "STRATA_B": "cSTRATA_Bd"}}, {})
+        self.assertEqual(first["environment_sha256"], hashlib.sha256(
+            b'[["STRATA_A","bSTRATA_Bc"],["STRATA_B","d"]]').hexdigest())
+        self.assertNotEqual(first["environment_sha256"], second["environment_sha256"])
+        self.assertFalse(first["eligible"])
+        self.assertFalse(second["eligible"])
+        reordered = bench.normal_comparison_environment({"env": {"STRATA_B": "d", "STRATA_A": "bSTRATA_Bc"}}, {})
+        self.assertEqual(first, reordered)
+
+    def test_legacy_public_flow_retains_counts_and_outputs_but_excludes_unknown_controls(self):
+        for unknown in (False, True):
+            case = RunTests()
+            case.setUp()
+            try:
+                cfg = json.loads(case.config.read_text())
+                if unknown:
+                    cfg["env"]["STRATA_LEGACY_UNREVIEWED"] = "LEGACY-PRIVATE-SENTINEL"
+                    case.config.write_text(json.dumps(cfg))
+                    case.original = case.config.read_bytes()
+                expected = {key: value for key, value in cfg["env"].items() if key != "STRATA_VERIFY_PROFILE"}
+                with patch.dict(bench.os.environ, {}, clear=True):
+                    result = case.invoke(expected_env=expected)
+                self.assertEqual(result["status"], "complete")
+                self.assertEqual(len(result["rows"]), 6)
+                self.assertEqual(len(result["requests"]), 7)
+                self.assertEqual(result["summary"]["completion_tokens"], 960)
+                self.assertEqual(result["summary"]["predicted_ms"], 9000)
+                self.assertEqual(result["normal_comparison"]["eligible"], not unknown)
+                self.assertTrue(result["normal_comparison"]["complete"])
+                case.assert_safe_artifacts()
+                for path in case.output.iterdir():
+                    self.assertNotIn("LEGACY-PRIVATE-SENTINEL", path.read_text())
+            finally:
+                case.tearDown()
+
+    def test_consumer_excludes_legacy_missing_partial_and_malformed_classifications(self):
+        good = bench.normal_comparison_environment({"env": {}}, {})
+        specimens = [None, [], {}, {"timing_diagnostic": False}, {"normal_comparison": True},
+                     {"normal_comparison": {}}, {"normal_comparison": dict(good, eligible=1)},
+                     {"normal_comparison": dict(good, complete=False)},
+                     {"normal_comparison": dict(good, controls=[{}] * 129)},
+                     {"normal_comparison": dict(good, environment_sha256="PRIVATE-VALUE-SENTINEL")},
+                     {"normal_comparison": dict(good, exclusions=[{"reason": "PRIVATE-VALUE-SENTINEL"}])}]
+        for record in specimens:
+            result = bench.consume_normal_comparison(record, {"env": {}}, {})
+            self.assertFalse(result["eligible"])
+            self.assertFalse(result["complete"])
+            self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertTrue(bench.consume_normal_comparison({"normal_comparison": good}, {"env": {}}, {})["eligible"])
+
+    def test_actual_selected_consumer_never_promotes_missing_or_mutated_worker_classification(self):
+        for mutation in ("missing", "eligible", "complete", "controls", "digest", "unsafe-reason", "all-green"):
+            case = ContainedLifecycleTests()
+            case.setUp()
+            try:
+                def mutate(record):
+                    evidence = record["normal_comparison"]
+                    if mutation == "missing":
+                        record.pop("normal_comparison")
+                    elif mutation == "eligible":
+                        evidence["eligible"] = True
+                    elif mutation == "complete":
+                        evidence["complete"] = 1
+                    elif mutation == "controls":
+                        evidence["controls"] = []
+                    elif mutation == "digest":
+                        evidence["environment_sha256"] = "0" * 64
+                    elif mutation == "unsafe-reason":
+                        evidence["exclusions"] = [{"reason": "PRIVATE-WORKER-SENTINEL"}]
+                    else:
+                        record["normal_comparison"] = bench.normal_comparison_environment(
+                            {"env": {"CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0"}}, {})
+                with self.subTest(mutation=mutation), \
+                        patch.dict(bench.os.environ, {"STRATA_UNSEEN_CONSUMER_TREATMENT": "PRIVATE-UNKNOWN-SENTINEL"}, clear=True):
+                    result = case.invoke_selected(mutate)
+                self.assertTrue(bench.acceptance_final_predicate(result))
+                self.assertTrue(result["worker_complete"])
+                self.assertFalse(result["normal_comparison"]["eligible"])
+                self.assertFalse(result["normal_comparison"]["complete"])
+                self.assertNotIn("PRIVATE", json.dumps(result))
+            finally:
+                case.doCleanups()
+
+    def test_selected_consumer_retains_successful_unknown_and_normal_environment_outcomes(self):
+        for mode in ("normal", "inherited-unknown", "explicit-unknown"):
+            case = ContainedLifecycleTests()
+            case.setUp()
+            try:
+                unknown = mode != "normal"
+                environment = {"STRATA_VERIFY_QDEDUP": "1"}
+                if mode == "inherited-unknown":
+                    environment["STRATA_UNSEEN_LATER_CONTROL"] = "0"
+                elif mode == "explicit-unknown":
+                    cfg = json.loads(case.config.read_text())
+                    cfg["env"] = {"STRATA_UNSEEN_LATER_CONTROL": ""}
+                    case.config.write_text(json.dumps(cfg))
+                with patch.dict(bench.os.environ, environment, clear=True):
+                    result = case.invoke_selected()
+                self.assertTrue(bench.acceptance_final_predicate(result))
+                self.assertTrue(result["worker_complete"])
+                self.assertTrue(result["normal_comparison"]["complete"])
+                self.assertEqual(result["normal_comparison"]["eligible"], not unknown)
+                self.assertEqual(json.loads((case.output / "lifecycle.json").read_text())["status"], "held")
+            finally:
+                case.doCleanups()
+        self.assertFalse(bench.acceptance_ready())
+        self.assertFalse(bench.acceptance_protection(None))
+        with self.assertRaisesRegex(RuntimeError, "not implemented"):
+            bench.acceptance_preflight(None)
 
 
 if __name__ == "__main__":

@@ -100,13 +100,57 @@ ACCEPTANCE_ARTIFACT_LIMIT = 8 * 1024**2
 ACCEPTANCE_SECONDS = 900
 CLEANUP_SECONDS = 10
 PROFILE_ENV = {"STRATA_VERIFY_PROFILE", "STRATA_DECODE_TIMING", "STRATA_FETCH_PROFILE"}
+# Modes follow the actual getenv/environ consumers, not the spelling of a control.
+DIAGNOSTIC_ENV = dict.fromkeys((
+    "STRATA_VERIFY_PROFILE", "STRATA_DECODE_TIMING", "STRATA_SPLIT_TIMING", "STRATA_TRACE",
+    "STRATA_POOL_TRACE", "STRATA_RSS_TRACE", "STRATA_TRACE_ADAPT", "STRATA_VERIFY_DEBUG",
+    "STRATA_DRAFT_TIMING", "STRATA_PREFILL_TIMING", "STRATA_LOGPOS", "STRATA_DUMP_FIRST_LOGITS",
+    "STRATA_VERIFY_ARENA", "STRATA_DBG_NAN", "STRATA_IDX_FP16_CHECK", "STRATA_QSA_DUMP",
+    "STRATA_PREFILL_DUMP_R", "STRATA_PREFILL_DUMP_R_ALL", "STRATA_STATE_HASH", "STRATA_STATE_HASH_GDN",
+    "STRATA_SNAPSHOT_VERIFY", "STRATA_VERIFY_NODES", "STRATA_DBG_FEAT",
+    "STRATA_DBG_ROUTE_OVERRIDE", "STRATA_DBG_CPU_GATE", "STRATA_LAYER_SPLIT_GATE"), "presence")
+DIAGNOSTIC_ENV.update({"STRATA_BATCH_TRACE": "nonempty", "STRATA_DEBUG": "nonempty",
+    "STRATA_REQUEST_LINES": "server-log", "STRATA_LOGPOS_EXTRA": "logpos", "STRATA_LOGPOS_TOPK": "logpos",
+    "STRATA_QSA_DUMP_LAST": "qsa", "STRATA_HC_UPMIX_CHECK": "positive", "STRATA_CVEC_FUSE_CHECK": "positive",
+    "STRATA_FETCH_PROFILE": "one", "STRATA_FILE_COPY_STATS": "one", "STRATA_IO_STATS": "atoi",
+    "STRATA_PREFILL_DEMAND_STATS": "first-one", "STRATA_DBG_GDN": "first-one",
+    "STRATA_DBG_FORCE_SLOW_LAYER": "first-one", "STRATA_DBG_FEAT_LAYERS": "feature",
+    "STRATA_TEST_PAGEABLE": "first-one", "STRATA_TEST_CACHE_FAIL": "positive",
+    "STRATA_FS_VERIFY": "positive",
+    "STRATA_TEST_VERIFY_STALL": "positive",
+    "STRATA_VERIFY_TRACE": "nonzero",
+    "STRATA_PIPELINE_LOG": "pipeline", "STRATA_PIPELINE_TRACE": "pipeline",
+    "STRATA_PIPELINE_FORCE_MISS": "pipeline-positive", "CUDA_LAUNCH_BLOCKING": "atoi"})
+DIAGNOSTIC_GATES = {"STRATA_PIPELINE_DEBUG", "STRATA_VERIFY_DEVICE_PLAN", "STRATA_VERIFY_QDEDUP",
+                    "STRATA_VERIFY_COHERENT", "STRATA_VERIFY_ALL_RESIDENT"}  # Preserve optimization selections.
+ACCEPTANCE_ENV = set(DIAGNOSTIC_ENV) | {"CUDA_MODULE_LOADING", "STRATA_FILE_COPY_READY"}
 EVIDENCE_ENV = PROFILE_ENV | {
     "STRATA_RESIDENT_HEADROOM_GIB", "STRATA_FILE_CACHE_MIB", "STRATA_FILE_CACHE_COMPACT", "STRATA_FILE_DIRECT_UNMAP",
     "STRATA_KV_GROW", "STRATA_ARENA_PIN_GIB", "STRATA_PARTIAL_PIN_GIB", "STRATA_PARTIAL_PIN",
     "STRATA_UNBUFFERED_LOAD", "STRATA_FILE_RELEASE", "STRATA_DEC_BATCH", "STRATA_DEFERRED_REGISTER",
     "STRATA_OWNED_PRICE", "STRATA_FETCH_PVM",
 }
+# Source-reviewed tuning/treatment names, independently of the evidence projection.
+# generate.cpp: host/cache budgets, KV growth, pin cap, pricing, pipeline gate/theta;
+# expert_source.cpp: file I/O/release/ready-copy, partial pin, batching/registration;
+# verify.cpp: device planning, quantization reuse and coherent/resident placement.
+# Review means tuning rather than diagnostic instrumentation, not runtime admission
+# or permission to pool different treatments. New names are unclassified by default.
+NORMAL_ENV = {
+    "STRATA_RESIDENT_HEADROOM_GIB", "STRATA_FILE_CACHE_MIB", "STRATA_FILE_CACHE_COMPACT",
+    "STRATA_FILE_DIRECT_UNMAP", "STRATA_KV_GROW", "STRATA_ARENA_PIN_GIB",
+    "STRATA_PARTIAL_PIN_GIB", "STRATA_PARTIAL_PIN", "STRATA_UNBUFFERED_LOAD",
+    "STRATA_FILE_RELEASE", "STRATA_DEC_BATCH", "STRATA_DEFERRED_REGISTER", "STRATA_OWNED_PRICE",
+    "STRATA_FETCH_PVM", "STRATA_FILE_COPY_READY", "STRATA_PIPELINE_DEBUG", "STRATA_PIPELINE_THETA",
+    "STRATA_VERIFY_DEVICE_PLAN", "STRATA_VERIFY_QDEDUP", "STRATA_VERIFY_COHERENT",
+    "STRATA_VERIFY_ALL_RESIDENT", "CUDA_MODULE_LOADING",
+}
+NORMAL_CONTROL_LIMIT = 128
+NORMAL_ENVIRONMENT_LIMIT = 64 * 1024
+NORMAL_SCOPE = "STRATA_*; CUDA_MODULE_LOADING; CUDA_LAUNCH_BLOCKING"
 LONG_TARGET = CONTEXT - 192
+SUSTAINED_TARGET = 128000
+RETRIEVAL_CODES = ["field-cedar-284", "marble-finch-693", "cove-lantern-517"]
 HELD_OUT = (
     ("python-aliasing", "Trace this Python code: rows = [[0]] * 3; rows[1].append(7). "
      "Reply only with FINAL: followed by the resulting JSON value of rows. Do not include an explanation.",
@@ -175,16 +219,30 @@ def load_workload(name):
     return module
 
 
-def clean_environment(cfg, timing, fetch_timing=False):
+def clean_environment(cfg, timing, fetch_timing=False, *, acceptance=False, inherited=None):
     """Disable inherited profiling and make server/client use the same saved API key."""
     cfg = copy.deepcopy(cfg)
-    excluded = PROFILE_ENV | {"STRATA_API_KEY"}
-    env = {k: v for k, v in os.environ.items() if k.upper() not in excluded}
-    cfg["env"] = {k: v for k, v in cfg.get("env", {}).items() if k.upper() not in excluded}
+    excluded = (ACCEPTANCE_ENV if acceptance else PROFILE_ENV) | {"STRATA_API_KEY"}
+    inherited = os.environ if inherited is None else inherited
+    env = {k: v for k, v in inherited.items() if k.upper() not in excluded}
+    saved_excluded = {"STRATA_API_KEY"} if acceptance else excluded
+    cfg["env"] = {k: v for k, v in cfg.get("env", {}).items() if k.upper() not in saved_excluded}
+    if acceptance:
+        # Explicit treatments remain explicit; only an unselected inherited treatment is removed.
+        names = {key.upper() if os.name == "nt" else key for key in cfg["env"]}
+        for key, value in (("CUDA_MODULE_LOADING", "EAGER"), ("STRATA_FILE_COPY_READY", "0")):
+            if key not in names:
+                cfg["env"][key] = value
     if timing:
         cfg["env"]["STRATA_DECODE_TIMING"] = "1"
     if fetch_timing:
         cfg["env"]["STRATA_FETCH_PROFILE"] = "1"
+    if acceptance:
+        # These controls are consumed by the server itself, before child_env runs.
+        for key, value in cfg["env"].items():
+            name = key.upper() if os.name == "nt" else key
+            if name in {"STRATA_BATCH_TRACE", "STRATA_DEBUG", "STRATA_REQUEST_LINES"}:
+                env[name] = str(value)
     return cfg, env
 
 
@@ -194,15 +252,174 @@ def file_identity(path):
     return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
 
 
-def safe_engine_environment(cfg, inherited):
+def executable_provenance(exe, metadata):
+    """A matching receipt records a build claim; current checkout HEAD is never inferred."""
+    result = {"executable": file_identity(exe), "source_provenance": "source-unproven",
+              "build_receipt": None, "build_claim": None}
+    if metadata is not None and metadata.is_file():
+        if metadata.stat().st_size > ACCEPTANCE_LOG_LIMIT:
+            raise ValueError("Build receipt exceeds its evidence budget.")
+        receipt = json.loads(metadata.read_text(encoding="utf-8-sig"))
+        if receipt.get("sha256") != result["executable"]["sha256"]:
+            raise ValueError("Build receipt does not match the selected executable.")
+        result["build_receipt"] = file_identity(metadata)
+        result["build_claim"] = {key: receipt.get(key) for key in ("commit", "version", "src", "ggml")}
+        result["source_provenance"] = "matching receipt claim; current source/dependency admission still required"
+    return result
+
+
+def protection_snapshot(paths):
+    rows = []
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("A protected input is missing or is a symbolic link.")
+        rows.append(file_identity(path))
+    return rows
+
+
+def safe_engine_environment(cfg, inherited, *, acceptance=False):
     """Record allowed controls from both actual environment layers, with config taking precedence."""
     from serve.server import config_environment
     effective = {}
+    allowed = EVIDENCE_ENV | ACCEPTANCE_ENV | DIAGNOSTIC_GATES if acceptance else EVIDENCE_ENV
     for key, value in config_environment(cfg, inherited).items():
         name = key.upper() if os.name == "nt" else key
-        if name in EVIDENCE_ENV:
+        if name in allowed:
             effective[name] = value
     return effective
+
+
+def active_diagnostics(environment, *, server_log=False, backend=None):
+    def atoi_active(value, *, positive=False):
+        match = re.match(r"\s*([+-]?[0-9]+)", value)
+        if match is None:
+            return False
+        number = int(match[1])
+        # Out-of-range C atoi is not portable evidence of an inactive diagnostic.
+        return not -(2**31) <= number < 2**31 or (number > 0 if positive else number != 0)
+
+    def active(name):
+        if name not in environment:
+            return False
+        value, mode = environment[name], DIAGNOSTIC_ENV[name]
+        if mode == "presence":
+            return True
+        if mode == "one":
+            return value == "1"
+        if mode == "first-one":
+            return bool(value) and value[0] == "1"
+        if mode == "nonempty":
+            return bool(value)
+        if mode == "server-log":
+            return bool(value) and server_log
+        if mode == "pipeline":
+            gate = environment.get("STRATA_PIPELINE_DEBUG", "")
+            return bool(gate) and gate[0] != "0"
+        if mode == "pipeline-positive":
+            gate = environment.get("STRATA_PIPELINE_DEBUG", "")
+            return bool(gate) and gate[0] != "0" and atoi_active(value, positive=True)
+        if mode in ("logpos", "qsa"):
+            return ("STRATA_LOGPOS" if mode == "logpos" else "STRATA_QSA_DUMP") in environment
+        if mode == "feature":
+            return "STRATA_DBG_FEAT" in environment or "STRATA_DBG_ROUTE_OVERRIDE" in environment
+        if mode in ("positive", "atoi"):
+            if name == "CUDA_LAUNCH_BLOCKING" and backend == "hip":
+                return False
+            return atoi_active(value, positive=mode == "positive")
+        return bool(value) and value[0] != "0"
+    return [name for name in DIAGNOSTIC_ENV if active(name)]
+
+
+def diagnostic_environment(environment, *, server_log=False, backend=None):
+    return bool(active_diagnostics(environment, server_log=server_log, backend=backend))
+
+
+def normal_comparison_excluded(reason):
+    return {"schema": 1, "complete": False, "eligible": False, "controls": [],
+            "scope": NORMAL_SCOPE, "name_semantics": "windows" if os.name == "nt" else "posix",
+            "environment_sha256": None, "exclusions": [{"reason": reason}]}
+
+
+def normal_comparison_environment(cfg, inherited, *, server_log=False):
+    """Classify the full composed control environment; never export unknown names/values.
+
+    The digest binds a sorted JSON array of original name/value string pairs, not
+    semantic review, actual native consumption, allocations or operational admission.
+    """
+    from serve.server import config_environment
+    environment = config_environment(cfg, inherited)
+    if len(environment) > 4096:
+        return normal_comparison_excluded("environment-limit")
+    pairs, effective, size = [], {}, 0
+    for key, value in environment.items():
+        if type(key) is not str or type(value) is not str:
+            return normal_comparison_excluded("invalid-environment")
+        name = key.upper() if os.name == "nt" else key
+        if not name.startswith("STRATA_") and name not in {"CUDA_MODULE_LOADING", "CUDA_LAUNCH_BLOCKING"}:
+            continue  # Ordinary names such as Windows ProgramFiles(x86) are outside the scope.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key) is None or "\0" in value:
+            return normal_comparison_excluded("invalid-environment")
+        # Bound before encoding/parsing, including diagnostic integer prefixes.
+        if len(value) > 4096 or len(pairs) >= NORMAL_CONTROL_LIMIT:
+            return normal_comparison_excluded("control-inventory-limit")
+        size += len(key.encode("utf-8")) + len(value.encode("utf-8", errors="surrogatepass"))
+        if size > NORMAL_ENVIRONMENT_LIMIT:
+            return normal_comparison_excluded("control-inventory-limit")
+        pairs.append([key, value])
+        if name in effective and effective[name] != value:
+            return normal_comparison_excluded("ambiguous-windows-alias")
+        effective[name] = value
+    active = set(active_diagnostics(effective, server_log=server_log, backend=cfg.get("backend")))
+    controls, exclusions = [], []
+    for name in sorted(effective):
+        if name in DIAGNOSTIC_ENV:
+            item = {"control": name, "kind": "diagnostic", "active": name in active}
+            if item["active"]:
+                exclusions.append({"reason": "active-diagnostic", "control": name})
+        elif name in NORMAL_ENV:
+            item = {"control": name, "kind": "reviewed-normal"}
+        else:
+            identifier = "sha256:" + hashlib.sha256(name.encode("utf-8")).hexdigest()
+            item = {"control": identifier, "kind": "unclassified"}
+            exclusions.append({"reason": "unclassified-control", "control": identifier})
+        controls.append(item)
+    return {"schema": 1, "complete": True, "eligible": not exclusions,
+            "scope": NORMAL_SCOPE, "name_semantics": "windows" if os.name == "nt" else "posix",
+            "controls": controls, "environment_sha256": json_digest(sorted(pairs)), "exclusions": exclusions}
+
+
+def consume_normal_comparison(record, cfg, inherited, *, server_log=False):
+    """Recompute from independently supplied inputs; old/partial/mutated records fail closed.
+
+    This consumes environment classification only. Workload and lifecycle outcomes
+    retain their own predicates, including for useful diagnostic/UNKNOWN records.
+    """
+    if type(record) is not dict:
+        return normal_comparison_excluded("missing-or-inconsistent-classification")
+    expected = normal_comparison_environment(cfg, inherited, server_log=server_log)
+    observed = record.get("normal_comparison")
+    def same(actual, wanted):
+        # Traverse only the bounded expected shape, never serialize untrusted data.
+        if type(actual) is not type(wanted):
+            return False
+        if type(wanted) is dict:
+            return actual.keys() == wanted.keys() and all(same(actual[key], value) for key, value in wanted.items())
+        if type(wanted) is list:
+            return len(actual) == len(wanted) and all(same(a, b) for a, b in zip(actual, wanted))
+        return actual == wanted
+    if not same(observed, expected):
+        return normal_comparison_excluded("missing-or-inconsistent-classification")
+    return expected
+
+
+def json_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def message_identity(message):
+    return {"role": message["role"], "characters": len(message["content"]),
+            "content_sha256": hashlib.sha256(message["content"].encode("utf-8")).hexdigest(),
+            "message_sha256": json_digest(message)}
 
 
 def source_identity(deadline=None):
@@ -380,6 +597,301 @@ def long_context_tests(validation, client, record, save):
     save()
     if not record["long_context_passed"]:
         raise RuntimeError("Long-context reuse validation failed; inspect saved checks.")
+
+
+def acceptance_selection(args):
+    """Keep the historical fit test and each acceptance workload separate."""
+    context = getattr(args, "expected_context", CONTEXT)
+    if type(context) is not int or context not in (65536, CONTEXT):
+        raise ValueError("Expected context must be 65536 or 131072.")
+    selection = getattr(args, "acceptance_workload", None)
+    cohort = getattr(args, "cohort", None)
+    if selection is None:
+        if (cohort is not None or getattr(args, "candidate_exe", None) is not None
+                or getattr(args, "protect_input", [])):
+            raise ValueError("Cohort, executable and protection controls require an explicit acceptance workload.")
+        if getattr(args, "long_context", False) and context != CONTEXT:
+            raise ValueError("The historical clipped-fit test requires 131072 context.")
+        return None, context
+    if selection not in ("short", "near-full"):
+        raise ValueError("Unknown acceptance workload.")
+    if not getattr(args, "acceptance_telemetry", False) and getattr(args, "_acceptance_deadline", None) is None:
+        raise ValueError("Acceptance workloads require --acceptance-telemetry and the contained worker.")
+    if cohort not in ("saved-static", "automatic", "frozen-control"):
+        raise ValueError("Acceptance workloads require an explicit cohort.")
+    if any(getattr(args, name, False) for name in (
+            "smoke", "smoke_only", "held_out", "transfer_workload", "long_context", "validation_only")):
+        raise ValueError("Select the short or near-full workload without other workload switches.")
+    if getattr(args, "idle_seconds", 0):
+        raise ValueError("Acceptance workloads use their own final 30-second resident idle.")
+    if selection == "near-full" and (context != CONTEXT or cohort != "automatic"):
+        raise ValueError("Near-full acceptance requires the automatic 131072-context cohort.")
+    return selection, context
+
+
+def acceptance_case_specs(selection):
+    def case(label, tokens, expected=None, minimum=1, fresh=False, cached_from=None, target=None):
+        return {"case": label, "tokens": tokens, "expected": copy.deepcopy(expected), "minimum": minimum,
+                "fresh": fresh, "cached_from": cached_from, "target": target}
+    if selection == "short":
+        rows = [case("startup-exact", 32, [391]), case("short-exact", 32, [391]),
+                case("short-cached-followup", 32, [400], cached_from="short-exact")]
+        for index in range(1, 4):
+            label = f"sustained-{index}"
+            rows += [case(label, 512, minimum=512), case(label + "-followup", 32, [133], cached_from=label)]
+        return rows + [case("2k-fresh", 128, RETRIEVAL_CODES, fresh=True, target=2048),
+                       case("2k-cached", 128, [RETRIEVAL_CODES[2], 391], cached_from="2k-fresh")]
+    if selection == "near-full":
+        return [case("near-full-fresh", 2048, RETRIEVAL_CODES, fresh=True, target=SUSTAINED_TARGET),
+                case("near-full-cached", 128, [RETRIEVAL_CODES[2], 391], cached_from="near-full-fresh"),
+                case("near-full-sustained", 2048, minimum=512, fresh=True, target=SUSTAINED_TARGET)]
+    raise ValueError("Unknown acceptance workload.")
+
+
+def acceptance_case_checks(spec, count, response, context, prior_count=None, metric=None):
+    if type(count) is not int or count <= 0:
+        raise ValueError("Invalid encoded prompt count.")
+    text = response["choices"][0]["message"].get("content") or ""
+    usage, timings = response["usage"], response["timings"]
+    generated, cached, read = usage["completion_tokens"], timings.get("cache_n"), timings.get("prompt_n")
+    metric = metric or {}
+    checks = {"nonempty": bool(text.strip()),
+              "successful_finish": metric.get("finish") in ("stop", "length")
+              and metric["finish"] == response["choices"][0].get("finish_reason"),
+              "output_room": count + spec["tokens"] + 8 <= context,
+              "full_history_retained": type(usage["prompt_tokens"]) is int and usage["prompt_tokens"] == count,
+              "completion_length": type(generated) is int and spec["minimum"] <= generated <= spec["tokens"],
+              "engine_prompt_accounting": type(cached) is int and type(read) is int
+              and cached >= 0 and read >= 0 and cached + read == count,
+              "native_token_accounting": type(metric.get("prompt_total")) is int
+              and metric["prompt_total"] == count and type(metric.get("prompt_read")) is int
+              and metric["prompt_read"] == read and type(metric.get("engine_generated")) is int
+              and generated <= metric["engine_generated"] <= spec["tokens"]}
+    if spec["expected"] is not None:
+        checks["exact_answer"] = exact_answer(text, spec["expected"])
+    if spec["fresh"]:
+        checks["fresh_prefill"] = cached == 0 and read == count
+    if spec["target"] is not None:
+        checks["target_count"] = abs(count - spec["target"]) <= (256 if spec["target"] == SUSTAINED_TARGET else 16)
+    if spec["cached_from"]:
+        prefix = max(1, prior_count - 1024) if spec["cached_from"].endswith("-fresh") else 1
+        checks["prefix_cache_used"] = type(cached) is int and cached >= prefix
+    return checks
+
+
+def acceptance_request(client, record, save, count_prompt, label, messages):
+    spec = next(item for item in acceptance_case_specs(record["acceptance_workload"]) if item["case"] == label)
+    tokens, expected, minimum_output = spec["tokens"], spec["expected"], spec["minimum"]
+    count = count_prompt(messages)
+    context = record["expected_max_context"]
+    if type(count) is not int or count <= 0 or count + tokens + 8 > context:
+        raise RuntimeError("Acceptance request lacks its requested output room: " + label)
+    client.label = label
+    response = client.chat(messages, tokens, temperature=0,
+                           chat_template_kwargs={"enable_thinking": False})
+    rows = record.setdefault("acceptance_cases", [])
+    prior_count = next((row["local_prompt_tokens"] for row in rows if row["case"] == spec["cached_from"]), None)
+    checks = acceptance_case_checks(spec, count, response, context, prior_count, record["requests"][-1]["metric"])
+    rows.append({"case": label, "local_prompt_tokens": count, "requested_max_tokens": tokens,
+                 "minimum_completion_tokens": minimum_output, "expected": expected,
+                 "checks": checks, "passed": all(checks.values()), "response": response,
+                 "metric": record["requests"][-1]["metric"],
+                 "messages_sha256": record["requests"][-1]["messages_sha256"]})
+    record["acceptance_workload_passed"] = False
+    record["acceptance_summary"] = summarize(rows)
+    save()
+    if not rows[-1]["passed"]:
+        raise RuntimeError("Acceptance workload check failed: " + label)
+    return response, count
+
+
+def acceptance_retrieval(validation, client, record, save, count_prompt, target):
+    messages, codes, generated_count = validation.long_messages(client.cfg, target)
+    count = count_prompt(messages)
+    tolerance = 256 if target == SUSTAINED_TARGET else 16
+    if (codes != RETRIEVAL_CODES or type(count) is not int or type(generated_count) is not int or count != generated_count
+            or abs(count - target) > tolerance):
+        raise RuntimeError("Tokenizer/template-aware retrieval did not reach its target.")
+    label = "near-full" if target == SUSTAINED_TARGET else "2k"
+    response, _ = acceptance_request(client, record, save, count_prompt, label + "-fresh", messages)
+    history = copy.deepcopy(messages) + [copy.deepcopy(response["choices"][0]["message"]),
+        {"role": "user", "content":
+         "Recall the LABEL3 code and calculate 17 times 23. Reply with the code and integer only."}]
+    acceptance_request(client, record, save, count_prompt, label + "-cached", history)
+    return messages
+
+
+def acceptance_idle(guard, record, save):
+    record["final_idle"] = {"required_seconds": 30, "started_monotonic": time.monotonic(),
+                            "completed": False}
+    save()
+    end = record["final_idle"]["started_monotonic"] + 30
+    while time.monotonic() < end:
+        guard.check()
+        guard.done.wait(min(0.25, max(0, end - time.monotonic())))
+    guard.check()
+    record["final_idle"]["finished_monotonic"] = time.monotonic()
+    record["final_idle"]["completed"] = True
+    save()
+
+
+def acceptance_workload_tests(validation, client, record, save, guard):
+    """The original eleven-request sequence or a separate full-context sequence."""
+    record["acceptance_workload_passed"] = False
+    count_prompt = prompt_counter(client.cfg)
+    if record["acceptance_workload"] == "short":
+        startup = [{"role": "user", "content": "Calculate 17 times 23. Reply with the integer only."}]
+        acceptance_request(client, record, save, count_prompt, "startup-exact", startup)
+        response, _ = acceptance_request(client, record, save, count_prompt, "short-exact", startup)
+        acceptance_request(client, record, save, count_prompt, "short-cached-followup",
+            startup + [response["choices"][0]["message"], {"role": "user", "content":
+                "Add 9 to that result. Reply with the integer only."}])
+        for index in range(3):
+            messages = [{"role": "user", "content":
+                f"Case {index + 1}: Write a very long numbered tutorial about database transactions, isolation, "
+                "indexes and recovery. Continue for at least 1500 words without concluding; give detailed examples."}]
+            response, _ = acceptance_request(client, record, save, count_prompt, f"sustained-{index + 1}",
+                                              messages)
+            acceptance_request(client, record, save, count_prompt, f"sustained-{index + 1}-followup",
+                messages + [response["choices"][0]["message"], {"role": "user", "content":
+                    "Calculate 19 times 7. Reply with the integer only."}])
+        acceptance_retrieval(validation, client, record, save, count_prompt, 2048)
+    else:
+        acceptance_retrieval(validation, client, record, save, count_prompt, SUSTAINED_TARGET)
+        # A different first system message prevents reuse of the retrieval request. Recount
+        # the complete chat after changing the task; never assume the generator's old count.
+        messages, _, _ = validation.long_messages(client.cfg, SUSTAINED_TARGET)
+        messages = copy.deepcopy(messages)
+        messages[0] = {"role": "system", "content":
+            "Independent sustained generation test. Treat the reference as background data. "
+            "Follow the final writing task, with a detailed answer rather than a list of retrieval codes."}
+        messages[-1]["content"] += (
+            "\n\nFinal writing task: Write a very long numbered technical tutorial about database transactions, "
+            "isolation, indexes and recovery with detailed examples. Continue for at least 1500 words.")
+        count = count_prompt(messages)
+        if type(count) is not int or abs(count - SUSTAINED_TARGET) > 256:
+            raise RuntimeError("Sustained full-chat prompt is outside 128000 +/-256 tokens.")
+        acceptance_request(client, record, save, count_prompt, "near-full-sustained", messages)
+    acceptance_idle(guard, record, save)
+    record["acceptance_workload_passed"] = True
+    save()
+
+
+def validate_selected_workload(record, args, deadline):
+    """Independently consume the worker's complete selected evidence, not its aggregate flag."""
+    def require(condition, message):
+        if not condition:
+            raise ValueError("Selected workload evidence: " + message)
+    def digest(value):
+        return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    def number(value):
+        return valid_number(value) and value >= 0
+    try:
+        selection, context = acceptance_selection(args)
+        specs = acceptance_case_specs(selection)
+        require(record["acceptance_workload"] == selection and record["cohort"] == args.cohort
+                and type(record["expected_max_context"]) is int and record["expected_max_context"] == context,
+                "selection/cohort/context differs")
+        require(record["acceptance_workload_passed"] is True and record["missing_evidence"] == [], "work remains held")
+        cases, requests = record["acceptance_cases"], record["requests"]
+        require(type(cases) is list and type(requests) is list and len(cases) == len(specs) == len(requests),
+                "case/request sequence is incomplete")
+        prior = {}
+        last_time = previous_finish = None
+        for spec, row, request in zip(specs, cases, requests):
+            label = spec["case"]
+            require(row["case"] == request["label"] == label, "wrong, duplicated or unordered case")
+            require(type(row["requested_max_tokens"]) is int and type(request["max_tokens"]) is int
+                    and row["requested_max_tokens"] == request["max_tokens"] == spec["tokens"]
+                    and type(row["minimum_completion_tokens"]) is int
+                    and row["minimum_completion_tokens"] == spec["minimum"]
+                    and row["expected"] == spec["expected"], "case specification differs")
+            require(row["response"] == request["response"] and row["metric"] == request["metric"]
+                    and not request.get("error"), "request/case payload differs")
+            response, metric = row["response"], row["metric"]
+            matched_metric(response, {"totals": {"requests": 0}, "requests": []},
+                           {"totals": {"requests": 1}, "requests": [metric]})
+            require(last_time is None or metric["time"] > last_time, "request association is not ordered/unique")
+            last_time = metric["time"]
+            previous = prior.get(spec["cached_from"])
+            checks = acceptance_case_checks(spec, row["local_prompt_tokens"], response, context,
+                                            previous[0]["local_prompt_tokens"] if previous else None, metric)
+            require(type(row["checks"]) is dict and all(type(value) is bool for value in row["checks"].values())
+                    and row["checks"] == checks and all(checks.values()) and row["passed"] is True,
+                    "case checks/data/outcome failed")
+            text = response["choices"][0]["message"]["content"]
+            require(type(text) is str and len(response["choices"]) == 1
+                    and response["choices"][0]["message"]["role"] == "assistant"
+                    and response["choices"][0]["finish_reason"] in ("stop", "length"), "malformed returned assistant message")
+            require(digest(request["output_sha256"])
+                    and request["output_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest(), "output digest differs")
+            require(digest(request["messages_sha256"]) and row["messages_sha256"] == request["messages_sha256"],
+                    "message identity differs")
+            first, wall = request["first_content_seconds"], request["client_wall_seconds"]
+            start, finish = request["started_monotonic"], request["finished_monotonic"]
+            require(all(number(value) for value in (first, wall, start, finish, request["request_wall_seconds"]))
+                    and number(response["first_token_s"]) and number(response["wall_seconds"])
+                    and number(request["started_unix"]) and number(request["finished_unix"])
+                    and request["started_unix"] <= request["finished_unix"]
+                    and wall > 0 and first <= wall + 0.001 and start <= finish <= deadline
+                    and (previous_finish is None or start >= previous_finish)
+                    and abs(request["request_wall_seconds"] - (finish - start)) <= 0.000001
+                    and wall <= finish - start + 0.001
+                    and response["first_token_s"] == first and response["wall_seconds"] == wall,
+                    "request clocks are incomplete/inconsistent")
+            previous_finish = finish
+            require(type(request["actual_completion_tokens"]) is int
+                    and request["actual_completion_tokens"] == response["usage"]["completion_tokens"]
+                    and type(request["cached_tokens"]) is int and request["cached_tokens"] == response["timings"]["cache_n"]
+                    and metric["reused"] == request["cached_tokens"]
+                    and number(metric["prompt_ms"]) and abs(metric["prompt_ms"] - response["timings"]["prompt_ms"]) <= 0.11,
+                    "request counts/timing differ")
+            messages = request["message_digests"]
+            require(type(messages) is list and len(messages) >= 1, "message evidence missing")
+            for message in messages:
+                require(message["role"] in ("system", "user", "assistant") and type(message["characters"]) is int
+                        and message["characters"] >= 0 and digest(message["content_sha256"])
+                        and digest(message["message_sha256"]), "malformed message identity")
+            if previous:
+                old_row, old_request = previous
+                assistant = old_row["response"]["choices"][0]["message"]
+                require(len(messages) == len(old_request["message_digests"]) + 2
+                        and messages[:-2] == old_request["message_digests"]
+                        and messages[-2] == message_identity(assistant)
+                        and messages[-1]["role"] == "user", "returned history was not retained")
+            if label == "near-full-sustained":
+                require(messages[0] != prior["near-full-fresh"][1]["message_digests"][0], "sustained prompt was not separate")
+            prior[label] = row, request
+        summary = summarize(cases)
+        require(record["acceptance_summary"] == summary and all(
+            type(record["acceptance_summary"][key]) is type(value) for key, value in summary.items()),
+            "aggregate summary differs from actual cases")
+        require(type(record["metrics"]["totals"]["requests"]) is int
+                and record["metrics"]["totals"]["requests"] == len(requests), "final request total differs")
+        idle = record["final_idle"]
+        require(type(idle["required_seconds"]) is int and idle["required_seconds"] == 30 and idle["completed"] is True
+                and number(idle["started_monotonic"]) and number(idle["finished_monotonic"])
+                and requests[-1]["finished_monotonic"] <= idle["started_monotonic"]
+                and idle["finished_monotonic"] - idle["started_monotonic"] >= 30
+                and idle["finished_monotonic"] <= deadline, "final idle failed")
+        protection = record["protection"]
+        require(protection["unchanged"] is True and type(protection["before"]) is list
+                and len(protection["before"]) > 0 and protection["before"] == protection["after"], "protection differs")
+        paths = []
+        for item in protection["before"]:
+            require(type(item["path"]) is str and Path(item["path"]).is_absolute() and type(item["bytes"]) is int
+                    and item["bytes"] >= 0 and digest(item["sha256"]), "protection identity malformed")
+            paths.append(item["path"])
+        selected_paths = {args.config.resolve(), Path(record["exe"]).resolve()}
+        selected_paths.update(Path(path).resolve() for path in getattr(args, "protect_input", []))
+        require(len(paths) == len(set(map(Path, paths))) and selected_paths <= set(map(Path, paths)),
+                "protected inputs are incomplete/duplicated")
+        require(record["config"] == str(args.config.resolve()) and digest(record["exe_sha256"])
+                and next(item["sha256"] for item in protection["before"] if item["path"] == record["exe"]) == record["exe_sha256"],
+                "consumed executable/config identity differs")
+        return True
+    except (KeyError, TypeError, ValueError, IndexError, StopIteration, AttributeError, RuntimeError, OverflowError) as exc:
+        raise ValueError("Selected workload evidence refused: " + str(exc)) from None
 
 
 def redact(value, secret):
@@ -954,18 +1466,71 @@ def replace_result(pending, destination):
             time.sleep(0.05 * (attempt + 1))
 
 
-def matched_metric(response, before, after):
-    old = {row["time"] for row in before.get("requests", [])}
-    new = [row for row in after.get("requests", []) if row["time"] not in old]
-    if after["totals"]["requests"] - before["totals"]["requests"] != 1 or len(new) != 1:
-        raise RuntimeError("Could not uniquely match this response to one new request metric.")
-    metric = new[0]
-    usage, timings = response["usage"], response["timings"]
-    if (metric["output_tokens"] != usage["completion_tokens"]
-            or metric["prompt_tokens"] != usage["prompt_tokens"]
-            or abs(metric["decode_ms"] - timings["predicted_ms"]) > 0.11):
-        raise RuntimeError("New request metric does not agree with the response usage/timing.")
-    return metric
+def matched_metric(response, before, after, *, record=None):
+    try:
+        totals = [item["totals"]["requests"] for item in (before, after)]
+        if any(type(value) is not int or value < 0 for value in totals):
+            raise ValueError("Invalid request totals.")
+        rows = [row for item in (before, after) for row in item.get("requests", [])]
+        if any(not valid_number(row["time"]) or row["time"] < 0 for row in rows):
+            raise ValueError("Invalid request association time.")
+        old = {row["time"] for row in before.get("requests", [])}
+        new = [row for row in after.get("requests", []) if row["time"] not in old]
+        if totals[1] - totals[0] != 1 or len(new) != 1:
+            raise RuntimeError("Could not uniquely match this response to one new request metric.")
+        metric = new[0]
+        if record is not None:
+            record["metric"] = metric  # Retain uniquely associated invalid evidence on controlled refusal.
+        usage, timings = response["usage"], response["timings"]
+        for owner, keys in ((usage, ("prompt_tokens", "completion_tokens")),
+                            (metric, ("prompt_tokens", "output_tokens"))):
+            if any(type(owner[key]) is not int or owner[key] < 0 for key in keys):
+                raise ValueError("Invalid request token count.")
+        for owner, key in ((metric, "decode_ms"), (timings, "predicted_ms")):
+            if not valid_number(owner[key]) or owner[key] < 0:
+                raise ValueError("Invalid request timing.")
+        for owner, keys, integer in ((metric, ("prompt_ms",), False),
+                (timings, ("prompt_ms",), False),
+                (metric, ("reused", "engine_generated", "prompt_read", "prompt_total"), True),
+                (timings, ("cache_n", "prompt_n", "predicted_n"), True)):
+            for key in keys:
+                if owner is metric and key in ("reused", "engine_generated", "prompt_read", "prompt_total") \
+                        and owner.get(key) is None:
+                    continue  # Older engines explicitly report unavailable native counters as null.
+                if key in owner and (not valid_number(owner[key]) or owner[key] < 0
+                                     or (integer and type(owner[key]) is not int)):
+                    raise ValueError("Invalid request count/timing: " + key)
+        pairs = [(metric["output_tokens"], usage["completion_tokens"], 0),
+                 (metric["prompt_tokens"], usage["prompt_tokens"], 0),
+                 (metric["decode_ms"], timings["predicted_ms"], 0.11)]
+        for left, right in (("prompt_ms", "prompt_ms"), ("reused", "cache_n")):
+            if metric.get(left) is not None and timings.get(right) is not None:
+                pairs.append((metric[left], timings[right], 0.11 if left == "prompt_ms" else 0))
+        if "predicted_n" in timings:
+            pairs.append((timings["predicted_n"], usage["completion_tokens"], 0))
+        total = metric.get("prompt_total")
+        if total is not None and total < metric["prompt_tokens"]:
+            raise ValueError("Native whole-prompt count is smaller than the request prompt.")
+        if metric.get("prompt_read") is not None and metric["prompt_read"] > (total if total is not None else usage["prompt_tokens"]):
+            raise ValueError("Native prompt-read count exceeds the whole prompt.")
+        # Service can inject reasoning wrap-up tokens that are delivered but were
+        # not generated by the engine. Only the thinking-disabled selected cases
+        # impose the stronger native/delivered count relation.
+        prompt = usage["prompt_tokens"]
+        for owner, key in ((metric, "reused"), (metric, "prompt_read"),
+                           (timings, "cache_n"), (timings, "prompt_n")):
+            if owner.get(key) is not None and owner[key] > prompt:
+                raise ValueError("Known cache/read count exceeds the observed prompt.")
+        for owner, cached, read in ((metric, "reused", "prompt_read"), (timings, "cache_n", "prompt_n")):
+            if owner.get(cached) is not None and owner.get(read) is not None and owner[cached] + owner[read] != prompt:
+                raise ValueError("Known cache/read counts do not sum to the observed prompt.")
+        if metric.get("prompt_read") is not None and timings.get("prompt_n") is not None:
+            pairs.append((metric["prompt_read"], timings["prompt_n"], 0))
+        if any(abs(left - right) > tolerance for left, right, tolerance in pairs):
+            raise RuntimeError("New request metric does not agree with the response usage/timing.")
+        return metric
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("Invalid request metric evidence: " + str(exc)) from None
 
 
 class TimeoutOpener:
@@ -992,16 +1557,50 @@ def make_client(validation, cfg, record, save, guard, secret):
 
         def chat(self, messages, max_tokens=128, **kwargs):
             guard.check()
-            item = {"label": self.label, "messages": copy.deepcopy(messages), "max_tokens": max_tokens,
+            measured = bool(record.get("acceptance_workload"))
+            if measured:
+                kwargs["stream"] = True  # The existing client clocks the first actual content delta.
+            started = time.monotonic() if measured else None
+            item = {"label": self.label, "max_tokens": max_tokens,
                     "started_unix": time.time()}
+            if measured:
+                # Preserve request identity without copying each near-full prompt into
+                # every snapshot. The HTTP request still receives the complete history.
+                item["messages_sha256"] = json_digest(messages)
+                item["started_monotonic"] = started
+                item["message_digests"] = [message_identity(message) for message in messages]
+            else:
+                item["messages"] = copy.deepcopy(messages)
             record["requests"].append(item)
             save()
             try:
                 before = self.get("/metrics")
-                response = redact(super().chat(messages, max_tokens, **kwargs), secret)
+                raw_response = super().chat(messages, max_tokens, **kwargs)
+                if measured:
+                    text = raw_response["choices"][0]["message"].get("content") or ""
+                    item["output_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                response = redact(raw_response, secret)
                 item["response"] = response
+                if measured:
+                    item["first_content_seconds"] = response.get("first_token_s")
+                    item["client_wall_seconds"] = response.get("wall_seconds")
                 save()  # Keep the answer even if the subsequent metric lookup fails.
-                item["metric"] = matched_metric(response, before, self.get("/metrics"))
+                item["metric"] = matched_metric(response, before, self.get("/metrics"), record=item)
+                if measured:
+                    first, wall = item["first_content_seconds"], item["client_wall_seconds"]
+                    timings, usage, metric = response["timings"], response["usage"], item["metric"]
+                    if (not all(valid_number(value) for value in (first, wall))
+                            or not 0 <= first <= wall + 0.001 or wall <= 0
+                            or not all(valid_number(value) and value >= 0 for value in (
+                                timings.get("prompt_ms"), timings.get("predicted_ms"), metric.get("prompt_ms")))
+                            or abs(metric["prompt_ms"] - timings["prompt_ms"]) > 0.11
+                            or type(timings.get("cache_n")) is not int
+                            or type(metric.get("reused")) is not int
+                            or metric["reused"] != timings["cache_n"]
+                            or type(usage["completion_tokens"]) is not int):
+                        raise RuntimeError("Missing or inconsistent request-associated streaming evidence.")
+                    item["cached_tokens"] = timings["cache_n"]
+                    item["actual_completion_tokens"] = usage["completion_tokens"]
                 guard.check()
                 return response
             except Exception as exc:
@@ -1009,13 +1608,16 @@ def make_client(validation, cfg, record, save, guard, secret):
                 raise
             finally:
                 item["finished_unix"] = time.time()
+                if measured:
+                    item["finished_monotonic"] = time.monotonic()
+                    item["request_wall_seconds"] = item["finished_monotonic"] - started
                 save()
 
     return Client(cfg)
 
 
 def acceptance_ready():
-    # No CLI switch bypasses missing current admission, Stage C or CUDA evidence.
+    # Workload CPU coverage does not supply native, current admission or CUDA proof.
     return False
 
 
@@ -1106,10 +1708,13 @@ def acceptance_controller(args, started):
         raise RuntimeError("Output directory already exists; choose a new directory.")
     native, owner, proc = None, None, None
     capture = BoundedCapture(ACCEPTANCE_LOG_LIMIT - 64)
+    worker_environment = dict(os.environ)
+    worker_environment.pop("STRATA_BENCHMARK_BOOTSTRAP", None)  # Consumed by bootstrap, never passed to the engine.
     record = {"status": "held", "lifecycle_evidence": "refused", "started_monotonic": started,
               "total_deadline": total_deadline, "work_deadline": work_deadline,
               "pending_stages": ["Stage C", "CUDA", "current admission"],
-              "external_limits": "Controller OS calls must return; caller must keep controller alive."}
+              "external_limits": "Controller OS calls must return; caller must keep controller alive.",
+              "normal_comparison": normal_comparison_excluded("worker-classification-unavailable")}
     coverage_start = coverage_end = None
     eof = False
 
@@ -1164,6 +1769,7 @@ def acceptance_controller(args, started):
             guard.check()
             if code is not None:
                 record["worker_exit"] = code
+                record.setdefault("worker_observed_exit_monotonic", time.monotonic())
                 if code != 0:
                     raise RuntimeError("Worker exited unsuccessfully.")
                 if owner.discover() != 0:
@@ -1221,6 +1827,35 @@ def acceptance_controller(args, started):
             provisional = args.output / "provisional.json"
             worker_record = json.loads(provisional.read_bytes())
             record["worker_complete"] = worker_record.get("status") == "provisional_complete"
+            selection = getattr(args, "acceptance_workload", None)
+            if selection:
+                record["workload_evidence"] = {key: worker_record.get(key) for key in (
+                    "acceptance_workload", "cohort", "expected_max_context", "acceptance_workload_passed",
+                    "final_idle", "protection", "missing_evidence")}
+                complete = record["worker_complete"]
+                record["worker_complete"] = False
+                try:
+                    record["worker_complete"] = complete and validate_selected_workload(
+                        worker_record, args, min(work_deadline, record["worker_observed_exit_monotonic"]))
+                except ValueError as exc:
+                    record["workload_error"] = str(exc)
+                # Consume classification independently of workload/lifecycle success.
+                # Never promote the worker's bool, digest or inventory on its own.
+                try:
+                    with args.config.open("rb") as stream:
+                        data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+                    if len(data) > ACCEPTANCE_LOG_LIMIT:
+                        raise ValueError("Configuration exceeds its bounded read budget.")
+                    config_identity = next(item for item in worker_record["protection"]["before"]
+                                           if item["path"] == str(args.config.resolve()))
+                    if config_identity["sha256"] != hashlib.sha256(data).hexdigest():
+                        raise ValueError("Consumed configuration binding differs.")
+                    cfg = json.loads(data.decode("utf-8-sig"))
+                    prepared, inherited = clean_environment(cfg, args.timing, getattr(args, "fetch_timing", False),
+                                                           acceptance=True, inherited=worker_environment)
+                    record["normal_comparison"] = consume_normal_comparison(worker_record, prepared, inherited)
+                except (OSError, ValueError, TypeError, KeyError, StopIteration, AttributeError):
+                    record["normal_comparison"] = normal_comparison_excluded("classification-input-unavailable")
             record["protection"] = acceptance_protection(args) is True
             guard.monitor(once=True)
             guard.check()
@@ -1261,6 +1896,7 @@ def acceptance_controller(args, started):
 
 
 def run(args):
+    acceptance_selection(args)
     if getattr(args, "acceptance_telemetry", False):
         return acceptance_controller(args, time.monotonic())
     return _run_workload(args)
@@ -1268,6 +1904,7 @@ def run(args):
 
 def _run_workload(args):
     worker_deadline = getattr(args, "_acceptance_deadline", None)
+    selection, expected_context = acceptance_selection(args)
     idle_seconds = getattr(args, "idle_seconds", 0)
     held_out = getattr(args, "held_out", False)
     transfer_workload = getattr(args, "transfer_workload", False)
@@ -1284,22 +1921,28 @@ def _run_workload(args):
     if validation_only and not (held_out or transfer_workload or long_context or args.smoke
                                or getattr(args, "smoke_only", False)):
         raise ValueError("validation_only requires held_out, transfer_workload, long_context or smoke.")
-    if not 0 <= idle_seconds <= 600:
+    if not valid_number(idle_seconds) or not 0 <= idle_seconds <= 600:
         raise ValueError("idle_seconds must be between 0 and 600.")
     if args.output.exists():
         raise RuntimeError("Output directory already exists; choose a new directory.")
-    cfg = json.loads(args.config.read_text(encoding="utf-8-sig"))
+    config_bytes = args.config.read_bytes() if selection else None
+    cfg = json.loads(config_bytes.decode("utf-8-sig") if selection
+                     else args.config.read_text(encoding="utf-8-sig"))
     secret = cfg.get("api_key") or ""
     if not isinstance(secret, str) or not secret.strip():
         raise ValueError("An API key is required for the authenticated loopback benchmark.")
-    if held_out or transfer_workload or long_context:
+    if held_out or transfer_workload or long_context or selection:
         if cfg.get("fit_max_tokens") is not True or cfg.get("open_browser") is not False:
             raise ValueError("Acceptance requires fit_max_tokens=true and open_browser=false in the source config.")
     if acceptance_guard is not None:
         # This is the actual future run's guard and environment composition, not a launch clearance.
-        prepared, environment = clean_environment(cfg, args.timing, fetch_timing)
+        prepared, environment = (clean_environment(cfg, args.timing, fetch_timing, acceptance=True)
+                                 if selection else clean_environment(cfg, args.timing, fetch_timing))
         record = {"status": "held", "acceptance_telemetry": True,
-                  "effective_environment": safe_engine_environment(prepared, environment),
+                  "acceptance_workload": selection, "cohort": getattr(args, "cohort", None),
+                  "expected_max_context": expected_context,
+                  "effective_environment": safe_engine_environment(prepared, environment, acceptance=bool(selection)),
+                  "normal_comparison": normal_comparison_excluded("launch-held"),
                   "memory": acceptance_guard.summary(),
                   "pending_stages": {"B": "Whole-owner deadline, output, external exit and native cleanup.",
                                      "C": "Workload, protection, provenance and cohort binding."}}
@@ -1312,15 +1955,57 @@ def _run_workload(args):
     exe = Path(cfg["exe"])
     if not exe.is_absolute():
         exe = Path(cfg.get("cwd") or ROOT) / exe
+    exe = exe.resolve()
+    saved_exe = exe
+    protected = []
+    provenance = None
+    if selection:
+        automatic = bool(cfg.get("memory_policy"))
+        if (getattr(args, "cohort", None) == "automatic") != automatic:
+            raise ValueError("Selected cohort disagrees with the saved automatic/static policy.")
+        from tools.prepare_unsloth_q2 import engine_metadata
+        saved_metadata = Path(cfg.get("build_metadata") or engine_metadata(saved_exe))
+        if not saved_metadata.is_absolute():
+            saved_metadata = ROOT / saved_metadata
+        candidate = getattr(args, "candidate_exe", None)
+        if candidate is not None:
+            exe = Path(candidate).resolve()
+            cfg["exe"] = str(exe)
+            cfg["build_metadata"] = str(engine_metadata(exe))
+        metadata = engine_metadata(exe) if candidate is not None else saved_metadata
+        provenance = {"saved": executable_provenance(saved_exe, saved_metadata),
+                      "selected": executable_provenance(exe, metadata)}
+        paths = [args.config.resolve(), saved_exe, exe]
+        paths += [path.resolve() for path in (saved_metadata, metadata) if path.is_file()]
+        if cfg.get("tokenizer"):
+            tokenizer = Path(cfg["tokenizer"])
+            paths += [(tokenizer / name).resolve() for name in (
+                "vocab.json", "merges.txt", "token_type.json", "chat_template.jinja")]
+        paths += [Path(path).resolve() for path in getattr(args, "protect_input", [])]
+        protected = list(dict.fromkeys(paths))
+        protection_before = protection_snapshot(protected)
+        if protection_before[0]["sha256"] != hashlib.sha256(config_bytes).hexdigest():
+            raise ValueError("Configuration changed while binding the consumed inputs.")
     with exe.open("rb") as binary:
         executable_hash = hashlib.file_digest(binary, "sha256").hexdigest()
     args.output.mkdir(parents=True, exist_ok=False)
     record = {"status": "starting", "config": str(args.config.resolve()), "exe": str(exe.resolve()),
               "exe_sha256": executable_hash, "timing_diagnostic": args.timing or fetch_timing,
               "decode_timing": args.timing, "fetch_timing": fetch_timing,
-              "expected_max_context": CONTEXT, "smoke_only": getattr(args, "smoke_only", False),
+              "expected_max_context": expected_context, "smoke_only": getattr(args, "smoke_only", False),
               "validation_only": validation_only,
-              "rows": [], "requests": []}
+              "rows": [], "requests": [],
+              "normal_comparison": normal_comparison_excluded("environment-not-classified")}
+    if selection:
+        record.update(acceptance_workload=selection, cohort=args.cohort,
+                      executable_provenance=provenance, harness=file_identity(Path(__file__).resolve()),
+                      protection={"scope": "Enumerated inputs only; complete operational admission remains held.",
+                                  "before": protection_before, "after": None, "unchanged": False},
+                      missing_evidence=["Fresh parent-reviewed one-use operational manifest and complete current input admission.",
+                                        "Native lifecycle prerequisite remains unverified.",
+                                        "Actual per-request CUDA-stage evidence (minimum 256 MiB).",
+                                        "Final recent-cache allocation."] +
+                                       (["Server's once-refreshed automatic policy sample."] if automatic else []))
     guard = None
 
     def save():
@@ -1348,12 +2033,17 @@ def _run_workload(args):
         if temp.parent != SCRATCH.resolve():
             raise RuntimeError("Temporary config escaped the intended scratch directory.")
         engine_log = temp / "engine.log"
-        cfg, environment = clean_environment(cfg, args.timing, fetch_timing)
+        cfg, environment = (clean_environment(cfg, args.timing, fetch_timing, acceptance=True)
+                            if selection else clean_environment(cfg, args.timing, fetch_timing))
+        record["normal_comparison"] = normal_comparison_environment(cfg, environment,
+                                                                   server_log=worker_deadline is None)
+        record["timing_diagnostic"] = record["timing_diagnostic"] or any(
+            item.get("active") is True for item in record["normal_comparison"]["controls"])
         cfg.update(host="127.0.0.1", port=PORT, log=None if worker_deadline is not None else str(engine_log))
         record["effective_settings"] = {key: cfg.get(key) for key in (
             "model_name", "args", "fit_max_tokens", "open_browser",
             "expert_profile_save", "expert_profile_save_every")}
-        record["effective_settings"]["env"] = safe_engine_environment(cfg, environment)
+        record["effective_settings"]["env"] = safe_engine_environment(cfg, environment, acceptance=bool(selection))
         config_path = temp / "config.json"
         if worker_deadline is not None:
             bounded_write(config_path, json.dumps(cfg).encode("utf-8"), worker_deadline)
@@ -1392,16 +2082,19 @@ def _run_workload(args):
             else:
                 raise RuntimeError("Server did not load within 600 seconds.")
             record["health"] = health
-            if health.get("max_context") != CONTEXT:
-                raise RuntimeError("Loaded server context is not 131072; benchmark stopped.")
+            if health.get("max_context") != expected_context:
+                raise RuntimeError(f"Loaded server context is not {expected_context}; benchmark stopped.")
             record["engine"] = client.get("/metrics")["engine"]
             record["status"] = "running"
             save()
-            if held_out or transfer_workload or long_context:
+            if held_out or transfer_workload or long_context or selection:
                 check_authentication(client, record, save)
-            record["warmup"] = client.chat([{"role": "user", "content":
-                "Explain what a database transaction does in a few sentences."}], 64)
-            prompts = [] if record["smoke_only"] or validation_only else load_workload("benchmark").PROMPTS
+            if selection:
+                acceptance_workload_tests(validation, client, record, save, guard)
+            else:
+                record["warmup"] = client.chat([{"role": "user", "content":
+                    "Explain what a database transaction does in a few sentences."}], 64)
+            prompts = [] if selection or record["smoke_only"] or validation_only else load_workload("benchmark").PROMPTS
             for round_index in range(2):
                 if round_index == 1 and prompts and idle_seconds:
                     record["idle_started_unix"] = time.time()
@@ -1452,6 +2145,13 @@ def _run_workload(args):
                 long_context_tests(validation, client, record, save)
             metrics = client.get("/metrics")
             record["metrics"] = {k: metrics[k] for k in ("engine", "totals")}
+            if selection:
+                # INFO fields describe actual engine-reported startup allocations, not
+                # final host-cache capacity or the server's independent policy resample.
+                record["allocation_evidence"] = {
+                    "requested_args": cfg.get("args"),
+                    "startup_engine_info": record["engine"], "final_engine_info": metrics["engine"],
+                    "meaning": "Engine INFO observations; missing final automatic/recent allocations remain explicit."}
             guard.check()
             record["status"] = "complete"
         except BaseException as exc:
@@ -1503,6 +2203,15 @@ def _run_workload(args):
                     record["artifact_error"] = redact(type(exc).__name__ + ": " + str(exc), secret)
                     raise
                 finally:
+                    if protected:
+                        try:
+                            record["protection"]["after"] = protection_snapshot(protected)
+                            record["protection"]["unchanged"] = record["protection"]["after"] == protection_before
+                            if not record["protection"]["unchanged"]:
+                                raise RuntimeError("Protected benchmark inputs changed during the workload.")
+                        except Exception as exc:
+                            record["status"] = "failed"
+                            record.setdefault("error", redact(str(exc), secret))
                     save()
     if record["status"] != "complete":
         raise RuntimeError("Benchmark was cancelled; inspect results.json.")
@@ -1522,6 +2231,16 @@ def main(argv=None):
                         help="Also run four broader held-out 160-token cases; quality requires manual review")
     parser.add_argument("--long-context", action="store_true",
                         help="Also validate a fresh near-128K prompt, fit_max_tokens and reuse (may take many minutes)")
+    parser.add_argument("--expected-context", type=int, choices=(65536, CONTEXT), default=CONTEXT,
+                        help="Required loaded context capacity (default 131072)")
+    parser.add_argument("--acceptance-workload", choices=("short", "near-full"),
+                        help="Contained opt-in eleven-request short or separate near-full/sustained workload; admission held")
+    parser.add_argument("--cohort", choices=("saved-static", "automatic", "frozen-control"),
+                        help="Explicit policy cohort for the selected acceptance workload")
+    parser.add_argument("--candidate-exe", type=Path,
+                        help="Use this executable in a diagnostic clone, preserving the saved executable's provenance")
+    parser.add_argument("--protect-input", action="append", default=[], metavar="PATH",
+                        help="Additional exact input file to hash before/after (for example the selected launcher)")
     parser.add_argument("--validation-only", action="store_true",
                         help="Run warmup and selected acceptance checks without the six throughput cases")
     parser.add_argument("--idle-seconds", type=float, default=0,
