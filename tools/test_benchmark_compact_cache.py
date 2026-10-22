@@ -3494,5 +3494,387 @@ class NormalComparisonTests(unittest.TestCase):
             bench.acceptance_preflight(None)
 
 
+class DesktopComparisonConsumerTests(unittest.TestCase):
+    """CPU-only public desktop report/caller controls, with fatal external seams."""
+
+    def setUp(self):
+        from tools import prepare_unsloth_q2 as preparation
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        def forbidden(*args, **kwargs):
+            raise AssertionError("real external seam forbidden in desktop consumer tests")
+        winjob = types.ModuleType("serve.winjob")
+        winjob.contain = winjob.no_throttle = forbidden
+        self.stack.enter_context(patch.dict(sys.modules, {
+            "serve.winjob": winjob, "benchmark_compact_cache": bench,
+            "prepare_unsloth_q2": preparation}))
+        for target, name in ((bench.subprocess, "Popen"), (bench.subprocess, "run"),
+                             (bench.socket, "socket"), (bench.urllib.request, "urlopen"),
+                             (bench.psutil, "process_iter"), (bench.psutil, "Process"),
+                             (bench.psutil, "virtual_memory"),
+                             (bench.psutil, "swap_memory"), (ctypes, "WinDLL"),
+                             (bench, "assert_idle"), (preparation, "check_ready"),
+                             (preparation, "memory_snapshot"), (preparation.setup, "gpu_info")):
+            self.stack.enter_context(patch.object(target, name, side_effect=forbidden, create=True))
+        spec = bench.importlib.util.spec_from_file_location(
+            "desktop_consumer_test", Path(__file__).with_name("benchmark_desktop_profiles.py"))
+        self.desktop = bench.importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.desktop)
+
+    def specimen(self, env=None, *, automatic=False, answer="clean", speed=23.5):
+        cfg = {"args": ["--max-context", "131072"], "env": dict(env or {}),
+               "api_key": "PRIVATE-CREDENTIAL", "model_name": "PRIVATE-MODEL"}
+        if automatic:
+            cfg["memory_policy"] = {"version": 1}
+        context = bench.clean_environment(cfg, False, inherited={"PRIVATE-ORDINARY": "PRIVATE-VALUE"})
+        result = {"status": "complete", "timing_diagnostic": False,
+                  "rows": [{"response": {"choices": [{"message": {"role": "assistant", "content": answer},
+                                                       "finish_reason": "stop"}]}}],
+                  "summary": {"tokens_per_second": speed, "completion_tokens": 160},
+                  "normal_comparison": bench.normal_comparison_launch_environment(*context, server_log=True)}
+        return result, context
+
+    def test_legacy_public_report_without_context_excludes_old_performance_row(self):
+        result, _ = self.specimen(speed=987.65)
+        result.pop("normal_comparison")
+        text = self.desktop.report([("legacy", result)])
+        self.assertNotIn("987.65", text)
+        self.assertNotIn("1/1", text)
+        self.assertIn("independent launch context unavailable", text)
+        self.assertIn("No eligible complete runs", text)
+        # Even a valid modern record cannot supply its own independent inputs.
+        modern, _ = self.specimen()
+        self.assertNotIn("23.50", self.desktop.report([("modern", modern)]))
+
+    def test_mixed_public_report_uses_first_eligible_baseline_and_preserves_inputs(self):
+        excluded, bad_context = self.specimen({"STRATA_PRIVATE_UNKNOWN": ""}, answer="excluded", speed=987.65)
+        first, context = self.specimen()
+        last, last_context = self.specimen(answer="different", speed=31)
+        records = [("excluded", excluded), ("first-clean", first), ("last-clean", last)]
+        contexts = {"excluded": bad_context, "first-clean": context, "last-clean": last_context}
+        before = bench.copy.deepcopy((records, contexts))
+        text = self.desktop.report(records, contexts=contexts)
+        self.assertIn("| first-clean | 23.50 | 160 | 1/1 |", text)
+        self.assertIn("| last-clean | 31.00 | 160 | 0/1 |", text)
+        self.assertNotIn("987.65", text)
+        for private in ("STRATA_PRIVATE_UNKNOWN", "PRIVATE-CREDENTIAL", "PRIVATE-MODEL", "PRIVATE-VALUE", "PRIVATE-ORDINARY"):
+            self.assertNotIn(private, text)
+        self.assertEqual((records, contexts), before)
+        self.assertIn("build, model, workload, allocation, cohort or performance", text)
+        self.assertIn("unsupported for new normal-comparison conclusions", text)
+
+    def test_unknown_diagnostic_automatic_and_forged_classifications_cannot_rank(self):
+        for env, automatic in (({"STRATA_PRIVATE_UNKNOWN": ""}, False),
+                               ({"STRATA_PRIVATE_UNKNOWN": "0"}, False),
+                               ({"STRATA_DEBUG": "1"}, False),
+                               ({"STRATA_REQUEST_LINES": "1"}, False), ({}, True)):
+            with self.subTest(env=env, automatic=automatic):
+                result, context = self.specimen(env, automatic=automatic, speed=987.65)
+                self.assertNotIn("987.65", self.desktop.report([("bad", result)], contexts={"bad": context}))
+                # A forged true flag cannot override actual source classification/binding.
+                result["normal_comparison"]["eligible"] = True
+                result["normal_comparison"]["complete"] = True
+                self.assertNotIn("987.65", self.desktop.report([("bad", result)], contexts={"bad": context}))
+        result, context = self.specimen(speed=987.65)
+        for field, value in (("eligible", 1), ("complete", 1), ("schema", True),
+                             ("environment_sha256", "forged"), ("controls", [{}] * 129)):
+            with self.subTest(field=field):
+                changed = bench.copy.deepcopy(result)
+                changed["normal_comparison"][field] = value
+                self.assertNotIn("987.65", self.desktop.report([("bad", changed)], contexts={"bad": context}))
+
+    def test_missing_malformed_and_mismatched_independent_contexts_fail_closed(self):
+        result, context = self.specimen(speed=987.65)
+        for contexts in (None, [], {}, {"bad": None}, {"bad": []}, {"bad": ({},)},
+                         {"bad": ({"env": []}, {})}, {"bad": ({"env": {}}, [])},
+                         {"bad": ({"env": {"STRATA_PRIVATE_UNKNOWN": "0"}}, {})}):
+            with self.subTest(contexts=contexts):
+                text = self.desktop.report([("bad", result)], contexts=contexts)
+                self.assertNotIn("987.65", text)
+                self.assertIn("No eligible complete runs", text)
+        result.pop("normal_comparison")
+        self.assertNotIn("987.65", self.desktop.report([("bad", result)], contexts={"bad": context}))
+
+    def test_incomplete_failed_diagnostic_and_malformed_results_cannot_set_baseline(self):
+        clean, context = self.specimen()
+        changes = [{"status": value} for value in (None, "failed", "starting", "provisional_complete")]
+        changes += [{"timing_diagnostic": value} for value in (None, True, 0)]
+        changes += [{key: value} for key, value in (("rows", []), ("rows", [{}]), ("summary", {}),
+                    ("smoke_passed", False), ("decode_timing", True), ("fetch_timing", True),
+                    ("validation_only", True), ("smoke_only", True), ("error", "PRIVATE-FAILURE"),
+                    ("cleanup_error", "PRIVATE-FAILURE"), ("artifact_error", "PRIVATE-FAILURE"))]
+        for change in changes:
+            with self.subTest(change=change):
+                bad, _ = self.specimen(answer="excluded", speed=987.65)
+                bad.update(change)
+                text = self.desktop.report([("bad", bad), ("clean", clean)],
+                                           contexts={"bad": context, "clean": context})
+                self.assertNotIn("987.65", text)
+                self.assertNotIn("PRIVATE-FAILURE", text)
+                self.assertIn("| clean | 23.50 | 160 | 1/1 |", text)
+
+    def test_all_excluded_empty_and_nonfinite_results_are_valid_reports(self):
+        result, context = self.specimen()
+        for speed in (0, -1, True, float("nan"), float("inf"), "987.65"):
+            with self.subTest(speed=speed):
+                changed = bench.copy.deepcopy(result)
+                changed["summary"]["tokens_per_second"] = speed
+                text = self.desktop.report([("bad", changed)], contexts={"bad": context})
+                self.assertIn("No eligible complete runs", text)
+                self.assertNotIn("1/1", text)
+        self.assertIn("No eligible complete runs", self.desktop.report([]))
+        for bad in (None, [], {}, {"normal_comparison": True}):
+            self.assertIn("No eligible complete runs", self.desktop.report([("bad", bad)], contexts={"bad": context}))
+
+    def test_malformed_first_response_cannot_rank_or_choose_baseline(self):
+        bad, context = self.specimen(speed=987.65)
+        bad["rows"] = [{"response": {"choices": [None]}}]
+        clean, clean_context = self.specimen(answer="valid")
+        records = [("malformed", bad), ("clean", clean)]
+        contexts = {"malformed": context, "clean": clean_context}
+        before = bench.copy.deepcopy((records, contexts))
+        text = self.desktop.report(records, contexts=contexts)
+        self.assertIn("| malformed | complete assistant responses unavailable; inspect raw results |", text)
+        self.assertNotIn("987.65", text)
+        self.assertIn("| clean | 23.50 | 160 | 1/1 |", text)
+        self.assertEqual((records, contexts), before)
+        for private in ("PRIVATE-CREDENTIAL", "PRIVATE-MODEL", "PRIVATE-ORDINARY", "PRIVATE-VALUE"):
+            self.assertNotIn(private, text)
+
+    def malformed_choices(self):
+        return [None, True, 1, "PRIVATE-ANSWER", [], {},
+                {"message": None}, {"message": []}, {"message": "PRIVATE-ANSWER"},
+                {"message": {}}, {"message": {"role": "assistant"}, "finish_reason": "stop"},
+                *({"message": {"role": "assistant", "content": value}, "finish_reason": "stop"}
+                  for value in (None, 0, True, [], {"PRIVATE-KEY": "PRIVATE-ANSWER"})),
+                *({"message": {"role": value, "content": "PRIVATE-ANSWER"}, "finish_reason": "stop"}
+                  for value in (None, "user", "", 0, [])),
+                {"message": {"content": "PRIVATE-ANSWER"}, "finish_reason": "stop"},
+                {"message": {"role": "assistant", "content": "PRIVATE-ANSWER"}},
+                *({"message": {"role": "assistant", "content": "PRIVATE-ANSWER"}, "finish_reason": value}
+                  for value in (None, "", "tool_calls", "error", 0, True, [], {}))]
+
+    def test_malformed_choices_in_any_element_or_later_row_exclude_whole_record(self):
+        clean, context = self.specimen()
+        valid = clean["rows"][0]["response"]["choices"][0]
+        for invalid in self.malformed_choices():
+            for choices in ([invalid], [valid, invalid], [invalid, valid]):
+                for later in (False, True):
+                    with self.subTest(invalid=invalid, choices=len(choices), later=later):
+                        bad, _ = self.specimen(speed=987.65)
+                        bad["rows"] = ([bench.copy.deepcopy(clean["rows"][0])] if later else [])
+                        bad["rows"].append({"response": {"choices": bench.copy.deepcopy(choices)}})
+                        before = bench.copy.deepcopy(bad)
+                        text = self.desktop.report([("bad", bad), ("clean", clean)],
+                                                   contexts={"bad": context, "clean": context})
+                        self.assertNotIn("987.65", text)
+                        self.assertIn("| clean | 23.50 | 160 | 1/1 |", text)
+                        self.assertIn("| bad | complete assistant responses unavailable; inspect raw results |", text)
+                        self.assertEqual(bad, before)
+                        self.assertNotIn("PRIVATE-ANSWER", text)
+                        self.assertNotIn("PRIVATE-KEY", text)
+
+    def test_complete_assistant_text_stop_length_and_multiple_valid_choices_compare(self):
+        for content in ("", "ordinary answer", "line one\nline two", "答え"):
+            for finish in ("stop", "length"):
+                for multiple in (False, True):
+                    with self.subTest(content=content, finish=finish, multiple=multiple):
+                        result, context = self.specimen(answer=content)
+                        result["rows"][0]["response"]["choices"][0]["finish_reason"] = finish
+                        if multiple:
+                            result["rows"][0]["response"]["choices"].append({
+                                "message": {"role": "assistant", "content": "second answer"}, "finish_reason": "stop"})
+                        before = bench.copy.deepcopy((result, context))
+                        text = self.desktop.report([("valid", result)], contexts={"valid": context})
+                        self.assertIn("| valid | 23.50 | 160 | 1/1 |", text)
+                        self.assertNotIn("No eligible complete runs", text)
+                        self.assertEqual((result, context), before)
+
+    def test_actual_ordinary_runner_fixture_still_produces_comparable_responses(self):
+        case = RunTests()
+        case.setUp()
+        self.addCleanup(case.tearDown)
+        source = json.loads(case.config.read_text())
+        context = bench.clean_environment(source, False, inherited={})
+        base_client = case.fake_client()
+        # Strengthen only this fixture's wire response with fields emitted by the
+        # ordinary API and required by existing assistant-response validation.
+        class CompleteClient(base_client):
+            def chat(self, *args, **kwargs):
+                response = super().chat(*args, **kwargs)
+                response["choices"][0]["message"]["role"] = "assistant"
+                response["choices"][0]["finish_reason"] = "stop"
+                return response
+        with patch.object(case, "fake_client", return_value=CompleteClient), \
+                patch.dict(bench.os.environ, {}, clear=True):
+            result = case.invoke()
+        before = bench.copy.deepcopy(result)
+        text = self.desktop.report([("ordinary", result)], contexts={"ordinary": context})
+        self.assertEqual(len(result["rows"]), 6)
+        self.assertIn("| ordinary | 106.67 | 960 | 6/6 | not requested |", text)
+        self.assertEqual(result, before)
+        self.assertNotIn(case.secret, text)
+        case.owner.stop.assert_called_once_with()
+        case.assert_safe_artifacts()
+
+    def test_main_malformed_responses_share_table_and_console_exclusion(self):
+        for later in (False, True):
+            for invalid in (None, {"message": {}}, {"message": {"role": "assistant", "content": None}}):
+                with self.subTest(later=later, invalid=invalid):
+                    def corrupt(index, record):
+                        if index == 0:
+                            record["summary"]["tokens_per_second"] = 987.65
+                            if later:
+                                record["rows"].append(bench.copy.deepcopy(record["rows"][0]))
+                            if not later and invalid is None:
+                                record["rows"][-1]["response"]["choices"] = [None]
+                            else:
+                                record["rows"][-1]["response"]["choices"].append(invalid)
+                    code, stdout, stderr = self.invoke_main(mutate=corrupt)
+                    self.assertEqual((code, stderr), (0, ""))
+                    self.assertNotIn("987.65", stdout + self.writes[-1][1])
+                    self.assertIn("compact-before: excluded from normal comparison (complete assistant responses unavailable)", stdout)
+                    self.assertIn("| desktop | 23.50 | 160 | 1/1 | passed |", self.writes[-1][1])
+                    self.assertEqual(stdout.count("tokens/s (environment-eligible candidate)"), 3)
+                    self.assertIs(self.returned[0]["rows"][-1]["response"]["choices"][-1], invalid)
+
+    def invoke_main(self, *, plan=False, excluded=(), fail_at=None, saving=None, env=None, automatic=False, mutate=None):
+        """All files/workloads/readiness here are returning in-memory collaborators."""
+        root = Path(tempfile.gettempdir()).resolve() / "desktop-consumer-memory-only"
+        self.configs = {root / filename: {"args": ["--max-context", "131072"],
+            "api_key": "PRIVATE-CREDENTIAL", "env": {"STRATA_FILE_CACHE_MIB": "4096", "STRATA_VERIFY_PROFILE": "1"}}
+            for _, filename, _ in self.desktop.CASES}
+        if saving:
+            self.configs[root / self.desktop.CASES[0][1]].update(saving)
+        for cfg in self.configs.values():
+            cfg["env"].update(env or {})
+            if automatic:
+                cfg["memory_policy"] = {"version": 1}
+        self.events, self.writes, self.returned, self.launch_contexts = [], [], [], []
+        self.consumptions = []
+        def read(path, *args, **kwargs):
+            self.events.append(("read", path.name))
+            return json.dumps(self.configs[path])
+        def ready(cfg):
+            self.events.append(("ready", bench.copy.deepcopy(cfg)))
+        def idle():
+            self.events.append(("idle",))
+        def mkdir(path, *args, **kwargs):
+            self.events.append(("mkdir", path, kwargs))
+        def write(path, text, **kwargs):
+            self.writes.append((path, text))
+            return len(text)
+        def workload(args):
+            index = len(self.returned)
+            label, filename, smoke = self.desktop.CASES[index]
+            self.assertEqual(vars(args), {"config": root / filename, "output": args.output,
+                                         "timing": False, "smoke": smoke, "smoke_only": False})
+            self.assertEqual(args.output.name, label)
+            self.events.append(("run", label))
+            if fail_at == index:
+                raise RuntimeError("PRIVATE-CREDENTIAL")
+            cfg = json.loads(args.config.read_text())
+            context = bench.clean_environment(cfg, False, inherited=dict(bench.os.environ))
+            self.launch_contexts.append(bench.copy.deepcopy(context))
+            result, _ = self.specimen(answer="excluded" if index in excluded else "clean", speed=987.65 if index in excluded else 23.5)
+            result["normal_comparison"] = bench.normal_comparison_launch_environment(*context, server_log=True)
+            if smoke:
+                result["smoke_passed"] = True
+            if index in excluded:
+                result.pop("normal_comparison")
+            if mutate:
+                mutate(index, result)
+            # Returned metadata and subsequent process environment are not independent inputs.
+            result["effective_settings"] = {"env": {"STRATA_PRIVATE_UNKNOWN": "PRIVATE-POISON"}}
+            self.returned.append(result)
+            bench.os.environ["STRATA_RESIDENT_PIN"] = str(index % 2)
+            return result
+        real_consume = bench.consume_normal_comparison
+        def consume(record, cfg, inherited, **kwargs):
+            index = next(index for index, value in enumerate(self.returned) if value is record)
+            self.consumptions.append((index, bench.copy.deepcopy((cfg, inherited)), kwargs))
+            return real_consume(record, cfg, inherited, **kwargs)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(self.desktop, "ROOT", root), \
+                patch.object(Path, "read_text", read), patch.object(Path, "mkdir", mkdir), \
+                patch.object(Path, "write_text", write), \
+                patch.object(self.desktop.preparation, "check_ready", side_effect=ready), \
+                patch.object(bench, "assert_idle", side_effect=idle), \
+                patch.object(bench, "run", side_effect=workload), \
+                patch.object(bench, "consume_normal_comparison", side_effect=consume), \
+                patch.dict(bench.os.environ, {"STRATA_API_KEY": "PRIVATE-INHERITED-KEY", "STRATA_VERIFY_PROFILE": "1"}, clear=True), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = self.desktop.main(["--plan"] if plan else [])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_main_retains_independent_clean_context_and_original_run_order_settings(self):
+        code, stdout, stderr = self.invoke_main(excluded=(0,))
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual([event[1] for event in self.events if event[0] == "run"],
+                         ["compact-before", "desktop", "desktop-gpu", "compact-after"])
+        self.assertEqual([event[0] for event in self.events[:8]], ["read", "ready"] * 4)
+        self.assertEqual([event[0] for event in self.events[8:10]], ["idle", "mkdir"])
+        self.assertEqual(len(self.writes), 4)
+        for index, context, kwargs in self.consumptions:
+            self.assertEqual(context, self.launch_contexts[index])
+            self.assertEqual(kwargs, {"server_log": True})
+            self.assertNotIn("STRATA_API_KEY", context[1])
+            self.assertNotIn("STRATA_VERIFY_PROFILE", context[0]["env"])
+            self.assertNotIn("STRATA_VERIFY_PROFILE", context[1])
+        self.assertEqual({index for index, _, _ in self.consumptions}, {0, 1, 2, 3})
+        self.assertIn("compact-before: excluded from normal comparison", stdout)
+        self.assertEqual(stdout.count("23.50 tokens/s (environment-eligible candidate)"), 3)
+        self.assertNotIn("987.65", stdout + self.writes[-1][1])
+        self.assertIn("| desktop | 23.50 | 160 | 1/1 | passed |", self.writes[-1][1])
+        self.assertNotIn("| compact-before | 987.65", self.writes[-1][1])
+        for private in ("PRIVATE-CREDENTIAL", "PRIVATE-INHERITED-KEY", "PRIVATE-POISON", "STRATA_PRIVATE_UNKNOWN"):
+            self.assertNotIn(private, stdout + stderr + "".join(text for _, text in self.writes))
+        self.assertNotIn("normal_comparison", self.returned[0])
+
+    def test_main_all_excluded_never_advertises_throughput(self):
+        code, stdout, stderr = self.invoke_main(excluded=(0, 1, 2, 3))
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertNotIn("tokens/s", stdout)
+        self.assertEqual(stdout.count("excluded from normal comparison"), 4)
+        self.assertIn("No eligible complete runs", self.writes[-1][1])
+        self.assertNotIn("987.65", self.writes[-1][1])
+
+    def test_main_actual_unknown_diagnostic_and_automatic_classification_excludes_console_and_table(self):
+        for env, automatic in (({"STRATA_PRIVATE_UNKNOWN": ""}, False),
+                               ({"STRATA_PRIVATE_UNKNOWN": "0"}, False),
+                               ({"STRATA_DEBUG": "1"}, False),
+                               ({"STRATA_REQUEST_LINES": "1"}, False), ({}, True)):
+            with self.subTest(env=env, automatic=automatic):
+                code, stdout, stderr = self.invoke_main(env=env, automatic=automatic)
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertNotIn("tokens/s", stdout)
+                self.assertIn("No eligible complete runs", self.writes[-1][1])
+                self.assertNotIn("23.50", self.writes[-1][1])
+                self.assertEqual(stdout.count("excluded from normal comparison"), 4)
+
+    def test_main_plan_starts_nothing_and_preserves_learned_profile_refusal(self):
+        code, stdout, stderr = self.invoke_main(plan=True)
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("Readiness passed. No model was started.", stdout)
+        self.assertEqual([event[0] for event in self.events], ["read", "ready"] * 4)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.returned, [])
+        for saving in ({"expert_profile_save": "private.bin"}, {"args": ["--expert-profile-save", "private.bin"]}):
+            code, stdout, stderr = self.invoke_main(plan=True, saving=saving)
+            self.assertEqual(code, 1)
+            self.assertIn("Comparison stopped (ValueError)", stderr)
+            self.assertEqual([event[0] for event in self.events], ["read", "ready"])
+            self.assertEqual(self.writes, [])
+
+    def test_main_failure_stops_sequence_and_retains_prior_report_without_secret(self):
+        code, stdout, stderr = self.invoke_main(fail_at=1)
+        self.assertEqual(code, 1)
+        self.assertIn("Comparison stopped (RuntimeError)", stderr)
+        self.assertNotIn("PRIVATE-CREDENTIAL", stderr)
+        self.assertEqual([event[1] for event in self.events if event[0] == "run"], ["compact-before", "desktop"])
+        self.assertEqual(len(self.writes), 1)
+        self.assertIn("| compact-before | 23.50 | 160 | 1/1 |", self.writes[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
