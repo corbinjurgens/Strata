@@ -2610,6 +2610,567 @@ class StageCSourceTests(unittest.TestCase):
         self.assertEqual(record["requests"][0]["cached_tokens"], 3)
 
 
+class AcceptanceManifestTests(unittest.TestCase):
+    """Synthetic inventory and Git transports; no model, native API or child workload."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="stage-c-manifest-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.workloads = self.root / "bench/results/fixture"
+        self.harness = [self.root / "tools/benchmark_compact_cache.py", self.root / "serve/server.py",
+                        self.root / "tools/prepare_unsloth_q2.py", self.root / "setup.py",
+                        self.workloads / "validation.py", self.workloads / "benchmark.py"]
+        self.saved = self.root / "engine/saved.exe"
+        self.candidate = self.root / "strata-candidate.exe"
+        self.saved_receipt = self.root / "receipts/saved.json"
+        self.selected_receipt = self.root / "BUILD-candidate.json"
+        self.tokenizer = self.root / "tokenizer"
+        self.pack = self.root / "pack"
+        self.profile = self.root / "profile.bin"
+        self.interpreter = self.root / "python.exe"
+        self.protected = [self.root / "launcher.bat", self.root / "extra-input.txt"]
+        self.shards = [self.root / "model-01.gguf", self.root / "model-02.gguf"]
+        self.pack_data = [self.pack / "a-data.bin", self.pack / "z-data.bin"]
+        self.tokenizer_files = [self.tokenizer / name for name in
+                                ("vocab.json", "merges.txt", "token_type.json", "chat_template.jinja")]
+        for index, path in enumerate(self.harness + [self.saved, self.candidate, self.saved_receipt,
+                self.selected_receipt, self.profile, self.interpreter, self.pack / "native_experts.txt"]
+                + self.protected + self.shards + self.pack_data + self.tokenizer_files):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(("synthetic file " + str(index)).encode())
+        (self.pack / "ignored-directory").mkdir()
+        (self.pack / "ignored-directory/nested.bin").write_bytes(b"not enumerated recursively")
+        receipt = {path.name: {"path": str(path), "size": path.stat().st_size,
+                              "mtime_ns": path.stat().st_mtime_ns,
+                              "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                   for path in reversed(self.shards)}
+        self.source_receipt = self.pack / "source-verification.json"
+        self.source_receipt.write_text(json.dumps(receipt))
+        self.config = self.root / "saved.json"
+        self.cfg = {"exe": "saved.exe", "cwd": str(self.saved.parent), "build_metadata": "receipts/saved.json",
+                    "tokenizer": str(self.tokenizer), "api_key": "synthetic-private-key",
+                    "fit_max_tokens": True, "open_browser": False, "memory_policy": {"version": 1},
+                    "args": ["--pack", str(self.pack), "--native", str(self.shards[0]),
+                             "--expert-profile", str(self.profile)]}
+        self.config.write_text(json.dumps(self.cfg))
+        self.args = argparse.Namespace(config=self.config, output=self.root / "new-output", timing=False,
+            acceptance_telemetry=True, acceptance_workload="short", cohort="automatic", expected_context=65536,
+            acceptance_physical_gib=8.0, acceptance_commit_gib=9.0, port=18081, acceptance_total_seconds=1200,
+            candidate_exe=self.candidate, protect_input=[str(path) for path in self.protected],
+            write_acceptance_manifest=self.root / "manifest.json", manifest_not_after_unix=10000.0)
+        self.git = Mock(side_effect=lambda argv, **kwargs: types.SimpleNamespace(
+            stdout=b"" if argv[1] == "status" else b"0123456789abcdef0123456789abcdef01234567\n"))
+        for name, value in (("ROOT", self.root), ("WORKLOADS", self.workloads)):
+            self.enterContext(patch.object(bench, name, value))
+        self.enterContext(patch.object(bench, "direct_interpreter", return_value=self.interpreter))
+        self.enterContext(patch.object(bench.time, "time", return_value=1000.0))
+        self.enterContext(patch.object(bench.subprocess, "run", self.git))
+        self.popen = self.enterContext(patch.object(bench.subprocess, "Popen",
+                                                   side_effect=AssertionError("No workload process permitted")))
+        self.enterContext(patch.object(bench, "acceptance_controller",
+                                       side_effect=AssertionError("No controller permitted")))
+        self.enterContext(patch.object(bench, "_run_workload", side_effect=AssertionError("No workload permitted")))
+
+    def write(self):
+        self.assertEqual(bench.run(self.args), 0)
+        self.popen.assert_not_called()
+        self.assertFalse(self.args.output.exists())
+        return bench.load_acceptance_manifest(self.args.write_acceptance_manifest)
+
+    def refused(self, reason):
+        with self.assertRaisesRegex(ValueError, reason):
+            bench.run(self.args)
+        self.assertFalse(self.args.write_acceptance_manifest.exists())
+        self.assertFalse(self.args.output.exists())
+        self.popen.assert_not_called()
+
+    def load_changed(self, manifest):
+        path = self.root / "malformed.json"
+        path.write_text(json.dumps(manifest))
+        return bench.load_acceptance_manifest(path)
+
+    def test_writer_exact_manifest_roles_paths_identities_and_loader_round_trip(self):
+        manifest = self.write()
+        roles_and_paths = [("config", self.config), ("saved-exe", self.saved), ("selected-exe", self.candidate),
+            ("saved-build-receipt", self.saved_receipt), ("selected-build-receipt", self.selected_receipt),
+            *[("tokenizer", path) for path in self.tokenizer_files],
+            ("pack-descriptor", self.pack / "native_experts.txt"), ("pack-descriptor", self.source_receipt),
+            ("expert-profile", self.profile), *[("harness", path) for path in self.harness],
+            ("interpreter", self.interpreter), *[("protect-input", path) for path in self.protected]]
+        expected_inputs = [{"role": role, "path": str(path), "bytes": len(path.read_bytes()),
+                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                           for role, path in roles_and_paths]
+        expected_sizes = [{"role": role, "path": str(path), "bytes": path.stat().st_size,
+                           "mtime_ns": path.stat().st_mtime_ns}
+                          for role, path in [("model-shard", path) for path in self.shards]
+                          + [("pack-data", path) for path in self.pack_data]]
+        expected = {"schema": "strata-acceptance-manifest/1", "created_unix": 1000.0,
+            "not_after_unix": 10000.0, "source_head": "0123456789abcdef0123456789abcdef01234567",
+            "output": str(self.args.output), "workload": "short", "cohort": "automatic",
+            "expected_context": 65536, "port": 18081, "total_seconds": 1200,
+            "floors_gib": {"physical": 8.0, "commit": 9.0}, "candidate_exe": str(self.candidate),
+            "protect_input": [str(path) for path in self.protected], "inputs": expected_inputs,
+            "size_bound": expected_sizes, "unbound": [{"role": "python-dependencies",
+                "reason": "Interpreter file is hashed; imported packages and DLLs are not bound."}]}
+        self.assertEqual(manifest, expected)
+        self.assertEqual(self.args.write_acceptance_manifest.read_bytes(),
+                         (json.dumps(expected, indent=2) + "\n").encode())
+        self.assertNotIn(b"synthetic-private-key", self.args.write_acceptance_manifest.read_bytes())
+        self.assertEqual(self.git.call_count, 2)
+        self.assertEqual([call.args[0] for call in self.git.call_args_list], [
+            ["git", "status", "--porcelain=v1", "--untracked-files=no", "--",
+             *[str(path.relative_to(self.root)) for path in self.harness]], ["git", "rev-parse", "HEAD"]])
+        for call in self.git.call_args_list:
+            self.assertEqual(call.kwargs, {"cwd": self.root, "capture_output": True, "timeout": 30, "check": True})
+        self.assertFalse(bench.acceptance_ready())
+
+    def test_cli_writes_prints_manifest_path_and_returns_zero(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = bench.main(["--config", str(self.config), "--output", str(self.args.output),
+                "--acceptance-telemetry", "--acceptance-workload", "short", "--cohort", "automatic",
+                "--acceptance-physical-gib", "8", "--acceptance-commit-gib", "8", "--port", "18081",
+                "--write-acceptance-manifest", str(self.args.write_acceptance_manifest),
+                "--manifest-not-after-unix", "10000"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "Saved acceptance manifest to " + str(self.args.write_acceptance_manifest) + "\n")
+        manifest = bench.load_acceptance_manifest(self.args.write_acceptance_manifest)
+        self.assertIsNone(manifest["candidate_exe"])
+        self.assertEqual(manifest["total_seconds"], 900)
+        self.assertEqual(manifest["port"], 18081)
+        self.assertEqual([row["role"] for row in manifest["inputs"]].count("saved-build-receipt"), 1)
+        self.assertNotIn("selected-build-receipt", [row["role"] for row in manifest["inputs"]])
+        self.popen.assert_not_called()
+
+    def test_absent_receipts_remain_explicitly_source_unproven(self):
+        self.saved_receipt.unlink()
+        self.selected_receipt.unlink()
+        manifest = self.write()
+        self.assertEqual(manifest["unbound"], [
+            {"role": "python-dependencies", "reason": "Interpreter file is hashed; imported packages and DLLs are not bound."},
+            {"role": "saved-build-receipt", "reason": "absent; executable is source-unproven"},
+            {"role": "selected-build-receipt", "reason": "absent; executable is source-unproven"}])
+        self.assertFalse(any(row["role"].endswith("build-receipt") for row in manifest["inputs"]))
+
+    def test_saved_executable_and_default_receipt_use_root_when_cwd_is_absent(self):
+        self.cfg.pop("cwd")
+        self.cfg.pop("build_metadata")
+        self.cfg["exe"] = "engine/saved.exe"
+        receipt = self.saved.parent / "BUILD-saved.json"
+        receipt.write_bytes(b"synthetic default receipt")
+        self.config.write_text(json.dumps(self.cfg))
+        manifest = self.write()
+        self.assertEqual(manifest["inputs"][1]["path"], str(self.saved))
+        self.assertEqual(manifest["inputs"][3]["path"], str(receipt))
+
+    def test_relative_engine_arguments_bind_engine_cwd_despite_caller_cwd(self):
+        caller = self.root / "caller/engine"
+        caller.mkdir(parents=True)
+        decoy_pack = caller.parent / "pack"
+        decoy_pack.mkdir()
+        for path in [self.pack / "native_experts.txt", self.source_receipt, *self.pack_data]:
+            (decoy_pack / path.name).write_bytes(path.read_bytes())
+        (caller.parent / "profile.bin").write_bytes(b"wrong caller profile")
+        self.cfg["exe"] = str(self.saved)
+        self.cfg["tokenizer"] = "../../tokenizer"
+        for cwd in (str(self.saved.parent), "engine", None, ""):
+            self.cfg["cwd"] = cwd
+            prefix = "../" if cwd else ""
+            self.cfg["args"] = ["--pack", prefix + "pack", "--native", prefix + "model-01.gguf",
+                                "--expert-profile", prefix + "profile.bin"]
+            self.config.write_text(json.dumps(self.cfg))
+            with self.subTest(cwd=cwd), contextlib.chdir(caller):
+                manifest = self.write()
+            bound = [(row["role"], row["path"]) for row in manifest["inputs"]
+                     if row["role"] in ("pack-descriptor", "expert-profile", "tokenizer")]
+            self.assertEqual(bound, [*[("tokenizer", str(path)) for path in self.tokenizer_files],
+                ("pack-descriptor", str(self.pack / "native_experts.txt")),
+                ("pack-descriptor", str(self.source_receipt)), ("expert-profile", str(self.profile))])
+            self.assertEqual([row["path"] for row in manifest["size_bound"]],
+                             [str(path) for path in self.shards + self.pack_data])
+            self.args.write_acceptance_manifest.unlink()
+        self.popen.assert_not_called()
+
+    def test_existing_destination_is_preserved(self):
+        self.args.write_acceptance_manifest.write_bytes(b"prior evidence")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            bench.run(self.args)
+        self.assertEqual(self.args.write_acceptance_manifest.read_bytes(), b"prior evidence")
+        self.git.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_output_contained_or_equal_destination_is_refused_before_creation(self):
+        for path in (self.args.output, self.args.output / "manifest.json"):
+            with self.subTest(path=path):
+                self.args.write_acceptance_manifest = path
+                self.refused("outside output")
+        self.git.assert_not_called()
+
+    def test_frozen_control_is_refused(self):
+        self.args.cohort = "frozen-control"
+        self.refused("Frozen control")
+        self.git.assert_not_called()
+
+    def test_missing_pack_or_native_flag_is_refused(self):
+        for flag in ("--pack", "--native"):
+            cfg = bench.copy.deepcopy(self.cfg)
+            index = cfg["args"].index(flag)
+            del cfg["args"][index:index + 2]
+            self.config.write_text(json.dumps(cfg))
+            with self.subTest(flag=flag):
+                self.refused("Acceptance inputs require --pack and --native")
+        self.git.assert_not_called()
+
+    def test_writer_options_must_be_supplied_together(self):
+        for key in ("write_acceptance_manifest", "manifest_not_after_unix"):
+            args = argparse.Namespace(**vars(self.args))
+            setattr(args, key, None)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "required together"):
+                bench.run(args)
+        self.assertFalse(self.args.write_acceptance_manifest.exists())
+        self.git.assert_not_called()
+
+    def test_writer_requires_telemetry_selection_and_explicit_floors(self):
+        changes = [{"acceptance_telemetry": False}, {"acceptance_workload": None, "cohort": None,
+            "candidate_exe": None, "protect_input": []}, {"acceptance_physical_gib": None},
+            {"acceptance_commit_gib": None}, {"acceptance_physical_gib": 3.9}]
+        for changed in changes:
+            args = argparse.Namespace(**vars(self.args))
+            vars(args).update(changed)
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                bench.run(args)
+        self.assertFalse(self.args.write_acceptance_manifest.exists())
+        self.git.assert_not_called()
+
+    def test_dirty_tracked_harness_refuses_before_write(self):
+        self.git.side_effect = lambda *args, **kwargs: types.SimpleNamespace(stdout=b" M serve/server.py\n")
+        self.refused("harness source is dirty")
+        self.assertEqual(self.git.call_count, 1)
+
+    def test_changed_source_shard_mtime_refuses_before_write(self):
+        path = self.shards[0]
+        stat = path.stat()
+        bench.os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+        self.refused("Source shard stat differs")
+        self.git.assert_not_called()
+
+    def test_changed_source_shard_size_refuses_before_write(self):
+        self.shards[0].write_bytes(b"changed shard size")
+        self.refused("Source shard stat differs")
+
+    def test_duplicate_resolved_protected_path_is_refused(self):
+        self.args.protect_input.append(str(self.protected[0].parent / "engine/../launcher.bat"))
+        self.refused("Duplicate resolved input path")
+
+    def test_candidate_resolving_to_saved_executable_is_refused(self):
+        self.args.candidate_exe = self.saved.parent / "../engine/saved.exe"
+        self.refused("Duplicate resolved input path")
+
+    def test_missing_protected_input_is_refused(self):
+        self.protected[0].unlink()
+        self.refused("protected input is missing")
+
+    def test_symbolic_link_input_or_pack_entry_is_refused(self):
+        # Model the filesystem seam so this refusal does not need Windows symlink privileges.
+        real_is_symlink = Path.is_symlink
+        for target in (self.config, self.candidate, self.saved_receipt, self.pack_data[0], self.shards[0]):
+            with self.subTest(target=target), patch.object(Path, "is_symlink",
+                    lambda path: path == target or real_is_symlink(path)):
+                self.refused("symbolic link")
+
+    def test_saved_executable_direct_symbolic_link_is_refused(self):
+        link = self.root / "saved-link.exe"
+        link.symlink_to(self.saved)
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(link.is_file())
+        self.cfg["exe"] = str(link)
+        self.config.write_text(json.dumps(self.cfg))
+        self.refused("symbolic link")
+        self.git.assert_not_called()
+
+    def test_saved_executable_symbolic_link_ancestor_is_refused(self):
+        link = self.root / "engine-link"
+        link.symlink_to(self.saved.parent, target_is_directory=True)
+        self.assertTrue(link.is_symlink())
+        supplied = link / self.saved.name
+        self.assertFalse(supplied.is_symlink())
+        self.assertTrue(supplied.is_file())
+        self.cfg["exe"] = str(supplied)
+        self.config.write_text(json.dumps(self.cfg))
+        self.refused("symbolic link")
+        self.git.assert_not_called()
+
+    def test_pack_directory_symbolic_link_ancestor_is_refused(self):
+        link = self.root / "pack-parent-link"
+        link.symlink_to(self.pack.parent, target_is_directory=True)
+        self.assertTrue(link.is_symlink())
+        supplied = link / self.pack.name
+        self.assertFalse(supplied.is_symlink())
+        self.assertTrue(supplied.is_dir())
+        self.cfg["args"][self.cfg["args"].index("--pack") + 1] = str(supplied)
+        self.config.write_text(json.dumps(self.cfg))
+        self.refused("symbolic link")
+        self.git.assert_not_called()
+
+    def test_symbolic_link_ancestor_before_parent_traversal_is_refused(self):
+        link = self.root / "engine-link"
+        link.symlink_to(self.saved.parent, target_is_directory=True)
+        self.assertTrue(link.is_symlink())
+        supplied = link / ".." / "engine" / self.saved.name
+        self.assertFalse(supplied.is_symlink())
+        self.assertTrue(supplied.is_file())
+        self.cfg.update(cwd=str(self.root), exe="engine-link/../engine/saved.exe")
+        self.config.write_text(json.dumps(self.cfg))
+        self.refused("symbolic link")
+        self.git.assert_not_called()
+
+    def test_invalid_source_head_or_expiry_refuses_before_write(self):
+        for head in (b"ABCDEF0123456789abcdef0123456789abcdef0123\n", b"short\n"):
+            self.git.side_effect = lambda argv, head=head, **kwargs: types.SimpleNamespace(
+                stdout=b"" if argv[1] == "status" else head)
+            with self.subTest(head=head):
+                self.refused("digest")
+        self.git.side_effect = lambda argv, **kwargs: types.SimpleNamespace(
+            stdout=b"" if argv[1] == "status" else b"0123456789abcdef0123456789abcdef01234567\n")
+        self.args.manifest_not_after_unix = 2199.0
+        self.refused("window is too short")
+
+    def test_loader_rejects_duplicate_keys_at_top_level_and_inside_rows(self):
+        manifest = self.write()
+        raw = json.dumps(manifest)
+        path = self.root / "duplicate.json"
+        for changed in ('{"schema":"strata-acceptance-manifest/1",' + raw[1:],
+                        raw.replace('"physical": 8.0', '"physical": 8.0, "physical": 8.0'),
+                        raw.replace('"role": "config"', '"role": "config", "role": "config"')):
+            path.write_text(changed)
+            with self.subTest(changed=changed[:80]), self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
+                bench.load_acceptance_manifest(path)
+
+    def test_loader_rejects_missing_extra_keys_in_every_container(self):
+        manifest = self.write()
+        for container in ((), ("floors_gib",), ("inputs", 0), ("size_bound", 0), ("unbound", 0)):
+            for operation in ("missing", "extra"):
+                changed = bench.copy.deepcopy(manifest)
+                target = changed
+                for key in container:
+                    target = target[key]
+                if operation == "missing":
+                    del target[next(iter(target))]
+                else:
+                    target["unexpected"] = None
+                with self.subTest(container=container, operation=operation), self.assertRaises(ValueError):
+                    self.load_changed(changed)
+
+    def test_loader_rejects_wrong_exact_types_without_coercion(self):
+        manifest = self.write()
+        changes = {("schema",): [1, None], ("created_unix",): [True, "1000", None],
+            ("not_after_unix",): [False, "10000", None], ("source_head",): [40, None],
+            ("output",): [1, None], ("workload",): [True, []], ("cohort",): [1, []],
+            ("expected_context",): [True, 65536.0, "65536"], ("port",): [True, 18081.0, "18081"],
+            ("total_seconds",): [True, 1200.0, "1200"], ("floors_gib",): [[], None],
+            ("floors_gib", "physical"): [True, "8", None], ("floors_gib", "commit"): [False, "9", None],
+            ("candidate_exe",): [1, []], ("protect_input",): [{}, "path"], ("protect_input", 0): [None, 1],
+            ("inputs",): [{}, None], ("inputs", 0): [[], None], ("inputs", 0, "role"): [[], 1],
+            ("inputs", 0, "path"): [None, 1], ("inputs", 0, "sha256"): [None, 1],
+            ("inputs", 0, "bytes"): [True, 1.0, "1"], ("size_bound",): [{}, None],
+            ("size_bound", 0, "bytes"): [True, 1.0, "1"],
+            ("size_bound", 0, "mtime_ns"): [True, 1.0, "1"], ("unbound",): [{}, None],
+            ("unbound", 0, "role"): [[], 1], ("unbound", 0, "reason"): [False, 1]}
+        for keys, values in changes.items():
+            for value in values:
+                changed = bench.copy.deepcopy(manifest)
+                target = changed
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = value
+                with self.subTest(keys=keys, value=value), self.assertRaises(ValueError):
+                    self.load_changed(changed)
+
+    def test_loader_rejects_uppercase_or_wrong_length_digests(self):
+        manifest = self.write()
+        for key in ("source_head", "sha256"):
+            for value in ("A" * (40 if key == "source_head" else 64), "a" * 39, "g" * 64):
+                changed = bench.copy.deepcopy(manifest)
+                (changed if key == "source_head" else changed["inputs"][0])[key] = value
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, "digest"):
+                    self.load_changed(changed)
+
+    def test_loader_rejects_relative_paths_in_all_path_fields(self):
+        manifest = self.write()
+        for keys in (("output",), ("candidate_exe",), ("protect_input", 0),
+                     ("inputs", 0, "path"), ("size_bound", 0, "path")):
+            changed = bench.copy.deepcopy(manifest)
+            target = changed
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = "relative/path"
+            with self.subTest(keys=keys), self.assertRaisesRegex(ValueError, "absolute"):
+                self.load_changed(changed)
+
+    def test_loader_rejects_invalid_values_and_duplicate_resolved_inputs(self):
+        manifest = self.write()
+        for keys, value in ((("created_unix",), float("nan")), (("not_after_unix",), float("inf")),
+                (("floors_gib", "physical"), 3.9), (("inputs", 0, "bytes"), -1),
+                (("size_bound", 0, "mtime_ns"), -1), (("port",), 65536), (("total_seconds",), 899),
+                (("expected_context",), 65537), (("cohort",), "frozen-control"), (("workload",), "unknown")):
+            changed = bench.copy.deepcopy(manifest)
+            target = changed
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with self.subTest(keys=keys, value=value), self.assertRaises(ValueError):
+                self.load_changed(changed)
+        changed = bench.copy.deepcopy(manifest)
+        changed["inputs"].append(dict(changed["inputs"][0]))
+        with self.assertRaisesRegex(ValueError, "Duplicate resolved input"):
+            self.load_changed(changed)
+
+    def test_loader_reads_only_limit_plus_one_and_refuses_oversized_bytes(self):
+        stream = io.BytesIO(b" " * (1024**2 + 2))
+        read = Mock(wraps=stream.read)
+        stream.read = read
+        with patch.object(Path, "open", return_value=stream):
+            with self.assertRaisesRegex(ValueError, "exceeds its evidence budget"):
+                bench.load_acceptance_manifest(self.root / "oversized.json")
+        read.assert_called_once_with(1024**2 + 1)
+
+    def test_loader_reports_malformed_json_encoding_or_missing_file_as_value_error(self):
+        path = self.root / "invalid.json"
+        for data in (b"{", b"\xff", b"[]", b"null"):
+            path.write_bytes(data)
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                bench.load_acceptance_manifest(path)
+        with self.assertRaises(ValueError):
+            bench.load_acceptance_manifest(self.root / "missing.json")
+
+    def test_short_or_failed_manifest_write_removes_its_partial_destination(self):
+        original_open = Path.open
+        before = set(self.root.iterdir())
+        for failure in ("short", "write", "flush", "close"):
+            writes = []
+            def open_stream(path, mode="r", *args, **kwargs):
+                stream = original_open(path, mode, *args, **kwargs)
+                if mode != "xb":
+                    return stream
+                writes.append(path)
+                class FailedStream:
+                    def __enter__(inner): return inner
+                    def __exit__(inner, *exc):
+                        stream.close()
+                        if failure == "close":
+                            raise OSError("simulated close failure")
+                    def write(inner, data):
+                        if failure == "write":
+                            stream.write(data[:10])
+                            raise OSError("simulated write failure")
+                        return stream.write(data[:-1] if failure == "short" else data)
+                    def flush(inner):
+                        if failure == "flush":
+                            raise OSError("simulated flush failure")
+                        stream.flush()
+                return FailedStream()
+            with self.subTest(failure=failure), patch.object(Path, "open", open_stream):
+                with self.assertRaisesRegex(OSError, "Short artifact write|simulated .* failure"):
+                    bench.run(self.args)
+            self.assertFalse(self.args.write_acceptance_manifest.exists())
+            self.assertFalse(self.args.output.exists())
+            self.assertEqual(len(writes), 1)
+            self.assertEqual(set(self.root.iterdir()), before)
+        self.popen.assert_not_called()
+
+    def test_exclusive_write_race_preserves_the_other_writers_destination(self):
+        real_write = bench.bounded_write
+        def race(path, *args, **kwargs):
+            path.write_bytes(b"another writer's evidence")
+            return real_write(path, *args, **kwargs)
+        with patch.object(bench, "bounded_write", side_effect=race), self.assertRaises(FileExistsError):
+            bench.run(self.args)
+        self.assertEqual(self.args.write_acceptance_manifest.read_bytes(), b"another writer's evidence")
+        self.assertFalse(self.args.output.exists())
+
+    def test_failed_exclusive_write_preserves_replacement_created_after_close(self):
+        original_open = Path.open
+        destination = self.args.write_acceptance_manifest
+        replacement = b"another writer's replacement after close"
+        chronology = []
+
+        def open_stream(path, mode="r", *args, **kwargs):
+            stream = original_open(path, mode, *args, **kwargs)
+            if mode not in ("wb", "xb"):
+                return stream
+            class FailedStream:
+                def __enter__(inner): return inner
+                def __exit__(inner, *exc):
+                    stream.close()
+                    self.assertTrue(stream.closed)
+                    chronology.append("closed")
+                    destination.unlink(missing_ok=True)
+                    with original_open(destination, "xb") as other:
+                        other.write(replacement)
+                    chronology.append("replaced")
+                def write(inner, data): return stream.write(data)
+                def flush(inner):
+                    chronology.append("flush failed")
+                    raise OSError("simulated flush failure")
+            return FailedStream()
+
+        with patch.object(Path, "open", open_stream), self.assertRaisesRegex(OSError, "simulated flush failure"):
+            bench.run(self.args)
+        self.assertEqual(chronology, ["flush failed", "closed", "replaced"])
+        self.assertTrue(destination.exists())
+        self.assertEqual(destination.read_bytes(), replacement)
+        self.assertFalse(self.args.output.exists())
+        self.popen.assert_not_called()
+
+    def test_exclusive_publication_race_after_close_preserves_other_writer(self):
+        original_open = Path.open
+        destination = self.args.write_acceptance_manifest
+        replacement = b"another writer published before the final link"
+        before = set(self.root.iterdir())
+
+        def open_stream(path, mode="r", *args, **kwargs):
+            stream = original_open(path, mode, *args, **kwargs)
+            if mode != "xb":
+                return stream
+            class RacingStream:
+                def __enter__(inner): return inner
+                def __exit__(inner, *exc):
+                    stream.close()
+                    with original_open(destination, "xb") as other:
+                        other.write(replacement)
+                def write(inner, data): return stream.write(data)
+                def flush(inner): stream.flush()
+            return RacingStream()
+
+        with patch.object(Path, "open", open_stream), self.assertRaises(FileExistsError):
+            bench.run(self.args)
+        self.assertEqual(destination.read_bytes(), replacement)
+        self.assertEqual(set(self.root.iterdir()), before | {destination})
+        self.assertFalse(self.args.output.exists())
+        self.popen.assert_not_called()
+
+    def test_exclusive_publication_failure_removes_staging_and_leaves_no_manifest(self):
+        before = set(self.root.iterdir())
+        with patch.object(bench.os, "link", side_effect=OSError("simulated publication failure")) as link:
+            with self.assertRaisesRegex(OSError, "simulated publication failure"):
+                bench.run(self.args)
+        link.assert_called_once()
+        self.assertFalse(self.args.write_acceptance_manifest.exists())
+        self.assertFalse(self.args.output.exists())
+        self.assertEqual(set(self.root.iterdir()), before)
+        self.popen.assert_not_called()
+
+    def test_exclusive_deadline_after_close_refuses_before_publication(self):
+        before = set(self.root.iterdir())
+        with patch.object(bench.time, "monotonic", side_effect=[0, 1]), patch.object(bench.os, "link") as link:
+            with self.assertRaisesRegex(TimeoutError, "finalization exceeded"):
+                bench.bounded_write(self.args.write_acceptance_manifest, b"{}", deadline=1, exclusive=True)
+        link.assert_not_called()
+        self.assertFalse(self.args.write_acceptance_manifest.exists())
+        self.assertEqual(set(self.root.iterdir()), before)
+
+
 class StageCRepairTests(unittest.TestCase):
     def source(self):
         case = StageCSourceTests()

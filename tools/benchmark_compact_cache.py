@@ -96,6 +96,12 @@ PORT = 8081
 CONTEXT = 131072
 LOG_LIMIT = 4 * 1024**2
 ACCEPTANCE_LOG_LIMIT = 1024**2
+ACCEPTANCE_MANIFEST_SCHEMA = "strata-acceptance-manifest/1"
+ACCEPTANCE_MANIFEST_KEYS = {
+    "schema", "created_unix", "not_after_unix", "source_head", "output", "workload", "cohort",
+    "expected_context", "port", "total_seconds", "floors_gib", "candidate_exe", "protect_input",
+    "inputs", "size_bound", "unbound",
+}
 ACCEPTANCE_RECEIPT_LIMIT = 6 * 1024**2
 ACCEPTANCE_ARTIFACT_LIMIT = 12 * 1024**2
 ACCEPTANCE_SECONDS = 900
@@ -1667,16 +1673,285 @@ def direct_interpreter():
     return interpreter
 
 
-def bounded_write(path, data, deadline, limit=ACCEPTANCE_LOG_LIMIT):
-    """Write only provisional bytes. Check short writes and close before returning."""
+def acceptance_harness_paths():
+    return [ROOT / "tools/benchmark_compact_cache.py", ROOT / "serve/server.py",
+            ROOT / "tools/prepare_unsloth_q2.py", ROOT / "setup.py",
+            WORKLOADS / "validation.py", WORKLOADS / "benchmark.py"]
+
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key.")
+        result[key] = value
+    return result
+
+
+def manifest_path(value):
+    if type(value) is not str or not value or "\0" in value or not Path(value).is_absolute():
+        raise ValueError("Manifest paths must be absolute strings.")
+
+
+def manifest_digest(value, length):
+    if type(value) is not str or re.fullmatch("[0-9a-f]{" + str(length) + "}", value) is None:
+        raise ValueError("Invalid manifest digest.")
+
+
+def validate_acceptance_manifest(manifest):
+    """Validate evidence without coercing JSON scalars or reading input contents."""
+    if type(manifest) is not dict or manifest.keys() != ACCEPTANCE_MANIFEST_KEYS:
+        raise ValueError("Invalid manifest keys.")
+    if type(manifest["schema"]) is not str or manifest["schema"] != ACCEPTANCE_MANIFEST_SCHEMA:
+        raise ValueError("Invalid manifest schema.")
+    manifest_digest(manifest["source_head"], 40)
+    for key, low, high in (("expected_context", 65536, CONTEXT), ("port", 1024, 65535),
+                           ("total_seconds", 900, 5400)):
+        value = manifest[key]
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError("Invalid manifest " + key + ".")
+    if manifest["expected_context"] not in (65536, CONTEXT):
+        raise ValueError("Invalid manifest context.")
+    for key in ("created_unix", "not_after_unix"):
+        if not valid_number(manifest[key]) or manifest[key] < 0:
+            raise ValueError("Invalid manifest time.")
+    if manifest["not_after_unix"] - manifest["created_unix"] < manifest["total_seconds"]:
+        raise ValueError("Manifest window is too short.")
+    for key, choices in (("workload", ("short", "near-full")), ("cohort", ("saved-static", "automatic"))):
+        if type(manifest[key]) is not str or manifest[key] not in choices:
+            raise ValueError("Invalid manifest " + key + ".")
+    floors = manifest["floors_gib"]
+    if (type(floors) is not dict or floors.keys() != {"physical", "commit"}
+            or any(not valid_number(value) or value < 4 for value in floors.values())):
+        raise ValueError("Invalid manifest floors.")
+    manifest_path(manifest["output"])
+    if manifest["candidate_exe"] is not None:
+        manifest_path(manifest["candidate_exe"])
+    if type(manifest["protect_input"]) is not list:
+        raise ValueError("Invalid manifest protect_input.")
+    for path in manifest["protect_input"]:
+        manifest_path(path)
+    paths = set()
+    for key, roles, identity in (
+            ("inputs", {"config", "saved-exe", "selected-exe", "saved-build-receipt", "selected-build-receipt",
+                        "tokenizer", "pack-descriptor", "expert-profile", "harness", "interpreter", "protect-input"}, "sha256"),
+            ("size_bound", {"model-shard", "pack-data"}, "mtime_ns")):
+        if type(manifest[key]) is not list:
+            raise ValueError("Invalid manifest " + key + ".")
+        for row in manifest[key]:
+            if type(row) is not dict or row.keys() != {"role", "path", "bytes", identity}:
+                raise ValueError("Invalid manifest input keys.")
+            if type(row["role"]) is not str or row["role"] not in roles:
+                raise ValueError("Invalid manifest input role.")
+            manifest_path(row["path"])
+            resolved = Path(row["path"]).resolve()
+            if resolved in paths:
+                raise ValueError("Duplicate resolved input path.")
+            paths.add(resolved)
+            if type(row["bytes"]) is not int or row["bytes"] < 0:
+                raise ValueError("Invalid manifest input bytes.")
+            if identity == "sha256":
+                manifest_digest(row[identity], 64)
+            elif type(row[identity]) is not int or row[identity] < 0:
+                raise ValueError("Invalid manifest input mtime_ns.")
+    if type(manifest["unbound"]) is not list:
+        raise ValueError("Invalid manifest unbound.")
+    reasons = {"python-dependencies": "Interpreter file is hashed; imported packages and DLLs are not bound.",
+               "saved-build-receipt": "absent; executable is source-unproven",
+               "selected-build-receipt": "absent; executable is source-unproven"}
+    unbound_roles = set()
+    for row in manifest["unbound"]:
+        if (type(row) is not dict or row.keys() != {"role", "reason"}
+                or type(row["role"]) is not str or row["role"] not in reasons
+                or type(row["reason"]) is not str or row["reason"] != reasons[row["role"]]
+                or row["role"] in unbound_roles):
+            raise ValueError("Invalid manifest unbound reason.")
+        unbound_roles.add(row["role"])
+    if "python-dependencies" not in unbound_roles:
+        raise ValueError("Missing Python dependency limit.")
+    return manifest
+
+
+def load_acceptance_manifest(path):
+    try:
+        with Path(path).open("rb") as stream:
+            data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+        if len(data) > ACCEPTANCE_LOG_LIMIT:
+            raise ValueError("Manifest exceeds its evidence budget.")
+        manifest = json.loads(data.decode("utf-8"), object_pairs_hook=unique_json_object)
+        return validate_acceptance_manifest(manifest)
+    except (OSError, UnicodeError, RuntimeError, TypeError, ValueError) as exc:
+        if type(exc) is ValueError:
+            raise
+        raise ValueError("Cannot read a valid acceptance manifest.") from exc
+
+
+def acceptance_inputs(args, cfg):
+    """Hash small reviewed inputs and stat-bind the pack and verified source shards."""
+    from tools.prepare_unsloth_q2 import engine_metadata
+
+    flags = cfg.get("args", [])
+    if (type(flags) is not list or any(type(flag) is not str for flag in flags)
+            or "--pack" not in flags or "--native" not in flags):
+        raise ValueError("Acceptance inputs require --pack and --native")
+
+    def argument(flag):
+        index = flags.index(flag)
+        if flags.count(flag) != 1 or index + 1 == len(flags) or flags[index + 1].startswith("--"):
+            raise ValueError("Invalid acceptance input flag.")
+        # The server starts in ROOT; the engine's cwd overrides that inherited base.
+        return ROOT / (cfg.get("cwd") or ".") / flags[index + 1]
+
+    pack = argument("--pack")
+    argument("--native")
+    inputs, size_bound = [], []
+    unbound = [{"role": "python-dependencies",
+                "reason": "Interpreter file is hashed; imported packages and DLLs are not bound."}]
+    paths = set()
+
+    def resolved_input(path):
+        path = Path(path)
+        # Check supplied ancestors before resolve() removes symbolic links and '..'.
+        if any(part.is_symlink() for part in (path, *path.parents)) or not path.is_file():
+            raise ValueError("A protected input is missing or is a symbolic link.")
+        resolved = path.resolve()
+        if resolved in paths:
+            raise ValueError("Duplicate resolved input path.")
+        paths.add(resolved)
+        return resolved
+
+    def hashed(role, path):
+        resolved = resolved_input(path)
+        inputs.append(dict(role=role, **protection_snapshot([resolved])[0]))
+
+    hashed("config", args.config)
+    saved_exe = Path(cfg["exe"])
+    if not saved_exe.is_absolute():
+        saved_exe = Path(cfg.get("cwd") or ROOT) / saved_exe
+    hashed("saved-exe", saved_exe)
+    candidate = getattr(args, "candidate_exe", None)
+    if candidate is not None:
+        hashed("selected-exe", candidate)
+    saved_metadata = Path(cfg.get("build_metadata") or engine_metadata(saved_exe.resolve()))
+    if not saved_metadata.is_absolute():
+        saved_metadata = ROOT / saved_metadata
+    receipts = [("saved-build-receipt", saved_metadata)]
+    # With no candidate the saved executable/receipt already binds the selected one.
+    if candidate is not None:
+        receipts.append(("selected-build-receipt", engine_metadata(Path(candidate).resolve())))
+    for role, path in receipts:
+        if path.exists() or path.is_symlink():
+            hashed(role, path)
+        else:
+            unbound.append({"role": role, "reason": "absent; executable is source-unproven"})
+    if type(cfg.get("tokenizer")) is not str or not cfg["tokenizer"]:
+        raise ValueError("Acceptance inputs require a tokenizer directory.")
+    tokenizer = Path(cfg["tokenizer"])
+    for name in ("vocab.json", "merges.txt", "token_type.json", "chat_template.jinja"):
+        hashed("tokenizer", tokenizer / name)
+    for name in ("native_experts.txt", "source-verification.json"):
+        hashed("pack-descriptor", pack / name)
+    if "--expert-profile" in flags:
+        hashed("expert-profile", argument("--expert-profile"))
+    for path in acceptance_harness_paths():
+        hashed("harness", path)
+    hashed("interpreter", direct_interpreter())
+    for path in getattr(args, "protect_input", []):
+        hashed("protect-input", path)
+    with (pack / "source-verification.json").open("rb") as stream:
+        data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+    if len(data) > ACCEPTANCE_LOG_LIMIT:
+        raise ValueError("Source receipt exceeds its evidence budget.")
+    receipt = json.loads(data.decode("utf-8-sig"), object_pairs_hook=unique_json_object)
+    if type(receipt) is not dict or not receipt:
+        raise ValueError("Invalid source verification receipt.")
+    for name in sorted(receipt):
+        row = receipt[name]
+        if (type(row) is not dict or row.keys() != {"path", "size", "mtime_ns", "sha256"}
+                or type(row["size"]) is not int or row["size"] < 0
+                or type(row["mtime_ns"]) is not int or row["mtime_ns"] < 0):
+            raise ValueError("Invalid source shard identity.")
+        manifest_path(row["path"])
+        manifest_digest(row["sha256"], 64)
+        path = resolved_input(row["path"])
+        stat = path.stat()
+        if (stat.st_size, stat.st_mtime_ns) != (row["size"], row["mtime_ns"]):
+            raise ValueError("Source shard stat differs from its verification receipt.")
+        size_bound.append({"role": "model-shard", "path": str(path),
+                           "bytes": row["size"], "mtime_ns": row["mtime_ns"]})
+    input_paths = {Path(row["path"]) for row in inputs}
+    for path in sorted(pack.iterdir()):
+        if path.is_symlink():
+            raise ValueError("A protected input is missing or is a symbolic link.")
+        if path.is_file() and path.resolve() not in input_paths:
+            path = resolved_input(path)
+            stat = path.stat()
+            size_bound.append({"role": "pack-data", "path": str(path),
+                               "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return inputs, size_bound, unbound
+
+
+def write_acceptance_manifest(args):
+    selection, context = acceptance_selection(args)
+    if not getattr(args, "acceptance_telemetry", False) or selection is None:
+        raise ValueError("Manifest writing requires acceptance telemetry and a selected workload.")
+    if args.cohort == "frozen-control":
+        raise ValueError("Frozen control cannot use an acceptance manifest.")
+    destination = Path(args.write_acceptance_manifest)
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("Acceptance manifest destination already exists.")
+    destination = destination.resolve()
+    output = args.output.resolve()
+    if destination.is_relative_to(output):
+        raise ValueError("Acceptance manifest must be outside output.")
+    if output.exists():
+        raise ValueError("Output directory already exists; choose a new directory.")
+    cfg = json.loads(args.config.read_text(encoding="utf-8-sig"))
+    inputs, size_bound, unbound = acceptance_inputs(args, cfg)
+    paths = [str(path.relative_to(ROOT)) for path in acceptance_harness_paths()]
+    status = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=no", "--", *paths],
+                            cwd=ROOT, capture_output=True, timeout=30, check=True).stdout
+    if status:
+        raise ValueError("Tracked harness source is dirty.")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
+                          timeout=30, check=True).stdout
+    if len(head) > 128:
+        raise ValueError("Invalid source head.")
+    source_head = head.decode("ascii").strip()
+    manifest = {"schema": ACCEPTANCE_MANIFEST_SCHEMA, "created_unix": time.time(),
+                "not_after_unix": args.manifest_not_after_unix, "source_head": source_head,
+                "output": str(output), "workload": selection, "cohort": args.cohort,
+                "expected_context": context, "port": getattr(args, "port", PORT),
+                "total_seconds": getattr(args, "acceptance_total_seconds", None) or ACCEPTANCE_SECONDS,
+                "floors_gib": {"physical": args.acceptance_physical_gib, "commit": args.acceptance_commit_gib},
+                "candidate_exe": str(args.candidate_exe.resolve()) if args.candidate_exe is not None else None,
+                "protect_input": [str(Path(path).resolve()) for path in getattr(args, "protect_input", [])],
+                "inputs": inputs, "size_bound": size_bound, "unbound": unbound}
+    validate_acceptance_manifest(manifest)
+    data = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+    bounded_write(destination, data, time.monotonic() + 30, exclusive=True)
+    return 0
+
+
+def bounded_write(path, data, deadline, limit=ACCEPTANCE_LOG_LIMIT, *, exclusive=False):
+    """Check writes and close before publishing an exclusive destination without replacement."""
     if time.monotonic() >= deadline or len(data) > limit:
         raise RuntimeError("Artifact exceeds its size or absolute time budget.")
-    with path.open("wb") as stream:
-        if stream.write(data) != len(data):
-            raise OSError("Short artifact write.")
-        stream.flush()
-    if time.monotonic() >= deadline:
-        raise TimeoutError("Artifact finalization exceeded the absolute deadline.")
+    # A private same-filesystem staging file avoids deleting a foreign destination
+    # after a failed close. Cleanup must not report failure after publication.
+    staging = (tempfile.TemporaryDirectory(prefix=".strata-manifest-", dir=path.parent,
+                                          ignore_cleanup_errors=True)
+               if exclusive else contextlib.nullcontext())
+    with staging as directory:
+        pending = Path(directory) / "manifest" if exclusive else path
+        with pending.open("xb" if exclusive else "wb") as stream:
+            if stream.write(data) != len(data):
+                raise OSError("Short artifact write.")
+            stream.flush()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Artifact finalization exceeded the absolute deadline.")
+        if exclusive:
+            os.link(pending, path)
 
 
 def acceptance_worker(envelope):
@@ -1936,6 +2211,12 @@ def run(args):
         if type(total_seconds) is not int or not 900 <= total_seconds <= 5400:
             raise ValueError("Acceptance total seconds must be between 900 and 5400.")
     acceptance_selection(args)
+    writer = getattr(args, "write_acceptance_manifest", None)
+    not_after = getattr(args, "manifest_not_after_unix", None)
+    if writer is not None or not_after is not None:
+        if writer is None or not_after is None:
+            raise ValueError("Manifest destination and not-after time are required together.")
+        return write_acceptance_manifest(args)
     if getattr(args, "acceptance_telemetry", False):
         return acceptance_controller(args, time.monotonic())
     return _run_workload(args)
@@ -2293,6 +2574,10 @@ def main(argv=None):
                         help="Prepare opt-in host acceptance telemetry; runtime remains held for Stage B/C")
     parser.add_argument("--acceptance-total-seconds", type=int,
                         help="Opt-in total acceptance budget, 900-5400 seconds (default 900)")
+    parser.add_argument("--write-acceptance-manifest", type=Path, metavar="PATH",
+                        help="Write reviewed input identities without starting a workload")
+    parser.add_argument("--manifest-not-after-unix", type=float, metavar="SECONDS",
+                        help="Manifest expiry as Unix time; required with --write-acceptance-manifest")
     parser.add_argument("--acceptance-physical-gib", type=float,
                         help="Opt-in physical headroom floor in GiB (default 4)")
     parser.add_argument("--acceptance-commit-gib", type=float,
@@ -2308,7 +2593,10 @@ def main(argv=None):
         # Arbitrary exception messages can include HTTP credentials; details are redacted on disk.
         print(f"Benchmark stopped ({type(exc).__name__}); see results.json if the run started.", file=sys.stderr)
         return 1
-    print(f"Saved benchmark to {args.output}")
+    if args.write_acceptance_manifest is not None:
+        print(f"Saved acceptance manifest to {args.write_acceptance_manifest.resolve()}")
+    else:
+        print(f"Saved benchmark to {args.output}")
     return 0
 
 
