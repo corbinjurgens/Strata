@@ -66,12 +66,21 @@ struct FileExpertSourceTestAccess {
             throw std::runtime_error("ready-copy fixture could not claim a stage buffer");
         std::memcpy(s.stage_buf_[v].get(), bytes, (size_t) s.layer_blob_bytes_[(size_t) layer]);
         s.stage_busy_[v] = busy ? 1 : 0;
+        if (!busy) {
+            s.stage_pending_bytes_ -= s.stage_pending_[v];
+            s.stage_pending_[v] = 0;
+        }
         s.stage_pf_[v] = 1;
         return s.stage_buf_[v].get();
     }
     static void busy_key(FileExpertSource& s, int64_t key, bool busy) {
         std::lock_guard<std::mutex> lock(s.stage_mu_);
-        s.stage_busy_[s.stage_of_.at(key)] = busy ? 1 : 0;
+        const size_t v = s.stage_of_.at(key);
+        s.stage_busy_[v] = busy ? 1 : 0;
+        if (!busy) {
+            s.stage_pending_bytes_ -= s.stage_pending_[v];
+            s.stage_pending_[v] = 0;
+        }
     }
     static int64_t exchange_stage_owner(FileExpertSource& s, int64_t key, int64_t owner) {
         std::lock_guard<std::mutex> lock(s.stage_mu_);
@@ -108,19 +117,48 @@ struct FileExpertSourceTestAccess {
         s.role_ptr_.resize(6, nullptr);
         s.layer_blob_bytes_ = {small, large};
         s.stage_blob_ = large;
+        s.fetch_profiling_ = true;
+    }
+    struct StageClaim { bool have = false, fill = false; size_t slot = 0; const uint8_t* data = nullptr; };
+    static StageClaim reserve(FileExpertSource& s, int64_t key, const HostMemory* memory, bool ahead = false) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        StageClaim c;
+        c.have = s.claim_stage(key, c.slot, c.fill, ahead, memory, false);
+        if (c.have || c.fill) c.data = s.stage_buf_[c.slot].get();
+        if (c.fill && ahead) s.stage_pf_[c.slot] = 1;   // the worker marks a claimed read-ahead slot before filling
+        return c;
     }
     static const uint8_t* claim(FileExpertSource& s, int64_t key, const HostMemory& memory,
                                 uint8_t value, bool publish = true) {
-        std::lock_guard<std::mutex> lock(s.stage_mu_);
-        size_t slot = 0;
-        bool fill = false;
-        if (!s.claim_stage(key, slot, fill, false, &memory) && !fill)
-            throw std::runtime_error("synthetic stage claim failed");
-        if (fill) {
-            std::memset(s.stage_buf_[slot].get(), value, (size_t) s.stage_capacity_[slot]);
-            s.stage_busy_[slot] = publish ? 0 : 1;
+        const auto c = reserve(s, key, &memory);
+        if (c.data == nullptr) throw std::runtime_error("synthetic stage claim failed");
+        if (c.fill) {
+            std::memset(s.stage_buf_[c.slot].get(), value, (size_t) s.stage_capacity_[c.slot]);
+            if (publish) s.publish_stage(c.slot, key / s.n_expert_, true, 0);
         }
-        return s.stage_buf_[slot].get();
+        return c.data;
+    }
+    static void finish(FileExpertSource& s, int64_t key, bool ok, bool ahead = false) {
+        s.publish_stage(s.stage_of_.at(key), key / s.n_expert_, ok, 0, ahead);
+    }
+    static uint64_t pending(const FileExpertSource& s) { return s.stage_pending_bytes_; }
+    static uint64_t pending_slot(const FileExpertSource& s, size_t v) { return s.stage_pending_[v]; }
+    static bool busy_slot(const FileExpertSource& s, size_t v) { return s.stage_busy_[v] != 0; }
+    static bool prefetched_slot(const FileExpertSource& s, size_t v) { return s.stage_pf_[v] != 0; }
+    static bool quiescent(FileExpertSource& s) {
+        std::lock_guard<std::mutex> lock(s.stage_mu_);
+        return s.stage_pending_bytes_ == 0 &&
+            std::all_of(s.stage_pending_.begin(), s.stage_pending_.end(), [](uint64_t n) { return n == 0; }) &&
+            std::all_of(s.stage_busy_.begin(), s.stage_busy_.end(), [](char busy) { return busy == 0; });
+    }
+    static auto admission_state(const FileExpertSource& s) {
+        std::vector<const uint8_t*> pointers;
+        for (const auto& b : s.stage_buf_) pointers.push_back(b.get());
+        return std::make_tuple(pointers, s.stage_capacity_, s.stage_key_, s.stage_epoch_, s.stage_used_,
+                               s.stage_busy_, s.stage_pf_, s.stage_pending_, s.stage_pending_bytes_,
+                               s.stage_allocated_bytes_, s.stage_of_,
+                               s.fetch_stats().get(FileExpertSource::FetchMetric::allocations),
+                               s.fetch_stats().get(FileExpertSource::FetchMetric::allocation_bytes));
     }
     static void age(FileExpertSource& s) { s.epoch_ += FileExpertSource::kStageAge; }
     static bool has(FileExpertSource& s, int64_t key) { return s.stage_of_.count(key) != 0; }
@@ -1384,14 +1422,18 @@ void test_file_cache_headroom() {
     require(reused == fitting && reused[large - 1] == 90, "compact shrink allocated under pressure");
     check(large, 1);
 
-    // Other applications can take memory after retention grows. Reclaim only aged entries; buffers
-    // still inside their layer lifetime and pending fills remain valid even if mandatory staging grows.
+    // Other applications can take memory after retention grows. A mandatory miss must refuse rather than
+    // allocate or reclaim buffers still inside their layer lifetime or pending fills.
     reset();
     first = Access::claim(source, 0, memory(unlimited, unlimited), 99, false);
     const uint8_t* live = Access::claim(source, 1, memory(unlimited, unlimited), 100);
-    Access::claim(source, 32, memory(0, 0), 101);
-    check(2 * small + large, 3);
-    require(first[0] == 99 && live[0] == 100, "mandatory staging overwrote protected buffers");
+    const auto exhausted = memory(0, 0);
+    const auto before = Access::admission_state(source);
+    const auto denied = Access::reserve(source, 32, &exhausted);
+    require(!denied.have && !denied.fill && denied.data == nullptr &&
+                Access::admission_state(source) == before, "mandatory refusal changed protected staging state");
+    check(2 * small, 2);
+    require(first[0] == 99 && live[0] == 100, "mandatory refusal overwrote protected buffers");
     Access::age(source);
     Access::claim(source, 2, memory(0, 0), 102);
     check(2 * small, 2);
@@ -1407,7 +1449,7 @@ void test_file_cache_headroom() {
     Access::claim(source, 2, memory(unlimited - small, unlimited), 105);
     check(3 * small, 3);
     reset(true, 0);
-    first = Access::claim(source, 0, memory(small, small), 105);
+    first = Access::claim(source, 0, memory(margin + small, margin + small), 105);
     Access::age(source);
     reused = Access::claim(source, 1, memory(0, 0), 106);
     require(reused == first, "zero headroom ignored exhausted memory");
@@ -1422,6 +1464,206 @@ void test_file_cache_headroom() {
     Access::claim(source, 1, memory(0, 0), 108);
     check(2 * small, 2);
     std::cout << "recent cache headroom: fresh RAM/commit, charged capacities, safe reuse, protected staging, reset PASS\n";
+}
+
+void test_stage_admission() {
+    using namespace strata::core;
+    using Access = detail::FileExpertSourceTestAccess;
+    constexpr uint64_t small = 32ull << 10, large = 64ull << 10;
+    constexpr uint64_t floor = 1ull << 20, margin = 256ull << 20, unlimited = ~uint64_t{0};
+    const detail::HostMemory healthy{unlimited, unlimited, unlimited};
+    const detail::HostMemory exhausted{0, unlimited, 0};
+    FileExpertSource source;
+    auto reset = [&](uint64_t target = 4 * (64ull << 10), uint64_t headroom = 1ull << 20) {
+        source.close();
+        Access::stage_geometry(source, small, large);
+        source.set_file_cache_bytes(target, true, headroom);
+        require(Access::pending(source) == 0, "close retained a pending physical-touch obligation");
+    };
+    auto refused = [&](int64_t key, const detail::HostMemory* memory) {
+        const auto before = Access::admission_state(source);
+        const auto c = Access::reserve(source, key, memory);
+        require(!c.have && !c.fill && c.data == nullptr, "unsafe stage claim was admitted");
+        require(Access::admission_state(source) == before,
+                "refusal changed pointers, lookup, busy state, capacity or pending debt");
+    };
+
+    // Independent physical/commit limits, their one-byte boundary, and a failed telemetry read.
+    reset();
+    const detail::HostMemory physical_short{floor + margin + small - 1, unlimited, unlimited};
+    const detail::HostMemory commit_short{unlimited, unlimited, floor + margin + small - 1};
+    refused(0, &physical_short);
+    refused(0, &commit_short);
+    refused(0, &exhausted);
+    refused(0, nullptr);   // reserve disables real telemetry, so nullptr represents sampling failure
+    require(source.file_cache_stats().buffers == 0 && Access::pending(source) == 0,
+            "fresh refusal retained an allocation or obligation");
+
+    // Recent pointers are protected. Aging a busy buffer must not make it a victim either.
+    const uint8_t* live = Access::claim(source, 0, healthy, 17);
+    refused(1, &exhausted);
+    refused(1, nullptr);
+    require(live[0] == 17 && live[small - 1] == 17, "refusal changed a recent pointer");
+    reset();
+    const auto busy = Access::reserve(source, 0, &healthy);
+    require(busy.fill && Access::pending(source) == small, "pending fill was not reserved");
+    Access::age(source);
+    refused(1, &exhausted);
+    Access::finish(source, 0, false);
+    require(Access::pending(source) == 0 && !Access::has(source, 0),
+            "failed fill retained its lookup or pending obligation");
+    const auto reused_failed = Access::reserve(source, 1, &exhausted);
+    require(reused_failed.fill && reused_failed.data == busy.data && Access::pending(source) == small,
+            "failed fill's safe capacity was not reusable without allocating");
+    Access::finish(source, 1, true);
+    require(Access::pending(source) == 0, "successful reuse retained pending debt");
+
+    // An undersized safe victim cannot justify replacement. The entire new capacity, rather than just
+    // the size difference or prospective old-buffer credit, must fit while both allocations coexist.
+    reset();
+    live = Access::claim(source, 0, healthy, 23);
+    Access::age(source);
+    const detail::HostMemory physical_replace_short{floor + margin + large - 1, unlimited, unlimited};
+    const detail::HostMemory commit_replace_short{unlimited, unlimited, floor + margin + large - 1};
+    refused(32, &exhausted);
+    refused(32, &physical_replace_short);
+    refused(32, &commit_replace_short);
+    require(live[0] == 23 && live[small - 1] == 23, "refused resize changed its old buffer");
+    const detail::HostMemory exact_replace{floor + margin + large, unlimited, floor + margin + large};
+    const auto replaced = Access::reserve(source, 32, &exact_replace);
+    require(replaced.fill && Access::pending(source) == large &&
+                source.file_cache_stats().allocated_bytes == large, "exact full-replacement boundary refused");
+    Access::finish(source, 32, true);
+
+    // Claims under the same raw physical snapshot cannot all spend the not-yet-touched pages.
+    reset();
+    const detail::HostMemory two_fills{floor + margin + 2 * small, unlimited, unlimited};
+    const auto a = Access::reserve(source, 0, &two_fills);
+    const auto b = Access::reserve(source, 1, &two_fills);
+    require(a.fill && b.fill && a.data != b.data && Access::pending(source) == 2 * small &&
+                Access::pending_slot(source, a.slot) == small && Access::pending_slot(source, b.slot) == small,
+            "batch claims did not reserve their independent pending touches");
+    refused(2, &two_fills);
+    const detail::HostMemory under_pending{small - 1, unlimited, unlimited};
+    refused(2, &under_pending);
+    const auto hit = Access::reserve(source, 0, &exhausted);
+    require(hit.have && !hit.fill && hit.data == a.data && Access::pending(source) == 2 * small,
+            "busy hit duplicated a pending obligation");
+    Access::finish(source, 1, true);   // finish out of claim order
+    require(Access::pending(source) == small && Access::pending_slot(source, a.slot) == small &&
+                Access::pending_slot(source, b.slot) == 0 && Access::has(source, 0) && Access::has(source, 1),
+            "completion released another fill's debt or lookup");
+    const auto c = Access::reserve(source, 2, &two_fills);
+    require(c.fill && Access::pending(source) == 2 * small, "completion did not release its own admission room");
+    Access::finish(source, 0, false);
+    require(Access::pending(source) == small && Access::pending_slot(source, a.slot) == 0 &&
+                Access::pending_slot(source, c.slot) == small && !Access::has(source, 0) &&
+                Access::has(source, 1) && Access::has(source, 2), "failed fill released another fill's state");
+    Access::finish(source, 2, true);
+    require(Access::pending(source) == 0, "batch completion leaked pending debt");
+
+    // Capacity alone gives no evidence that old pages are physically resident and can be credited back.
+    reset();
+    live = Access::claim(source, 0, healthy, 31);
+    Access::age(source);
+    const detail::HostMemory one_fill{floor + margin + small, unlimited, unlimited};
+    const uint8_t* reused = Access::claim(source, 1, one_fill, 32);
+    require(reused == live && source.file_cache_stats().allocated_bytes == small &&
+                source.file_cache_stats().buffers == 1, "capacity was credited as physical residency for retention");
+
+    // A zero retention target does not disable an explicit floor. Healthy mandatory staging still works,
+    // and sufficiently large aged storage remains reusable even when telemetry is missing.
+    reset(0);
+    refused(0, &exhausted);
+    refused(0, nullptr);
+    const auto zero_target = Access::reserve(source, 0, &healthy);
+    require(zero_target.fill && Access::pending(source) == large &&
+                source.file_cache_stats().target_bytes == 0, "healthy zero-target staging changed its policy");
+    Access::finish(source, 0, true);
+    Access::age(source);
+    const auto safe = Access::reserve(source, 1, nullptr);
+    require(safe.fill && safe.data == zero_target.data && source.file_cache_stats().allocated_bytes == large,
+            "missing telemetry prevented fitting eligible reuse");
+    Access::finish(source, 1, true);
+
+    // A zero headroom override retains the existing allocation margin rather than bypassing admission.
+    reset(4 * large, 0);
+    const detail::HostMemory below_margin{small, unlimited, small};
+    refused(0, &below_margin);
+    const detail::HostMemory zero_floor_exact{margin + small, unlimited, margin + small};
+    const auto zero_floor = Access::reserve(source, 0, &zero_floor_exact);
+    require(zero_floor.fill && Access::pending(source) == small, "zero-floor exact margin boundary refused");
+    Access::finish(source, 0, true);
+
+    // The sentinel keeps caller-budgeted legacy behavior, even with no retention or telemetry.
+    reset(0, unlimited);
+    const auto legacy = Access::reserve(source, 0, nullptr);
+    require(legacy.fill && legacy.data != nullptr, "sentinel-unbounded staging started requiring telemetry");
+    Access::finish(source, 0, true);
+    require(Access::pending(source) == 0, "legacy fill leaked pending debt");
+    reset();
+    std::cout << "stage admission: refusal, pending completion/failure, reuse, zero target, legacy PASS\n";
+}
+
+void test_stage_read_ahead_completion() {
+    using namespace strata::core;
+    using Access = detail::FileExpertSourceTestAccess;
+    constexpr uint64_t small = 32ull << 10, large = 64ull << 10, unlimited = ~uint64_t{0};
+    const detail::HostMemory healthy{unlimited, unlimited, unlimited}, exhausted{0, unlimited, 0};
+    FileExpertSource source;
+    Access::stage_geometry(source, small, large);
+    source.set_file_cache_bytes(4 * large, true, 1ull << 20);
+
+    const auto worker = Access::reserve(source, 0, &healthy, true);
+    const auto other = Access::reserve(source, 32, &healthy);
+    require(worker.fill && other.fill && Access::pending(source) == small + large,
+            "read-ahead fixture did not own separate small/large pending fills");
+    std::memset(const_cast<uint8_t*>(worker.data), 41, (size_t) small);
+    std::memset(const_cast<uint8_t*>(other.data), 51, (size_t) large);
+    const auto hit = Access::reserve(source, 0, &exhausted, true);
+    require(hit.have && !hit.fill && hit.data == worker.data && Access::pending(source) == small + large &&
+                Access::prefetched_slot(source, worker.slot), "read-ahead busy hit changed its pending/PF ownership");
+
+    // This is the production publication path called by io_worker, without a test copy of its state changes.
+    Access::finish(source, 0, true, true);
+    require(Access::pending(source) == large && Access::pending_slot(source, worker.slot) == 0 &&
+                !Access::busy_slot(source, worker.slot) && Access::prefetched_slot(source, worker.slot) &&
+                Access::has(source, 0), "successful worker completion retained debt or lost its ready/PF entry");
+    require(Access::pending_slot(source, other.slot) == large && Access::busy_slot(source, other.slot) &&
+                other.data[0] == 51 && other.data[large - 1] == 51,
+            "successful worker completion released or changed another pending fill");
+    require(worker.data[0] == 41 && worker.data[small - 1] == 41 &&
+                source.io_counters().pf_read_blobs == 1 && source.file_read_bytes() == small &&
+                source.file_blob_bytes() == 0 && source.file_ms() == 0,
+            "successful worker completion changed data or original read-ahead counter semantics");
+
+    Access::age(source);
+    const auto reused = Access::reserve(source, 1, &exhausted, true);
+    require(reused.fill && reused.data == worker.data && Access::pending(source) == small + large &&
+                source.io_counters().pf_unused == 1, "eligible worker storage was not reused with its own fresh debt");
+    Access::finish(source, 1, false, true);
+    require(Access::pending(source) == large && Access::pending_slot(source, reused.slot) == 0 &&
+                !Access::busy_slot(source, reused.slot) && !Access::prefetched_slot(source, reused.slot) &&
+                !Access::has(source, 1), "failed worker completion retained lookup, busy, PF or pending state");
+    require(Access::pending_slot(source, other.slot) == large && Access::busy_slot(source, other.slot) &&
+                Access::has(source, 32) && other.data[0] == 51 && other.data[large - 1] == 51,
+            "failed worker completion released or changed another pending fill");
+    require(source.io_counters().pf_read_blobs == 2 && source.file_read_bytes() == small &&
+                source.file_blob_bytes() == 0 && source.file_ms() == 0,
+            "failed worker completion counted demand bytes/time or lost its completed-attempt count");
+
+    Access::age(source);
+    const auto normal = Access::reserve(source, 2, &exhausted);
+    require(normal.fill && normal.data == worker.data && Access::pending(source) == small + large,
+            "failed worker storage left phantom debt or was not safely reusable");
+    Access::finish(source, 2, true);
+    require(Access::pending(source) == large && source.file_read_bytes() == 2 * small &&
+                source.file_blob_bytes() == small && source.io_counters().pf_read_blobs == 2,
+            "normal publication after worker reuse changed debt or counter ownership");
+    Access::finish(source, 32, false);   // oldest claim completes last, through the demand failure path
+    require(Access::quiescent(source) && !Access::has(source, 32) && Access::has(source, 2),
+            "mixed out-of-order completion leaked debt, busy state or a failed lookup");
+    std::cout << "stage read-ahead completion: success, failure, mixed pending ownership, reuse, counters PASS\n";
 }
 
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
@@ -1484,9 +1726,11 @@ void test_host_memory() {
 
 // STRATA_IO_PREFETCH: the experts.bin file tier hands out the same bytes with the Linux I/O path on (whole-blob
 // preads, the read-ahead workers, the mapping for cached blobs), however the reads and the predictions interleave.
-void test_io_prefetch() {
+void test_io_prefetch(bool stage) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
+    SavedEnv saved_stage("STRATA_IO_PF_STAGE");
+    set_env("STRATA_IO_PF_STAGE", stage ? "1" : "0");
     constexpr int64_t layers = 3;
     constexpr int64_t experts = 8;
     const uint64_t layer_bytes = (uint64_t) experts * BLOB;
@@ -1533,9 +1777,12 @@ void test_io_prefetch() {
     require(source.copy_blob(1, 6, copy.data()) &&
                 std::memcmp(copy.data(), bytes.data() + (size_t) (layer_bytes + 6 * BLOB), (size_t) BLOB) == 0,
             "an io-prefetch copy_blob differs from the file");
+    source.set_io_prefetch(false);   // joins in-flight workers before inspecting completed-owner state
+    require(strata::core::detail::FileExpertSourceTestAccess::quiescent(source),
+            "joined io-prefetch workers retained busy slots or pending touches");
     const FileExpertSource::IoCounters c = source.io_counters();
     require(c.cached_bytes + c.uncached_bytes > 0, "no residency counted");
-    std::cout << "io prefetch: " << c.pf_read_blobs << " read ahead, " << c.pf_used << " used, " << c.pf_resident_skips
+    std::cout << "io prefetch (stage=" << stage << "): " << c.pf_read_blobs << " read ahead, " << c.pf_used << " used, " << c.pf_resident_skips
               << " skipped, pread " << c.pread_bytes << " B: bytes PASS\n";
 #else
     require(!source.io_prefetch(), "io prefetch on a platform without it");
@@ -1661,8 +1908,11 @@ int main(int argc, char** argv) {
         test_fetch_profiling();
         test_ready_copy_out();
         test_recent_file_cache();
-        test_io_prefetch();
+        test_io_prefetch(false);
+        test_io_prefetch(true);
         test_file_cache_headroom();
+        test_stage_admission();
+        test_stage_read_ahead_completion();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
         test_direct_mapping_retirement();

@@ -711,18 +711,7 @@ void FileExpertSource::io_worker() {
             dst = stage_buf_[v].get();
         }
         const bool ok = copy_from_files(layer, expert, dst);
-        io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
-        if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(stage_mu_);
-            stage_busy_[v] = 0;
-            if (!ok) {
-                stage_of_.erase(stage_key_[v]);
-                stage_key_[v] = -1;
-                stage_pf_[v] = 0;
-            }
-        }
-        stage_cv_.notify_all();
+        publish_stage(v, layer, ok, 0, /*ahead=*/true);
     }
 }
 
@@ -1002,6 +991,7 @@ void FileExpertSource::close() {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
         stage_capacity_.clear();
+        stage_pending_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
         stage_used_.clear();
@@ -1011,6 +1001,7 @@ void FileExpertSource::close() {
         stage_blob_ = 0;
         stage_cache_slots_ = 0;
         stage_cache_bytes_ = stage_allocated_bytes_ = 0;
+        stage_pending_bytes_ = 0;
         stage_headroom_ = ~uint64_t{0};
         stage_compact_ = false;
         stage_seq_ = 0;
@@ -1246,9 +1237,10 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 // fill (the GPU cache at startup, an adaptive swap, a helper GPU) copies the blob right away.
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
-// being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
+// being filled by another thread - the caller then waits), false with `fill` when the caller must fill buffer
+// `v`, or false without `fill` when admission/allocation refused. Tests can suppress sampling for missing telemetry.
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead,
-                                   const detail::HostMemory* memory) {
+                                   const detail::HostMemory* memory, bool sample_memory) {
     FetchTimer claim(fetch_counter(FetchMetric::claim_ns));
     fetch_add(FetchMetric::claims);
     constexpr uint64_t kStageSeq = 256;
@@ -1286,28 +1278,33 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     }
     scan.finish();
     const uint64_t need = stage_compact_ ? layer_blob_bytes_[(size_t) (key / n_expert_)] : stage_blob_;
-    const bool guarded = stage_cache_bytes_ > 0 && stage_headroom_ != ~uint64_t{0};
+    const bool guarded = stage_headroom_ != ~uint64_t{0};
+    if (need > UINT64_MAX - stage_pending_bytes_) return false;
     uint64_t retention = stage_cache_bytes_;
     bool allocation_fits = true;
     if (guarded) {
         detail::HostMemory sampled;
-        if (memory == nullptr && detail::host_available_memory(sampled)) memory = &sampled;
+        if (memory == nullptr && sample_memory && detail::host_available_memory(sampled)) memory = &sampled;
         if (memory == nullptr) {
             retention = 0;
             allocation_fits = false;
         } else {
-            // Existing capacities have already reduced available memory. Add them back only when finding a
-            // total retention target; a replacement must also fit while its old buffer is still allocated.
-            auto including_cache = [&](uint64_t available) {
+            // Capacity is not physical residency: do not credit it back to available RAM. Pending fills may
+            // still touch their entire buffers after this snapshot (including claims in the same batch).
+            const uint64_t physical = memory->available > stage_pending_bytes_
+                ? memory->available - stage_pending_bytes_ : 0;
+            // Allocated capacity is already committed. Credit it only for total commit retention, never for
+            // new allocations: a replacement must fit alongside its old buffer. No freed-RAM credit is assumed.
+            auto including_committed_cache = [&](uint64_t available) {
                 return available > UINT64_MAX - stage_allocated_bytes_
                     ? UINT64_MAX : available + stage_allocated_bytes_;
             };
             // Use the existing clamp margin even when the configured target fits: the final allocation must
             // leave room for allocator bookkeeping and the request's later checkpoint/library work.
             retention = std::min(stage_cache_bytes_, detail::clamp_resident_budget(UINT64_MAX,
-                including_cache(memory->available), including_cache(memory->commit), stage_headroom_));
+                physical, including_committed_cache(memory->commit), stage_headroom_));
             allocation_fits = need <= detail::clamp_resident_budget(UINT64_MAX,
-                memory->available, memory->commit, stage_headroom_);
+                physical, memory->commit, stage_headroom_);
         }
     }
     const bool grow = allocation_fits && (stage_compact_ || guarded
@@ -1315,7 +1312,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         : previous_size < stage_cache_slots_);
     if (v == previous_size || grow) v = empty;
     if (!allocation_fits) {
-        // Pressure must not turn a safe, already charged buffer into a new allocation merely to make its
+        // Pressure must not turn a safe, existing buffer into a new allocation merely to make its
         // compact size exact. Prefer the oldest fitting capacity; live and in-flight pointers stay untouched.
         size_t fitting = previous_size;
         oldest = std::numeric_limits<uint64_t>::max();
@@ -1324,7 +1321,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
                 oldest = stage_used_[i];
                 fitting = i;
             }
-        if (fitting != previous_size) v = fitting;
+        if (fitting == previous_size) return false;
+        v = fitting;
     }
     std::unique_ptr<uint8_t[], StageBufFree> buffer(nullptr, StageBufFree{});
     if (v == previous_size || (stage_capacity_[v] != need && (allocation_fits || stage_capacity_[v] < need))) {
@@ -1384,6 +1382,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
                 : std::max<size_t>(previous_size + 1, std::max<size_t>(8, previous_size * 2));
             stage_buf_.reserve(cap);
             stage_capacity_.reserve(cap);
+            stage_pending_.reserve(cap);
             stage_key_.reserve(cap);
             stage_epoch_.reserve(cap);
             stage_used_.reserve(cap);
@@ -1397,6 +1396,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     if (v == previous_size) {
         stage_buf_.emplace_back(nullptr, StageBufFree{});
         stage_capacity_.push_back(0);
+        stage_pending_.push_back(0);
         stage_key_.push_back(-1);
         stage_epoch_.push_back(0);
         stage_used_.push_back(0);
@@ -1419,6 +1419,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     stage_epoch_[v] = epoch_;
     stage_used_[v] = seq;
     stage_busy_[v] = 1;
+    stage_pending_[v] = need;
+    stage_pending_bytes_ += need;
     // A larger replacement can need more than one old entry's room. Release only safe oldest entries;
     // indices remain stable for pending fills. If all remaining entries are live, preserve the original overflow.
     while ((stage_compact_ || guarded) && stage_allocated_bytes_ > retention) {
@@ -1459,21 +1461,27 @@ bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8
     return ok;
 }
 
-void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us) {
-    FetchTimer publish(fetch_counter(FetchMetric::publish_ns));
-    file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us, bool ahead) {
+    FetchTimer publish(ahead ? nullptr : fetch_counter(FetchMetric::publish_ns));
+    // Read-ahead counts completed attempts, including failures; demand fills also count bytes handed out
+    // and elapsed fill time. Both paths publish the same slot state and release only its pending touches.
+    if (ahead) io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
+    else file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
     if (ok) {
         file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
-        file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        if (!ahead) file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
     }
     {
-        FetchTimer lock_wait(fetch_counter(FetchMetric::lock_wait_ns));
+        FetchTimer lock_wait(ahead ? nullptr : fetch_counter(FetchMetric::lock_wait_ns));
         std::lock_guard<std::mutex> lk(stage_mu_);
         lock_wait.finish();
+        stage_pending_bytes_ -= stage_pending_[v];
+        stage_pending_[v] = 0;
         stage_busy_[v] = 0;
         if (!ok) {
             stage_of_.erase(stage_key_[v]);
             stage_key_[v] = -1;
+            if (ahead) stage_pf_[v] = 0;
         }
     }
     stage_cv_.notify_all();

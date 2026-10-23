@@ -739,9 +739,9 @@ private:
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false,
-                     const detail::HostMemory* memory = nullptr);
+                     const detail::HostMemory* memory = nullptr, bool sample_memory = true);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
-    void publish_stage(size_t v, int64_t layer, bool ok, double us);
+    void publish_stage(size_t v, int64_t layer, bool ok, double us, bool ahead = false);
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
@@ -797,6 +797,7 @@ private:
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
     std::vector<uint64_t> stage_capacity_;
+    std::vector<uint64_t> stage_pending_;     ///< possible physical touches until this slot's fill completes
     std::vector<int64_t> stage_key_;
     std::vector<uint64_t> stage_epoch_, stage_used_;
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
@@ -810,6 +811,7 @@ private:
     uint64_t stage_blob_ = 0;
     size_t stage_cache_slots_ = 0;
     uint64_t stage_cache_bytes_ = 0, stage_allocated_bytes_ = 0;
+    uint64_t stage_pending_bytes_ = 0;        ///< sum of stage_pending_, under stage_mu_; not resident bytes
     uint64_t stage_headroom_ = ~uint64_t{0};
     bool stage_compact_ = false;
     uint64_t stage_seq_ = 0;
