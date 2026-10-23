@@ -260,6 +260,22 @@ class HelperTests(unittest.TestCase):
                 bench.assert_idle()
             probe.bind.assert_called_once_with(("127.0.0.1", 8081))
 
+    def test_occupied_port_message_preserves_default_and_names_selected_port(self):
+        for port in (8081, 18081):
+            with self.subTest(port=port), patch.object(bench.psutil, "process_iter", return_value=[]), \
+                    patch.object(bench.socket, "socket") as socket_factory:
+                probe = socket_factory.return_value.__enter__.return_value
+                probe.bind.side_effect = OSError("occupied")
+                with self.assertRaises(RuntimeError) as caught:
+                    if port == 8081:
+                        bench.assert_idle()
+                    else:
+                        bench.assert_idle(port)
+                expected = {8081: "Port 8081 is occupied; no process was started or stopped.",
+                            18081: "Port 18081 is occupied; no process was started or stopped."}
+                self.assertEqual(str(caught.exception), expected[port])
+                probe.bind.assert_called_once_with(("127.0.0.1", port))
+
     def test_memory_guard_stops_immediately_below_emergency_floor(self):
         owner = Mock()
         guard = bench.MemoryGuard(owner, Path("unused"))
@@ -523,6 +539,39 @@ class AcceptanceTelemetryTests(unittest.TestCase):
         self.assertEqual(len(guard.host_samples), 4096)
         guard.owner.stop.assert_called_once_with()
 
+    def test_default_sample_limit_remains_4096(self):
+        guard = bench.MemoryGuard(Mock(), Path("unused"))
+        self.assertEqual(guard.sample_limit, 4096)
+        self.assertEqual(self.guard().acceptance_summary()["sample_limit"], 4096)
+
+    def test_explicit_sample_limit_is_enforced_and_reported(self):
+        guard = bench.MemoryGuard(Mock(), Path("unused"), acceptance_floors=(4, 4), sample_limit=2)
+        self.sample(guard, start=1)
+        self.sample(guard, start=2)
+        self.assertEqual(guard.acceptance_summary(1, 2)["sample_limit"], 2)
+        self.assertEqual(guard.acceptance_summary(1, 2)["host_evidence"], "satisfied")
+        self.sample(guard, start=3)
+        self.assertEqual(len(guard.host_samples), 2)
+        self.assertIn("raw sample limit", guard.reason)
+        guard.owner.stop.assert_called_once_with()
+
+    def test_maximum_duration_host_receipt_fits_six_mib(self):
+        guard = bench.MemoryGuard(None, None, acceptance_floors=(4, 4), sample_limit=4 * 5400 + 256)
+        for index in range(4 * 5400 + 256):
+            start = 12345678.123456789 + index / 4
+            self.sample(guard, physical=32, commit=64, start=start, end=start + 0.000123456)
+        summary = guard.acceptance_summary(guard.host_samples[0]["finished_monotonic"],
+                                           guard.host_samples[-1]["started_monotonic"])
+        self.assertEqual(summary["host_evidence"], "satisfied")
+        self.assertEqual(len(summary["raw_samples"]), 21856)
+        self.assertEqual(set(summary["raw_samples"][0]), {"started_monotonic", "finished_monotonic",
+                                                       "physical_available_bytes", "commit_available_bytes"})
+        record = {"status": "held", "memory": summary,
+                  "memory_finalization": "provisional until post-artifact host edge in returned result"}
+        payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
+        self.assertEqual(bench.ACCEPTANCE_RECEIPT_LIMIT, 6 * 1024**2)
+        self.assertLessEqual(len(payload), bench.ACCEPTANCE_RECEIPT_LIMIT)
+
     def test_actual_monitor_uses_repository_commit_snapshot_not_swap_usage(self):
         from tools import prepare_unsloth_q2 as preparation
         guard = self.guard()
@@ -641,6 +690,85 @@ class RunTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "require --acceptance-telemetry"):
             bench.run(self.args)
         self.assertFalse(self.output.exists())
+
+    def test_cli_port_and_acceptance_duration_defaults_and_overrides(self):
+        for options, expected in (([], (8081, None)),
+                                  (["--port", "18081", "--acceptance-telemetry",
+                                    "--acceptance-total-seconds", "5400"], (18081, 5400))):
+            with self.subTest(options=options), patch.object(bench, "run") as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bench.main(["--config", str(self.config), "--output", str(self.output),
+                                             *options]), 0)
+            args = run.call_args.args[0]
+            self.assertEqual((args.port, args.acceptance_total_seconds), expected)
+
+    def test_invalid_ports_refuse_before_reading_config_or_starting_process(self):
+        self.args.config = self.root / "missing.json"
+        for value in (0, 1023, 65536, -1, True, 8081.5, "8081"):
+            self.args.port = value
+            with self.subTest(port=value), patch.object(bench.subprocess, "Popen") as popen, \
+                    patch.object(bench, "assert_idle") as idle:
+                with self.assertRaisesRegex(ValueError, "Port must be between 1024 and 65535"):
+                    bench.run(self.args)
+            popen.assert_not_called()
+            idle.assert_not_called()
+            self.assertFalse(self.output.exists())
+
+    def test_invalid_acceptance_durations_refuse_before_reading_config_or_starting_process(self):
+        self.args.config = self.root / "missing.json"
+        self.args.acceptance_telemetry = True
+        for value in (0, 899, 5401, -1, True, 900.5, "900"):
+            self.args.acceptance_total_seconds = value
+            with self.subTest(seconds=value), patch.object(bench.subprocess, "Popen") as popen, \
+                    patch.object(bench, "acceptance_controller") as controller:
+                with self.assertRaisesRegex(ValueError, "Acceptance total seconds must be between 900 and 5400"):
+                    bench.run(self.args)
+            popen.assert_not_called()
+            controller.assert_not_called()
+            self.assertFalse(self.output.exists())
+
+    def test_acceptance_duration_requires_telemetry_opt_in(self):
+        self.args.acceptance_total_seconds = 900
+        with patch.object(bench.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "require --acceptance-telemetry"):
+                bench.run(self.args)
+        popen.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_selected_public_workload_requires_both_explicit_floors_of_at_least_four(self):
+        self.args.acceptance_telemetry = True
+        self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        self.args.config = self.root / "missing.json"
+        cases = [(None, None), (None, 4), (4, None), (3.9, 4), (4, 3.9)]
+        cases += [(value, 4) for value in (True, "4", float("nan"), float("inf"))]
+        cases += [(4, value) for value in (True, "4", float("nan"), float("inf"))]
+        for physical, commit in cases:
+            self.args.acceptance_physical_gib, self.args.acceptance_commit_gib = physical, commit
+            with self.subTest(physical=physical, commit=commit), \
+                    patch.object(bench.subprocess, "Popen") as popen, \
+                    patch.object(bench, "acceptance_controller") as controller:
+                with self.assertRaisesRegex(ValueError, "explicit physical and commit floors of at least 4 GiB"):
+                    bench.run(self.args)
+            popen.assert_not_called()
+            controller.assert_not_called()
+            self.assertFalse(self.output.exists())
+
+    def test_selected_worker_still_accepts_none_floors(self):
+        self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        self.args._acceptance_deadline = 12345
+        self.args.acceptance_telemetry = False
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = None
+        self.assertEqual(bench.acceptance_selection(self.args), ("short", 131072))
+
+    def test_telemetry_only_preparation_keeps_default_four_gib_floors(self):
+        self.args.acceptance_telemetry = True
+        with patch.object(bench.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "Stage B/C"):
+                bench.run(self.args)
+        popen.assert_not_called()
+        saved = json.loads((self.output / "results.json").read_text())
+        self.assertEqual(saved["memory"]["floors_gib"], {"physical": 4, "commit": 4})
+        self.assertEqual(saved["memory"]["sample_limit"], 4096)
 
     def test_startup_refusal_creates_no_output_and_launches_nothing(self):
         with patch.object(bench, "assert_idle", side_effect=RuntimeError("A Strata engine is already running")), \
@@ -1874,8 +2002,52 @@ class ContainedLifecycleTests(unittest.TestCase):
     def test_duration_and_edge_samples_fit_raw_sample_cap(self):
         self.assertLessEqual(bench.ACCEPTANCE_SECONDS / 0.25 + 8, 4096)
 
+    def test_controller_default_duration_is_900_seconds_with_cleanup_reserved(self):
+        self.args.acceptance_total_seconds = None
+        result = self.invoke()
+        self.assertAlmostEqual(result["total_deadline"] - result["started_monotonic"], 900)
+        self.assertAlmostEqual(result["work_deadline"] - result["started_monotonic"], 890)
+        self.assertEqual(result["memory"]["sample_limit"], 3856)
+
+    def test_controller_maximum_duration_scales_deadlines_and_sample_cap(self):
+        self.args.acceptance_total_seconds = 5400
+        result = self.invoke()
+        self.assertAlmostEqual(result["total_deadline"] - result["started_monotonic"], 5400)
+        self.assertAlmostEqual(result["work_deadline"] - result["started_monotonic"], 5390)
+        self.assertEqual(result["memory"]["sample_limit"], 21856)
+
+    def test_selected_port_reaches_both_idle_checks_clone_and_server_command(self):
+        self.args.port = 18081
+        commands, clones = [], []
+        def spawn(argv, **kwargs):
+            if "--engine" in argv:
+                commands.append(argv)
+                clones.append(json.loads(Path(argv[argv.index("--config") + 1]).read_text()))
+            return self.spawn(argv, **kwargs)
+        with patch.object(bench, "assert_idle") as idle, \
+                patch.object(bench.subprocess, "Popen", side_effect=spawn):
+            result = self.invoke()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual([call.args for call in idle.call_args_list], [(18081,), (18081,)])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("--port") + 1], "18081")
+        self.assertEqual(clones[0]["port"], 18081)
+
+    def test_controller_uses_six_mib_receipt_cap_and_keeps_other_artifact_caps(self):
+        with patch.object(bench, "bounded_write", wraps=bench.bounded_write) as write:
+            self.invoke()
+        receipt_calls = [call for call in write.call_args_list if call.args[0].name == "lifecycle.json.tmp"]
+        self.assertEqual(len(receipt_calls), 1)
+        self.assertEqual(receipt_calls[0].kwargs, {"limit": 6 * 1024**2})
+        other_calls = [call for call in write.call_args_list if call.args[0].name != "lifecycle.json.tmp"]
+        self.assertTrue(other_calls)
+        self.assertTrue(all(call.kwargs.get("limit", bench.ACCEPTANCE_LOG_LIMIT) == 1024**2
+                            for call in other_calls))
+        self.assertEqual(bench.ACCEPTANCE_ARTIFACT_LIMIT, 12 * 1024**2)
+
     def test_selected_workload_cannot_qualify_a_complete_cpu_receipt_without_runtime_evidence(self):
         self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 4
         def workload(validation, client, record, save, guard):
             record.update(acceptance_workload_passed=True, acceptance_cases=[{"passed": True}] * 11,
                           final_idle={"completed": True, "started_monotonic": 10, "finished_monotonic": 40})
@@ -1895,6 +2067,7 @@ class ContainedLifecycleTests(unittest.TestCase):
 
     def test_selected_workload_controller_refuses_a_different_cohort_in_the_worker_receipt(self):
         self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 4
         def workload(validation, client, record, save, guard):
             record.update(acceptance_workload_passed=True, acceptance_cases=[{"passed": True}] * 11,
                           final_idle={"completed": True, "started_monotonic": 10, "finished_monotonic": 40},
@@ -1908,6 +2081,7 @@ class ContainedLifecycleTests(unittest.TestCase):
 
     def invoke_selected(self, mutate=None, selection="short", missing=False):
         self.args.acceptance_workload = selection
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 4
         self.args.expected_context = 131072
         self.args.cohort = "saved-static" if selection == "short" else "automatic"
         if selection == "near-full":
@@ -2259,6 +2433,7 @@ class StageCSourceTests(unittest.TestCase):
 
     def test_public_opt_in_is_held_before_native_resource_or_model_entry(self):
         self.args.acceptance_telemetry = True
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 4
         del self.args._acceptance_deadline
         from tools import prepare_unsloth_q2 as prep
         with patch.object(bench.subprocess, "Popen", side_effect=AssertionError("process forbidden")), \
@@ -2277,6 +2452,7 @@ class StageCSourceTests(unittest.TestCase):
         with patch.object(bench, "run") as run, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(bench.main(["--config", str(self.config), "--output", str(self.args.output),
                 "--acceptance-telemetry", "--acceptance-workload", "short", "--expected-context", "65536",
+                "--acceptance-physical-gib", "4", "--acceptance-commit-gib", "4",
                 "--cohort", "saved-static", "--candidate-exe", str(self.binary),
                 "--protect-input", str(self.config)]), 0)
         args = run.call_args.args[0]

@@ -96,7 +96,8 @@ PORT = 8081
 CONTEXT = 131072
 LOG_LIMIT = 4 * 1024**2
 ACCEPTANCE_LOG_LIMIT = 1024**2
-ACCEPTANCE_ARTIFACT_LIMIT = 8 * 1024**2
+ACCEPTANCE_RECEIPT_LIMIT = 6 * 1024**2
+ACCEPTANCE_ARTIFACT_LIMIT = 12 * 1024**2
 ACCEPTANCE_SECONDS = 900
 CLEANUP_SECONDS = 10
 PROFILE_ENV = {"STRATA_VERIFY_PROFILE", "STRATA_DECODE_TIMING", "STRATA_FETCH_PROFILE"}
@@ -647,6 +648,11 @@ def acceptance_selection(args):
         raise ValueError("Acceptance workloads use their own final 30-second resident idle.")
     if selection == "near-full" and (context != CONTEXT or cohort != "automatic"):
         raise ValueError("Near-full acceptance requires the automatic 131072-context cohort.")
+    if getattr(args, "_acceptance_deadline", None) is None:
+        for name in ("acceptance_physical_gib", "acceptance_commit_gib"):
+            value = getattr(args, name, None)
+            if not valid_number(value) or value < 4:
+                raise ValueError("Selected acceptance workloads require explicit physical and commit floors of at least 4 GiB.")
     return selection, context
 
 
@@ -935,7 +941,7 @@ def is_strata_process(info):
     return server or module
 
 
-def assert_idle():
+def assert_idle(port=PORT):
     for process in psutil.process_iter(["pid", "name", "cmdline"]):
         if process.info["pid"] != os.getpid() and is_strata_process(process.info):
             raise RuntimeError("A Strata engine or server is already running; close it before benchmarking.")
@@ -943,9 +949,9 @@ def assert_idle():
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         try:
-            probe.bind(("127.0.0.1", PORT))
+            probe.bind(("127.0.0.1", port))
         except OSError:
-            raise RuntimeError("Port 8081 is occupied; no process was started or stopped.") from None
+            raise RuntimeError(f"Port {port} is occupied; no process was started or stopped.") from None
 
 
 class OwnedProcess:
@@ -1251,9 +1257,10 @@ class WindowsProcessAPI:
 
 
 class MemoryGuard:
-    def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None):
+    def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None, sample_limit=4096):
         self.owner, self.engine_log = owner, engine_log
         self.deadline = deadline
+        self.sample_limit = sample_limit
         self.done = threading.Event()
         self.reason = None
         self.cleanup_error = None
@@ -1291,7 +1298,7 @@ class MemoryGuard:
             gap = finished - self.host_samples[-1]["finished_monotonic"] if self.host_samples else 0
             if self.host_samples and (started < self.host_samples[-1]["finished_monotonic"] or gap <= 0):
                 raise ValueError("Host sample clock did not advance monotonically.")
-            if len(self.host_samples) >= 4096:
+            if len(self.host_samples) >= self.sample_limit:
                 raise ValueError("Acceptance raw sample limit reached; evidence is incomplete.")
             self.host_samples.append({"started_monotonic": started, "finished_monotonic": finished,
                                       "physical_available_bytes": int(physical),
@@ -1340,7 +1347,7 @@ class MemoryGuard:
                 "errors": errors, "floors_gib": dict(zip(("physical", "commit"), self.acceptance_floors)),
                 "raw_samples": rows, "minima": minima, "max_gap_seconds": self.max_gap_seconds,
                 "coverage_start_monotonic": start, "coverage_end_monotonic": end,
-                "sample_limit": 4096, "cuda_stage_evidence": "missing; later-stage hold",
+                "sample_limit": self.sample_limit, "cuda_stage_evidence": "missing; later-stage hold",
                 "cleanup_error": self.cleanup_error,
                 "cuda_floor_mib": 256, "cuda_coverage": "stage evidence required; not collected",
                 "lifecycle_acceptance": "pending", "cleanup": "pending", "finalization": "pending"}
@@ -1718,11 +1725,13 @@ def acceptance_controller(args, started):
     preempted by its own timer. Job containment protects descendants, not that assumption.
     Discovery is periodic accounting, never a proof of each process's birth.
     """
-    total_deadline = started + ACCEPTANCE_SECONDS
+    total_seconds = getattr(args, "acceptance_total_seconds", None)
+    total_seconds = ACCEPTANCE_SECONDS if total_seconds is None else total_seconds
+    total_deadline = started + total_seconds
     work_deadline = total_deadline - CLEANUP_SECONDS
     floors = tuple(4 if value is None else value for value in (
         getattr(args, "acceptance_physical_gib", None), getattr(args, "acceptance_commit_gib", None)))
-    guard = MemoryGuard(None, None, acceptance_floors=floors)
+    guard = MemoryGuard(None, None, acceptance_floors=floors, sample_limit=4 * total_seconds + 256)
     if not acceptance_ready():
         return _run_workload(args)  # Existing held receipt, with no native/resource entry.
     if args.output.exists():
@@ -1887,7 +1896,7 @@ def acceptance_controller(args, started):
         record["memory_finalization"] = "provisional until post-artifact host edge in returned result"
         payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
         pending = args.output / "lifecycle.json.tmp"
-        bounded_write(pending, payload, total_deadline)
+        bounded_write(pending, payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
         pending.replace(args.output / "lifecycle.json")
         if (args.output / "lifecycle.json").read_bytes() != payload:
             raise OSError("Final receipt readback mismatch.")
@@ -1917,6 +1926,15 @@ def acceptance_controller(args, started):
 
 
 def run(args):
+    port = getattr(args, "port", PORT)
+    if type(port) is not int or not 1024 <= port <= 65535:
+        raise ValueError("Port must be between 1024 and 65535.")
+    total_seconds = getattr(args, "acceptance_total_seconds", None)
+    if total_seconds is not None:
+        if not getattr(args, "acceptance_telemetry", False):
+            raise ValueError("Acceptance total seconds require --acceptance-telemetry.")
+        if type(total_seconds) is not int or not 900 <= total_seconds <= 5400:
+            raise ValueError("Acceptance total seconds must be between 900 and 5400.")
     acceptance_selection(args)
     if getattr(args, "acceptance_telemetry", False):
         return acceptance_controller(args, time.monotonic())
@@ -1972,7 +1990,7 @@ def _run_workload(args):
         pending.write_text(json.dumps(redact(record, secret), indent=2) + "\n", encoding="utf-8")
         replace_result(pending, args.output / "results.json")
         raise RuntimeError("Acceptance telemetry preparation held: Stage B/C and CUDA stage evidence are missing.")
-    assert_idle()
+    assert_idle(getattr(args, "port", PORT))
     exe = Path(cfg["exe"])
     if not exe.is_absolute():
         exe = Path(cfg.get("cwd") or ROOT) / exe
@@ -2062,7 +2080,8 @@ def _run_workload(args):
         record["timing_diagnostic"] = (record["timing_diagnostic"] or not classification["complete"] or any(
             item.get("active") is True for item in classification["controls"]))
         record["normal_comparison"] = normal_comparison_binding(cfg, classification)
-        cfg.update(host="127.0.0.1", port=PORT, log=None if worker_deadline is not None else str(engine_log))
+        cfg.update(host="127.0.0.1", port=getattr(args, "port", PORT),
+                   log=None if worker_deadline is not None else str(engine_log))
         record["effective_settings"] = {key: cfg.get(key) for key in (
             "model_name", "args", "fit_max_tokens", "open_browser",
             "expert_profile_save", "expert_profile_save_every")}
@@ -2076,9 +2095,10 @@ def _run_workload(args):
             ACCEPTANCE_LOG_LIMIT - 64 if worker_deadline is not None else LOG_LIMIT), None, None
         try:
             # Recheck immediately before spawning: never attach to an existing service.
-            assert_idle()
+            assert_idle(getattr(args, "port", PORT))
             proc = subprocess.Popen([sys.executable, str(ROOT / "serve/server.py"), "--engine", "strata",
-                                     "--config", str(config_path), "--host", "127.0.0.1", "--port", str(PORT)],
+                                     "--config", str(config_path), "--host", "127.0.0.1", "--port",
+                                     str(getattr(args, "port", PORT))],
                                     cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             owner = OwnedProcess(proc) if worker_deadline is None else None
@@ -2245,6 +2265,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path, help="A new directory; existing directories are refused")
+    parser.add_argument("--port", type=int, default=PORT, help="Loopback server port, 1024-65535 (default 8081)")
     parser.add_argument("--timing", action="store_true", help="Enable CPU decode stage timing; diagnostic run only")
     parser.add_argument("--fetch-timing", action="store_true", help="Enable expert-fetch profiling; diagnostic run only")
     parser.add_argument("--smoke", action="store_true", help="Also run the existing six model smoke checks")
@@ -2270,6 +2291,8 @@ def main(argv=None):
                         help="Idle 0-600 seconds between timed rounds while keeping the memory guard active")
     parser.add_argument("--acceptance-telemetry", action="store_true",
                         help="Prepare opt-in host acceptance telemetry; runtime remains held for Stage B/C")
+    parser.add_argument("--acceptance-total-seconds", type=int,
+                        help="Opt-in total acceptance budget, 900-5400 seconds (default 900)")
     parser.add_argument("--acceptance-physical-gib", type=float,
                         help="Opt-in physical headroom floor in GiB (default 4)")
     parser.add_argument("--acceptance-commit-gib", type=float,
