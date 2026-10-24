@@ -19,6 +19,16 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools import benchmark_compact_cache as bench
 
+# Every selected acceptance clone carries STRATA_TRACE=1 for its CUDA-stage rows.
+TRACE_CONTROL = {"control": "STRATA_TRACE", "kind": "diagnostic", "active": True}
+TRACE_EXCLUSION = {"reason": "active-diagnostic", "control": "STRATA_TRACE"}
+
+
+def other_active_diagnostics(evidence):
+    """Active diagnostic controls of a classification besides the acceptance trace."""
+    return [item["control"] for item in evidence["controls"]
+            if item.get("active") is True and item != TRACE_CONTROL]
+
 
 class HelperTests(unittest.TestCase):
     def test_snapshot_replacement_survives_a_temporary_reader_lock(self):
@@ -460,7 +470,13 @@ class AcceptanceTelemetryTests(unittest.TestCase):
         self.assertEqual(result["lifecycle_acceptance"], "pending")
         self.assertEqual(result["cleanup"], "pending")
         self.assertEqual(result["finalization"], "pending")
-        self.assertIn("missing", result["cuda_stage_evidence"])
+        self.assertEqual(result["cuda"], {"rows": [], "minimum_enforced_mib": None, "serving_rows": 0,
+            "completed_request_rows": 0, "status": "refused", "errors": [
+                "Engine log was not bound to its authenticated final bytes.",
+                "No enforced serving CUDA-free row was observed.",
+                "Required completed-request marks are not configured."]})
+        self.assertNotIn("cuda_stage_evidence", result)
+        self.assertNotIn("cuda_coverage", result)
         self.assertEqual(result["cuda_floor_mib"], 256)
         guard.owner.stop.assert_not_called()
 
@@ -558,21 +574,53 @@ class AcceptanceTelemetryTests(unittest.TestCase):
         guard.owner.stop.assert_called_once_with()
 
     def test_maximum_duration_host_receipt_fits_six_mib(self):
-        guard = bench.MemoryGuard(None, None, acceptance_floors=(4, 4), sample_limit=4 * 5400 + 256)
+        temporary = tempfile.TemporaryDirectory(prefix="receipt-cap-")
+        self.addCleanup(temporary.cleanup)
+        log = Path(temporary.name) / "engine.log"
+        guard = bench.MemoryGuard(None, log, acceptance_floors=(4, 4), sample_limit=4 * 5400 + 256,
+                                  engine_log_limit=bench.ACCEPTANCE_LOG_LIMIT, required_request_marks=11)
         for index in range(4 * 5400 + 256):
             start = 12345678.123456789 + index / 4
             self.sample(guard, physical=32, commit=64, start=start, end=start + 0.000123456)
-        summary = guard.acceptance_summary(guard.host_samples[0]["finished_monotonic"],
-                                           guard.host_samples[-1]["started_monotonic"])
-        self.assertEqual(summary["host_evidence"], "satisfied")
-        self.assertEqual(len(summary["raw_samples"]), 21856)
-        self.assertEqual(set(summary["raw_samples"][0]), {"started_monotonic", "finished_monotonic",
-                                                       "physical_available_bytes", "commit_available_bytes"})
-        record = {"status": "held", "memory": summary,
-                  "memory_finalization": "provisional until post-artifact host edge in returned result"}
-        payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
-        self.assertEqual(bench.ACCEPTANCE_RECEIPT_LIMIT, 6 * 1024**2)
-        self.assertLessEqual(len(payload), bench.ACCEPTANCE_RECEIPT_LIMIT)
+        # Maximal encoded stages, largest admitted integer MiB and a long finite observation clock.
+        for stage in ("s" * 128, "\x01" * 21 + "ss", "\u00e9" * 21 + "ss",
+                      "\U0001f600" * 10 + "s" * 8, '"' * 64, "\\" * 64):
+            with self.subTest(stage=ascii(stage)):
+                self.assertLessEqual(len(stage), 128)
+                self.assertEqual(len(json.dumps(stage).encode("utf-8")) - 2, 128)
+                # Each specimen gets a fresh reader; the full-duration host evidence is shared.
+                reader = bench.MemoryGuard(None, log, acceptance_floors=(4, 4),
+                                           engine_log_limit=bench.ACCEPTANCE_LOG_LIMIT, required_request_marks=11)
+                reader.host_samples = guard.host_samples
+                reader.samples, reader.max_gap_seconds = guard.samples, guard.max_gap_seconds
+                reader.sample_limit = guard.sample_limit
+                lines = ["strata serve: 9007199254740991 MiB of VRAM free with everything loaded"]
+                lines += [f"strata trace: 9007199254740991 MiB free after {stage}"] * 4095
+                data = ("\r\n".join(lines) + "\r\n").encode("utf-8")
+                self.assertLessEqual(len(data), bench.ACCEPTANCE_LOG_LIMIT)
+                log.write_bytes(data)
+                with patch.object(bench.time, "monotonic", return_value=sys.float_info.max):
+                    reader.read_engine_log()
+                    with log.open("rb") as stream:
+                        opened = bench.os.fstat(stream.fileno())
+                    reader.finish_engine_log(data, (opened.st_dev, opened.st_ino))
+                self.assertIsNone(reader.reason)
+                summary = reader.acceptance_summary(reader.host_samples[0]["finished_monotonic"],
+                                                    reader.host_samples[-1]["started_monotonic"])
+                self.assertEqual(summary["host_evidence"], "satisfied")
+                self.assertEqual(len(summary["raw_samples"]), 21856)
+                self.assertEqual(set(summary["raw_samples"][0]), {"started_monotonic", "finished_monotonic",
+                                                               "physical_available_bytes", "commit_available_bytes"})
+                self.assertEqual(len(summary["cuda"]["rows"]), 4096)
+                self.assertEqual(summary["cuda"]["rows"][-1], {
+                    "cuda_free_mib": 9007199254740991, "stage": stage, "enforced": True,
+                    "observed_monotonic": sys.float_info.max})
+                self.assertEqual(summary["cuda"]["errors"], ["Completed-request CUDA marks: 0 of 11 required."])
+                record = {"status": "held", "memory": summary,
+                          "memory_finalization": "provisional until post-artifact host edge in returned result"}
+                payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
+                self.assertEqual(bench.ACCEPTANCE_RECEIPT_LIMIT, 6 * 1024**2)
+                self.assertLessEqual(len(payload), bench.ACCEPTANCE_RECEIPT_LIMIT)
 
     def test_actual_monitor_uses_repository_commit_snapshot_not_swap_usage(self):
         from tools import prepare_unsloth_q2 as preparation
@@ -612,6 +660,442 @@ class AcceptanceTelemetryTests(unittest.TestCase):
         self.assertEqual(guard.host_samples, failed_rows)
         self.assertEqual(guard.reason, reason)
         guard.owner.stop.assert_called_once_with()
+
+
+class EngineLogEvidenceTests(unittest.TestCase):
+    """The acceptance guard's incremental engine-log reader on synthetic r8-format logs."""
+
+    SERVING = "strata serve: 761 MiB of VRAM free with everything loaded"
+    MARKS = (731, 729, 715, 702, 698, 690, 688, 686, 685, 684, 683)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="engine-log-")
+        self.addCleanup(temporary.cleanup)
+        self.log = Path(temporary.name) / "engine.log"
+
+    def guard(self, marks=11, **kwargs):
+        kwargs.setdefault("engine_log_limit", bench.ACCEPTANCE_LOG_LIMIT)
+        return bench.MemoryGuard(Mock(), self.log, acceptance_floors=(4, 4), required_request_marks=marks, **kwargs)
+
+    @staticmethod
+    def text(lines):
+        return "".join(line + "\r\n" for line in lines).encode("utf-8")  # Windows text-mode stderr.
+
+    def lines(self, marks):
+        return (["[strata] 2026-10-23 12:00:00 engine started: strata.exe --serve",
+                 "strata generate: CUDA0 context ready, 10.21 GiB free before expert arena registration",
+                 "strata trace: 2310 MiB free after opening the expert cache", self.SERVING]
+                + [f"strata trace: prefill 900 MiB free after entry\nstrata trace: {mib} MiB free after the completed request"
+                   for mib in marks])
+
+    def append(self, data):
+        with self.log.open("ab") as stream:
+            stream.write(data)
+
+    def finish(self, guard):
+        data = self.log.read_bytes()
+        with self.log.open("rb") as stream:
+            opened = bench.os.fstat(stream.fileno())
+        guard.finish_engine_log(data, (opened.st_dev, opened.st_ino))
+        return guard.cuda_summary()
+
+    def complete(self, guard, lines):
+        data = self.text(lines)
+        middle = len(data) // 2  # A line split across reads stays pending until completed.
+        self.log.write_bytes(data[:middle])
+        guard.read_engine_log()
+        self.append(data[middle:])
+        guard.read_engine_log()
+        return self.finish(guard)
+
+    def assert_refused(self, guard, reason, error=None):
+        summary = guard.cuda_summary()
+        self.assertEqual(summary["status"], "refused")
+        self.assertEqual(guard.reason, reason)
+        guard.owner.stop.assert_called_once_with()
+        if error is not None:
+            self.assertEqual(summary["errors"][0], error)
+        with self.assertRaises(RuntimeError) as caught:
+            guard.check()
+        self.assertEqual(str(caught.exception), reason)
+        return summary
+
+    def test_short_sequence_with_eleven_marks_is_satisfied(self):
+        guard = self.guard(11)
+        summary = self.complete(guard, self.lines(self.MARKS))
+        self.assertEqual(summary["status"], "satisfied")
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(summary["serving_rows"], 1)
+        self.assertEqual(summary["completed_request_rows"], 11)
+        self.assertEqual(summary["minimum_enforced_mib"], 683)
+        # context-ready and the pre-serving trace are recorded but not enforced.
+        self.assertEqual([(row["stage"], row["cuda_free_mib"], row["enforced"]) for row in summary["rows"][:5]],
+                         [("context-ready", 10.21 * 1024, False), ("opening the expert cache", 2310, False),
+                          ("serving", 761, True), ("prefill entry", 900, True), ("the completed request", 731, True)])
+        self.assertEqual(len(summary["rows"]), 3 + 2 * 11)
+        self.assertIsNone(guard.reason)
+        guard.owner.stop.assert_not_called()
+
+    def test_near_full_sequence_with_three_marks_is_satisfied(self):
+        guard = self.guard(3)
+        summary = self.complete(guard, self.lines((1210, 940, 812)))
+        self.assertEqual((summary["status"], summary["completed_request_rows"], summary["minimum_enforced_mib"]),
+                         ("satisfied", 3, 761))
+
+    def test_no_serving_row_is_refused(self):
+        guard = self.guard(11)
+        summary = self.complete(guard, [line for line in self.lines(self.MARKS) if line != self.SERVING])
+        self.assertEqual(summary["status"], "refused")
+        self.assertEqual(summary["serving_rows"], 0)
+        self.assertEqual(summary["completed_request_rows"], 11)
+        self.assertEqual(summary["errors"], ["No enforced serving CUDA-free row was observed."])
+        guard.owner.stop.assert_not_called()
+
+    def test_one_missing_request_mark_is_refused(self):
+        guard = self.guard(11)
+        summary = self.complete(guard, self.lines(self.MARKS[:-1]))
+        self.assertEqual(summary["errors"], ["Completed-request CUDA marks: 10 of 11 required."])
+        self.assertEqual(summary["status"], "refused")
+
+    def test_unconfigured_marks_and_unbound_stream_are_refused(self):
+        guard = self.guard(None)
+        self.log.write_bytes(self.text(self.lines(self.MARKS)))
+        guard.read_engine_log()
+        self.assertEqual(guard.cuda_summary()["errors"], ["Engine log was not bound to its authenticated final bytes.",
+                                                          "Required completed-request marks are not configured."])
+
+    def test_255_mib_mark_stops_owner_and_keeps_first_reason(self):
+        guard = self.guard(11)
+        marks = (731, 255) + self.MARKS[2:]
+        self.log.write_bytes(self.text(self.lines(marks)))
+        guard.read_engine_log()
+        summary = self.assert_refused(guard, "Actual engine CUDA-free memory below 256 MiB at the completed request")
+        self.assertEqual(summary["minimum_enforced_mib"], 255)
+        self.assertEqual(summary["completed_request_rows"], 2)  # Reading stops at the failing row.
+        self.assertIn("An enforced CUDA-free row is below 256 MiB.", summary["errors"])
+        guard.read_engine_log()
+        self.assertEqual(len(guard.cuda_rows), len(summary["rows"]))
+        self.assertEqual(self.finish(guard)["status"], "refused")
+
+    def test_below_floor_cleanup_failure_is_separate_and_earlier_reason_survives(self):
+        guard = self.guard(11)
+        guard.owner.stop.side_effect = RuntimeError("synthetic owned survivor")
+        self.log.write_bytes(self.text([self.SERVING, "strata trace: 100 MiB free after the completed request"]))
+        guard.read_engine_log()
+        self.assertEqual(guard.reason, "Actual engine CUDA-free memory below 256 MiB at the completed request")
+        self.assertEqual(guard.cleanup_error, "RuntimeError: synthetic owned survivor")
+        guard = self.guard(11)
+        guard.reason = "Physical or available commit fell below the original 2 GiB emergency floor."
+        guard.read_engine_log()
+        self.assertEqual(guard.reason, "Physical or available commit fell below the original 2 GiB emergency floor.")
+        self.assertEqual(guard.cuda_summary()["minimum_enforced_mib"], 100)
+
+    def test_pre_serving_trace_below_floor_is_recorded_without_enforcement(self):
+        guard = self.guard(1)
+        self.complete(guard, ["strata trace: 10 MiB free after opening the expert cache",
+                              "strata trace: prefill 200 MiB free after entry",
+                              "strata generate: CUDA0 context ready, 0.10 GiB free before expert arena registration",
+                              self.SERVING, "strata trace: 700 MiB free after the completed request"])
+        self.assertIsNone(guard.reason)
+        self.assertEqual(guard.cuda_summary()["status"], "satisfied")
+        guard = self.guard(1)
+        self.log.write_bytes(self.text([self.SERVING, "strata trace: prefill 200 MiB free after entry"]))
+        guard.read_engine_log()
+        self.assertEqual(guard.reason, "Actual engine CUDA-free memory below 256 MiB at prefill entry")
+
+    def test_other_guard_formats_are_enforced_like_the_reference_reader(self):
+        cases = (("INFO context=131072 vram_free_mib=333", "engine-metric", 333),
+                 ("strata serve: VRAM 512 MiB kept free: cache, 300 MiB free now", "request-runtime", 300),
+                 ("strata serve: WARNING: 600 MiB of VRAM free with everything loaded - LOW", "serving", 600))
+        for line, stage, value in cases:
+            with self.subTest(stage=stage):
+                self.log.write_bytes(self.text([line]))
+                guard = self.guard(1)
+                guard.read_engine_log()
+                self.assertEqual([(row["stage"], row["cuda_free_mib"], row["enforced"]) for row in guard.cuda_rows],
+                                 [(stage, value, True)])
+
+    def reader_refused(self, error, data=None, *, setup=None, guard=None):
+        guard = guard or self.guard(11)
+        if setup is not None:
+            setup(guard)
+        else:
+            self.log.write_bytes(data)
+            guard.read_engine_log()
+        summary = self.assert_refused(guard, "Engine CUDA-stage evidence failed: " + error, error)
+        self.assertNotIn("PRIVATE", json.dumps(summary))
+        return summary
+
+    def test_unrecognized_free_memory_trace_is_refused(self):
+        for line in ("strata trace: 900 MiB free before the request", "strata trace: MiB free after PRIVATE"):
+            with self.subTest(line=line):
+                self.reader_refused("Unrecognized CUDA memory trace.", self.text([self.SERVING, line]))
+
+    def test_strict_utf8_is_required(self):
+        self.reader_refused("Engine log is not strict UTF-8.", self.text([self.SERVING]) + b"PRIVATE \xff\r\n")
+
+    def test_line_and_row_caps_and_value_bounds_refuse(self):
+        self.reader_refused("Engine log line exceeded 64 KiB.", b"PRIVATE" * 10000)
+        self.reader_refused("Engine log line exceeded 64 KiB.", b"x" * 65537 + b"\n")
+        rows = [self.SERVING] + ["strata trace: 900 MiB free after the completed request"] * 4095
+        guard = self.guard(11)
+        self.log.write_bytes(self.text(rows))
+        guard.read_engine_log()
+        self.assertIsNone(guard.reason)
+        self.assertEqual(len(guard.cuda_rows), 4096)
+        self.append(self.text(["strata trace: 900 MiB free after the completed request"]))
+        self.reader_refused("CUDA-stage row limit reached; evidence is incomplete.",
+                            setup=lambda guard: guard.read_engine_log(), guard=guard)
+        self.reader_refused("CUDA memory trace exceeds its evidence bounds.",
+                            self.text(["strata trace: 900 MiB free after " + "s" * 129]))
+        self.reader_refused("CUDA memory trace exceeds its evidence bounds.",
+                            self.text(["strata trace: " + "9" * 16 + " MiB free after the completed request"]))
+        summary = self.reader_refused(
+            "CUDA memory trace has an unreadable value.",
+            self.text(["strata trace: " + "9" * 5000 + " MiB free after the completed request"]))
+        self.assertEqual(summary["rows"], [])
+        self.reader_refused("CUDA memory trace exceeds its evidence bounds.",
+                            self.text(["strata generate: CUDA0 context ready, " + "9" * 400 + " GiB free"]))
+
+    def test_overlong_numeric_values_refuse_with_a_fixed_message(self):
+        # The review probe's float() error quoted 64 KiB of digits into every reason copy.
+        for line in ("strata generate: CUDA0 context ready, " + "1." * 32000 + " GiB free",
+                     "strata trace: " + "7" * 60000 + " MiB free after the completed request"):
+            with self.subTest(line=line[:40]):
+                self.assertLess(len(line), 65536)
+                summary = self.reader_refused("CUDA memory trace has an unreadable value.",
+                                              self.text([self.SERVING, line]))
+                guard_text = json.dumps(summary)
+                self.assertNotIn("1.1.1", guard_text)
+                self.assertNotIn("7777", guard_text)
+                self.assertLess(len(guard_text), 1024)
+
+    def test_stage_json_payload_boundary_preserves_ascii_and_counts_escape_expansion(self):
+        # Non-BMP characters encode as surrogate pairs. Lone surrogates cannot enter a strict UTF-8 log,
+        # but the row owner must still count their JSON expansion when called directly.
+        stages = ("s" * 128, "\x01" * 21 + "ss", "\u00e9" * 21 + "ss",
+                  "\U0001f600" * 10 + "s" * 8, "\ud800" * 21 + "ss", "\udfff" * 21 + "ss",
+                  '"' * 64, "\\" * 64, "s" + "\t" * 63 + "s", "s" + "\b" * 63 + "s")
+        for stage in stages:
+            with self.subTest(stage=ascii(stage)):
+                guard = self.guard(1)
+                self.assertEqual(len(json.dumps(stage).encode("utf-8")) - 2, 128)
+                row = guard.engine_row("strata trace: 731 MiB free after " + stage)
+                self.assertEqual(row["stage"], stage)
+                self.assertEqual(guard.cuda_rows, [row])
+                with self.assertRaisesRegex(ValueError, r"^CUDA memory trace exceeds its evidence bounds\.$"):
+                    guard.engine_row("strata trace: 731 MiB free after " + stage + "s")
+                self.assertEqual(guard.cuda_rows, [row])  # Refusal precedes insertion.
+
+    def test_over_budget_stage_fails_closed_without_recording_offending_text(self):
+        stages = ("\x01" * 128,) + tuple("PRIVATE-STAGE-SENTINEL" + suffix
+                   for suffix in ("\x01" * 21, "\u00e9" * 21, "\U0001f600" * 10, '"' * 64, "\\" * 64))
+        for stage in stages:
+            with self.subTest(stage=ascii(stage)):
+                guard = self.guard(1)
+                data = self.text([self.SERVING, "strata trace: 731 MiB free after the completed request",
+                                  "strata trace: 731 MiB free after " + stage,
+                                  "strata trace: 732 MiB free after later row"])
+                summary = self.reader_refused("CUDA memory trace exceeds its evidence bounds.", data, guard=guard)
+                self.assertEqual([row["stage"] for row in summary["rows"]], ["serving", "the completed request"])
+                self.assertEqual(summary["completed_request_rows"], 1)
+                self.assertNotIn(json.dumps(stage)[1:-1], json.dumps(summary))
+                guard.read_engine_log()
+                self.assertEqual(self.finish(guard), summary)
+                self.assertEqual(self.log.read_bytes(), data)
+
+    def test_admitted_numeric_shapes_keep_their_actual_bounds(self):
+        guard = self.guard(1)
+        cases = (("strata trace: 9007199254740991 MiB free after widest integer", 9007199254740991),
+                 ("strata generate: CUDA0 context ready, 8796093022207.999 GiB free", 9007199254740991.0),
+                 ("strata generate: CUDA0 context ready, 0.00000000000000000001 GiB free", 1.024e-17),
+                 ("strata generate: CUDA0 context ready, 0 GiB free", 0.0))
+        for line, expected in cases:
+            with self.subTest(line=line):
+                row = guard.engine_row(line)
+                self.assertEqual(type(row["cuda_free_mib"]), type(expected))
+                self.assertEqual(row["cuda_free_mib"], expected)
+                self.assertLessEqual(len(json.dumps(row["cuda_free_mib"])), 24)
+        rows = list(guard.cuda_rows)
+        for line in ("strata trace: 9007199254740992 MiB free after too large",
+                     "strata generate: CUDA0 context ready, 8796093022208 GiB free",
+                     "strata generate: CUDA0 context ready, " + "9" * 400 + " GiB free"):
+            with self.subTest(line=line[:80]):
+                with self.assertRaisesRegex(ValueError, r"^CUDA memory trace exceeds its evidence bounds\.$"):
+                    guard.engine_row(line)
+                self.assertEqual(guard.cuda_rows, rows)
+
+    def test_private_value_in_a_recognized_row_is_refused_and_never_recorded(self):
+        for secret in ("synthetic-api-key", "ab" * 32):
+            for line in ("strata trace: 731 MiB free after " + secret,
+                         "strata serve: 761 MiB of VRAM free with everything loaded " + secret):
+                with self.subTest(secret=secret, line=line[:20]):
+                    guard = self.guard(11)
+                    guard.engine_log_secrets = ("synthetic-api-key", "ab" * 32)
+                    summary = self.reader_refused("CUDA memory trace contains a private value.",
+                                                  self.text([self.SERVING, line]), guard=guard)
+                    self.assertEqual([row["stage"] for row in summary["rows"]], ["serving"])
+                    self.assertNotIn(secret, json.dumps(summary) + guard.reason)
+
+    def test_backlog_and_size_limits_refuse(self):
+        data = self.text(["strata generate: idle"] * 50000)
+        self.assertGreater(len(data), 1024**2)
+        self.reader_refused("Engine log exceeded its size limit.", data)
+        self.reader_refused("Engine log parsing backlog exceeded 1 MiB.", data,
+                            guard=self.guard(11, engine_log_limit=2 * bench.LOG_LIMIT))
+
+    def test_truncated_disappearing_replaced_and_linked_logs_refuse(self):
+        first = self.text(self.lines(self.MARKS[:3]))
+        def truncated(guard):
+            self.log.write_bytes(first)
+            guard.read_engine_log()
+            self.log.write_bytes(first[:10])
+            guard.read_engine_log()
+        self.reader_refused("Engine log truncated.", setup=truncated)
+        def disappeared(guard):
+            self.log.write_bytes(b"")
+            guard.read_engine_log()
+            self.log.unlink()
+            guard.read_engine_log()
+        self.reader_refused("Engine log disappeared.", setup=disappeared)
+        def replaced(guard):
+            self.log.write_bytes(first)
+            guard.read_engine_log()
+            self.log.unlink()
+            self.log.write_bytes(first)  # Identical bytes in a different object.
+            guard.read_engine_log()
+        self.reader_refused("Engine log identity changed.", setup=replaced)
+        def linked(guard):
+            self.log.unlink()
+            target = self.log.with_name("target.log")
+            target.write_bytes(first)
+            self.log.symlink_to(target)
+            guard.read_engine_log()
+        self.reader_refused("Engine log is linked.", setup=linked)
+
+    def test_absent_log_before_creation_is_not_an_error(self):
+        guard = self.guard(11)
+        guard.read_engine_log()
+        self.assertIsNone(guard.reason)
+        self.assertEqual(guard.cuda_rows, [])
+
+    def test_final_bytes_must_extend_the_consumed_stream(self):
+        data = self.text(self.lines(self.MARKS))
+        def rewritten(guard):
+            self.log.write_bytes(data)
+            guard.read_engine_log()
+            self.log.write_bytes(data.replace(b"731", b"999"))  # Same size, consumed bytes changed.
+            self.finish(guard)
+        self.reader_refused("Engine log changed after guard consumption.", setup=rewritten)
+        def other_object(guard):
+            self.log.write_bytes(data[:100])
+            guard.read_engine_log()
+            guard.finish_engine_log(data, (0, 0))
+        self.reader_refused("Engine log changed after guard consumption.", setup=other_object)
+        def shorter(guard):
+            self.log.write_bytes(data)
+            guard.read_engine_log()
+            guard.finish_engine_log(data[:-10], guard.engine_identity)
+        self.reader_refused("Engine log changed after guard consumption.", setup=shorter)
+        def incomplete(guard):
+            self.log.write_bytes(data + b"strata trace: 700 MiB free after the completed")
+            guard.read_engine_log()
+            self.finish(guard)
+        self.reader_refused("Engine log ends with an incomplete line.", setup=incomplete)
+
+    def test_legacy_guard_keeps_its_limit_and_never_parses_the_log(self):
+        guard = bench.MemoryGuard(Mock(), self.log)
+        self.assertEqual((guard.engine_log_limit, guard.required_request_marks), (2 * bench.LOG_LIMIT, None))
+        self.log.write_bytes(self.text([self.SERVING, "strata trace: 10 MiB free after the completed request",
+                                        "strata trace: 900 MiB free before PRIVATE"]))
+        guard.done = Mock()
+        guard.done.is_set.side_effect = [False, True]
+        with patch.object(bench.psutil, "virtual_memory", return_value=types.SimpleNamespace(available=8 * 1024**3)), \
+                patch.object(bench.psutil, "swap_memory", return_value=types.SimpleNamespace(used=0)):
+            guard.monitor()
+        self.assertIsNone(guard.reason)
+        self.assertEqual(guard.cuda_rows, [])
+        guard.owner.stop.assert_not_called()
+        self.assertEqual(set(guard.summary()), {"samples", "min_available_gib", "max_pagefile_used_gib",
+                                                "pagefile_available", "pagefile_unavailable_reason", "stop_reason"})
+        with self.log.open("r+b") as stream:
+            stream.truncate(2 * bench.LOG_LIMIT + 1)
+        guard.done.is_set.side_effect = [False, True]
+        with patch.object(bench.psutil, "virtual_memory", return_value=types.SimpleNamespace(available=8 * 1024**3)), \
+                patch.object(bench.psutil, "swap_memory", return_value=types.SimpleNamespace(used=0)):
+            guard.monitor()
+        self.assertEqual(guard.reason, "Engine log exceeded the diagnostic size limit.")
+        guard.owner.stop.assert_called_once_with()
+
+    def test_worker_engine_log_check_is_bounded_strict_and_secret_free(self):
+        class File:
+            handle = 7
+            def __init__(self, data):
+                self.data, self.limits = data, []
+            def read(self, limit):
+                self.limits.append(limit)
+                return self.data[:limit]
+        secret = "private-api-key"
+        data = self.text(self.lines(self.MARKS))
+        file = File(data)
+        self.assertEqual(bench.acceptance_engine_log(file, secret), data)
+        self.assertEqual(file.limits, [bench.ACCEPTANCE_LOG_LIMIT + 1])
+        for value, error in ((b"x" * (bench.ACCEPTANCE_LOG_LIMIT + 1), "Engine log exceeds its size budget."),
+                             (data + b"\xff\r\n", "Engine log is not strict UTF-8."),
+                             (data + b"Authorization: Bearer private-api-key\r\n", "Engine log contains the API key.")):
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, "^" + error.replace(".", r"\.") + "$"):
+                bench.acceptance_engine_log(File(value), secret)
+        for missing in (None, types.SimpleNamespace(handle=None)):
+            with self.assertRaisesRegex(RuntimeError, "^Engine log is missing\\.$"):
+                bench.acceptance_engine_log(missing, secret)
+
+    def test_real_worker_engine_log_handle_admits_only_the_engine_append_open(self):
+        import _winapi
+        api = bench.WindowsEngineLogAPI()
+        directory = self.log.parent
+        handle = api.open(self.log)
+        try:
+            other = directory / "other.log"
+            other.write_bytes(b"external replacement bytes")
+            with open(self.log, "a", encoding="utf-8") as server:  # serve/server.py StrataEngine's open.
+                server.write(self.SERVING + "\n")
+                server.flush()
+                for attack in (self.log.unlink, lambda: self.log.rename(directory / "moved.log"),
+                               lambda: other.replace(self.log)):
+                    with self.assertRaises(PermissionError):
+                        attack()
+            self.assertEqual(other.read_bytes(), b"external replacement bytes")
+            with self.assertRaises(PermissionError):
+                self.log.unlink()  # The worker handle alone still denies deletion.
+            bench.os.link(self.log, directory / "alias.log")  # A hard link names the same object.
+            self.assertTrue(bench.os.path.samefile(self.log, directory / "alias.log"))
+            api.seek(handle, 0)
+            self.assertEqual(api.read(handle, 4096), (self.SERVING + "\r\n").encode())
+        finally:
+            api.close(handle)
+        self.log.unlink()
+        (directory / "alias.log").unlink()
+        # Planted names refuse the create-once open and are never followed or truncated.
+        foreign = directory / "foreign.txt"
+        foreign.write_bytes(b"external foreign bytes")
+        dangling = directory / "dangling-target.txt"
+        plants = {"file": lambda: self.log.write_bytes(b"planted"),
+                  "hardlink": lambda: bench.os.link(foreign, self.log),
+                  "symlink": lambda: self.log.symlink_to(foreign),
+                  "dangling-symlink": lambda: self.log.symlink_to(dangling),
+                  "junction": lambda: _winapi.CreateJunction(str(directory / "jdir"), str(self.log))}
+        (directory / "jdir").mkdir()
+        for kind, plant in plants.items():
+            with self.subTest(kind=kind):
+                plant()
+                with self.assertRaises(OSError):
+                    api.close(api.open(self.log))
+                self.assertEqual(foreign.read_bytes(), b"external foreign bytes")
+                self.assertFalse(dangling.exists())
+                if kind == "junction":
+                    bench.os.rmdir(self.log)
+                else:
+                    self.log.unlink()
 
 
 class RunTests(unittest.TestCase):
@@ -1290,9 +1774,14 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.worker_thread = None
         self.clock_lock = threading.RLock()
         self.stage = None
+        # A manifest run's fake engine appends r8-format CUDA rows to the configured log.
+        self.engine_stream, self.engine_marks = None, 0
+        self.engine_serving = "strata serve: 761 MiB of VRAM free with everything loaded\n"
+        self.engine_mark = lambda index: "strata trace: 731 MiB free after the completed request\n"
         self.cleanup = contextlib.ExitStack()
         self.addCleanup(self.cleanup.close)
         self.addCleanup(self.temporary.cleanup)
+        self.addCleanup(self.engine_close)
         self.native = self.Native(self)
         self.NativeBinding = bench.WindowsProcessAPI
         self.SelfIdentityBinding = bench.worker_self_identity
@@ -1379,11 +1868,31 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.assertIn("--engine", argv, "Unexpected process boundary")
         self.assertTrue(self.assigned)
         cfg = json.loads(Path(argv[argv.index("--config") + 1]).read_text())
-        self.assertIsNone(cfg["log"])
+        if getattr(self.args, "acceptance_manifest", None) is None:
+            self.assertIsNone(cfg["log"])
+        else:
+            self.assertEqual(cfg["log"], str(self.output.resolve() / "engine.log"))
+            self.assertTrue(Path(cfg["log"]).is_file(), "The worker creates the engine log before the server")
+            # The same append open as serve/server.py StrataEngine, into the worker's object.
+            self.engine_stream = open(cfg["log"], "a", encoding="utf-8")
+            self.engine_write(self.engine_serving)
         self.events.append("server")
+        def terminate():
+            self.events.append("server-stop")
+            self.engine_close()
         return types.SimpleNamespace(stdout=io.BytesIO(b"synthetic server output\n"),
-                                     poll=lambda: None, terminate=lambda: self.events.append("server-stop"),
+                                     poll=lambda: None, terminate=terminate,
                                      wait=lambda timeout: self.events.append("server-wait") or 0)
+
+    def engine_write(self, text):
+        if self.engine_stream is not None and text:
+            self.engine_stream.write(text)
+            self.engine_stream.flush()
+
+    def engine_close(self):
+        if self.engine_stream is not None:
+            self.engine_stream.close()
+            self.engine_stream = None
 
     def workload(self, name):
         test = self
@@ -2120,7 +2629,10 @@ class ContainedLifecycleTests(unittest.TestCase):
             guard = real_guard(*args, **kwargs)
             monitor = guard.monitor
             def sample(*args, **kwargs):
-                with self.clock_lock:
+                # One lock order on every thread: the owner's lock, then the clock, as in
+                # OwnedProcess.finish(), which reads the clock while it holds its own lock.
+                owner = guard.owner
+                with owner.lock if owner is not None else contextlib.nullcontext(), self.clock_lock:
                     return monitor(*args, **kwargs)
             guard.monitor = sample
             guards.append(guard)
@@ -2131,10 +2643,24 @@ class ContainedLifecycleTests(unittest.TestCase):
                 with self.clock_lock:
                     self.now += step
                     seconds -= step
-                    guards[0].monitor(once=True)  # Advance the one external sampler without overlapping a read.
+                # Advance the one external sampler without overlapping a read. After the fake
+                # Job is cancelled the controller may hold the owner's lock while it accounts
+                # for and joins this worker thread, so this thread then stops waiting for it.
+                owner = guards[0].owner
+                locked = owner is None
+                while not locked and not self.killed:
+                    locked = owner.lock.acquire(timeout=0.001)
+                if locked:
+                    try:
+                        guards[0].monitor(once=True)
+                    finally:
+                        if owner is not None:
+                            owner.lock.release()
         class Client(base_client):
             def chat(client, *args, **kwargs):
                 response = super().chat(*args, **kwargs)
+                self.engine_marks += 1
+                self.engine_write(self.engine_mark(self.engine_marks))
                 advance(3.6)
                 return response
         validation = types.SimpleNamespace(Client=Client,
@@ -2475,7 +3001,8 @@ class StageCSourceTests(unittest.TestCase):
         self.assertEqual(result["acceptance_workload"], "near-full")
         self.assertEqual(result["cohort"], "automatic")
         self.assertEqual(result["status"], "held")
-        self.assertEqual(result["effective_environment"], {"CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0"})
+        self.assertEqual(result["effective_environment"], {"CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0",
+                                                           "STRATA_TRACE": "1"})
 
     def test_cli_selects_workload_context_cohort_candidate_and_exact_protected_files(self):
         with patch.object(bench, "run") as run, contextlib.redirect_stdout(io.StringIO()):
@@ -2513,14 +3040,32 @@ class StageCSourceTests(unittest.TestCase):
             clean, environment = bench.clean_environment(cfg, False, acceptance=True)
         self.assertEqual(environment, {"KEEP": "value"})
         self.assertEqual(config_environment(clean, environment), {"KEEP": "value", "STRATA_FILE_CACHE_MIB": "4096",
-            "CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0"})
+            "CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0", "STRATA_TRACE": "1"})
         self.assertEqual(cfg, {"env": {"STRATA_FILE_CACHE_MIB": "4096"}})
         explicit = {"env": {"CUDA_MODULE_LOADING": "LAZY", "STRATA_FILE_COPY_READY": "1",
                             "STRATA_VERIFY_PROFILE": "1", "STRATA_API_KEY": "another-private-key"}}
         with patch.dict(bench.os.environ, inherited, clear=True):
             treatment, environment = bench.clean_environment(explicit, False, acceptance=True)
         self.assertEqual(config_environment(treatment, environment), {"KEEP": "value", "CUDA_MODULE_LOADING": "LAZY",
-            "STRATA_FILE_COPY_READY": "1", "STRATA_VERIFY_PROFILE": "1"})
+            "STRATA_FILE_COPY_READY": "1", "STRATA_VERIFY_PROFILE": "1", "STRATA_TRACE": "1"})
+
+    def test_acceptance_clone_sets_one_exact_trace_and_legacy_cleaning_does_not(self):
+        saved = {"env": {"strata_trace": "0", "Strata_Trace": "", "STRATA_TRACE": "", "KEEP_ME": "1"}}
+        with patch.object(bench.os, "name", "nt"), patch.dict(bench.os.environ, {"STRATA_TRACE": "0"}, clear=True):
+            clean, environment = bench.clean_environment(saved, False, acceptance=True)
+        self.assertEqual(clean["env"], {"KEEP_ME": "1", "CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0",
+                                        "STRATA_TRACE": "1"})
+        self.assertEqual(environment, {})
+        with patch.object(bench.os, "name", "posix"), patch.dict(bench.os.environ, {}, clear=True):
+            clean, _ = bench.clean_environment(saved, False, acceptance=True)
+        self.assertEqual({key: clean["env"][key] for key in ("strata_trace", "Strata_Trace", "STRATA_TRACE")},
+                         {"strata_trace": "0", "Strata_Trace": "", "STRATA_TRACE": "1"})
+        with patch.dict(bench.os.environ, {}, clear=True):
+            legacy, _ = bench.clean_environment({"env": {"STRATA_TRACE": "0"}}, False)
+            unset, _ = bench.clean_environment({"env": {}}, False)
+        self.assertEqual(legacy["env"], {"STRATA_TRACE": "0"})
+        self.assertEqual(unset["env"], {})
+        self.assertEqual(saved["env"]["STRATA_TRACE"], "")  # The saved config is never changed.
 
     def test_saved_and_candidate_executable_provenance_are_separate_and_receipts_are_claims(self):
         candidate = self.root / "strata-candidate.exe"
@@ -3212,12 +3757,14 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.directory_api = bench.WindowsDirectoryAPI()
         self.provisional_api = bench.WindowsProvisionalAPI()
         self.receipt_api = bench.WindowsReceiptAPI()
+        self.engine_log_api = bench.WindowsEngineLogAPI()
         self.case = case = ContainedLifecycleTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
         self.enterContext(patch.object(bench, "WindowsDirectoryAPI", return_value=self.directory_api))
         self.enterContext(patch.object(bench, "WindowsProvisionalAPI", return_value=self.provisional_api))
         self.enterContext(patch.object(bench, "WindowsReceiptAPI", return_value=self.receipt_api))
+        self.enterContext(patch.object(bench, "WindowsEngineLogAPI", return_value=self.engine_log_api))
         self.root, self.args = case.root, case.args
         self.enterContext(patch.object(bench, "ROOT", self.root))
         self.enterContext(patch.object(bench, "WORKLOADS", self.root / "workloads"))
@@ -3333,6 +3880,27 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.enterContext(patch.object(self.receipt_api, "open", side_effect=opened_receipt))
         self.enterContext(patch.object(self.receipt_api, "close", side_effect=closed_receipt))
         self.addCleanup(lambda: self.assertEqual(self.receipt_handles, set(), "Unclosed controller receipt handles"))
+        self.engine_log_handles, self.engine_log_events = set(), []
+        engine_open, engine_close = self.engine_log_api.open, self.engine_log_api.close
+        engine_final = self.engine_log_api.open_final
+        def opened_engine_log(path):
+            handle = engine_open(path)
+            self.engine_log_handles.add(handle)
+            self.engine_log_events.append(("open", handle))
+            return handle
+        def opened_final_engine_log(path):
+            handle = engine_final(path)
+            self.engine_log_handles.add(handle)
+            self.engine_log_events.append(("final", handle))
+            return handle
+        def closed_engine_log(handle):
+            engine_close(handle)
+            self.engine_log_handles.remove(handle)
+            self.engine_log_events.append(("close", handle))
+        self.enterContext(patch.object(self.engine_log_api, "open", side_effect=opened_engine_log))
+        self.enterContext(patch.object(self.engine_log_api, "open_final", side_effect=opened_final_engine_log))
+        self.enterContext(patch.object(self.engine_log_api, "close", side_effect=closed_engine_log))
+        self.addCleanup(lambda: self.assertEqual(self.engine_log_handles, set(), "Unclosed worker engine-log handles"))
 
     def test_windows_atomic_birth_and_overlapping_handles_prevent_replacement_until_both_close(self):
         output, moved = self.root / "atomic-output", self.root / "moved-output"
@@ -4509,13 +5077,20 @@ class AcceptanceAdmissionTests(unittest.TestCase):
                 insert()
             return native_open(path)
 
+        def engine_log(path):
+            if path == target:
+                insert()  # The planted name precedes the worker's create-once engine log.
+            return engine_open(path)
+
         def prepared(file, data):
             if name == "provisional.json.tmp" and "requests" in json.loads(data):
                 insert()
             return publish(file, data)
 
+        engine_open = self.engine_log_api.open
         with patch.object(Path, "open", open_stream), \
                 patch.object(self.provisional_api, "open", side_effect=claim), \
+                patch.object(self.engine_log_api, "open", side_effect=engine_log), \
                 patch.object(bench.AcceptanceProvisionalFile, "publish", prepared), \
                 contextlib.redirect_stderr(io.StringIO()), \
                 self.assertRaises(bench.AcceptanceFailure) as caught:
@@ -4538,6 +5113,16 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         if name == "provisional.json":
             self.assertNotIn("server", self.case.events)
             self.assertFalse(caught.exception.record["finalization"])
+        elif name == "engine.log":
+            # The engine's log is created once before the server, so a planted name refuses the server.
+            self.assertNotIn("server", self.case.events)
+            receipt = json.loads((self.case.output / "provisional.json").read_bytes())
+            # The controller's guard may refuse the planted object and stop the worker first.
+            self.assertIn(receipt["status"], ("provisional_failed", "provisional_starting"))
+            if receipt["status"] == "provisional_failed":
+                self.assertEqual(receipt["artifact_error"], "RuntimeError: Engine log is missing.")
+            self.assertIsNone(self.worker_args._engine_log.handle)
+            self.assertEqual(self.engine_log_handles, set())
         else:
             self.assertIn("server", self.case.events)
             receipt = json.loads((self.case.output / "provisional.json").read_bytes())
@@ -4779,20 +5364,76 @@ class AcceptanceAdmissionTests(unittest.TestCase):
     def test_server_artifact_close_failure_is_not_pass(self):
         self.worker_write_failure("server.log", "close")
 
-    def test_engine_artifact_create_failure_is_not_pass(self):
-        self.worker_write_failure("engine.log", "create")
+    def engine_log_handle_failure(self, operation, *, short=False):
+        # The worker no longer writes engine.log: the engine appends to the worker's
+        # create-once object, which the worker reads once and closes at exit.
+        native = getattr(self.engine_log_api, operation)
+        message, injected = "synthetic engine-log " + operation + " failure", []
 
-    def test_engine_artifact_write_failure_is_not_pass(self):
-        self.worker_write_failure("engine.log", "write")
+        def failed(*args):
+            if injected or (operation == "close" and args[0] != self.worker_args._engine_log.handle):
+                return native(*args)  # A close failure targets the retained handle, not the final reader.
+            injected.append(True)
+            if operation == "read":
+                if short:
+                    return native(*args)[:-1]
+                raise OSError(message)
+            if operation == "close":
+                raise OSError(message)  # The handle stays retained, as for a failed CloseHandle.
+            raise OSError(message)
 
-    def test_engine_artifact_short_write_is_not_pass(self):
-        self.worker_write_failure("engine.log", "short-write")
+        stderr = io.StringIO()
+        with patch.object(self.engine_log_api, operation, side_effect=failed), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        record = caught.exception.record
+        try:
+            self.assertEqual(injected, [True], "The claimed engine-log failure must actually execute")
+            self.assertFalse(bench.acceptance_final_predicate(record))
+            receipt = json.loads((self.case.output / "provisional.json").read_bytes())
+            if operation == "open":
+                self.assertNotIn("server", self.case.events)
+                self.assertEqual(self.case.code, 1)
+                self.assertEqual(receipt["error"], message)
+            elif short:
+                self.assertEqual(self.case.code, 0)
+                self.assertEqual(receipt["status"], "provisional_complete")
+                self.assertEqual(record["finalization_error"],
+                                 "ValueError: Worker engine.log differs from its authenticated digest.")
+                self.assertNotEqual(record["memory"]["cuda"]["status"], "satisfied")
+            elif operation == "close":
+                self.assertEqual(self.case.code, 1)
+                self.assertEqual(receipt["status"], "provisional_complete")
+                self.assertIn("Worker engine log close failed (OSError).", stderr.getvalue())
+                self.assertEqual(len(self.engine_log_handles), 1)
+            else:
+                self.assertIn("server-stop", self.case.events)
+                self.assertEqual(self.case.code, 1)
+                self.assertEqual(receipt["status"], "provisional_failed")
+                self.assertEqual(receipt["artifact_error"], "OSError: " + message)
+                self.assertNotIn("engine.log", receipt.get("artifact_sha256", {}))
+        finally:
+            engine_log = self.worker_args._engine_log
+            if engine_log is not None and engine_log.handle is not None:
+                engine_log.deadline = float("inf")  # Caller cleanup of the retained handle.
+                engine_log.close()
+        self.assertEqual(self.engine_log_handles, set())
 
-    def test_engine_artifact_flush_failure_is_not_pass(self):
-        self.worker_write_failure("engine.log", "flush")
+    def test_engine_log_create_failure_never_starts_server(self):
+        self.engine_log_handle_failure("open")
 
-    def test_engine_artifact_close_failure_is_not_pass(self):
-        self.worker_write_failure("engine.log", "close")
+    def test_engine_log_read_failure_is_not_pass(self):
+        self.engine_log_handle_failure("read")
+
+    def test_engine_log_short_read_is_not_pass(self):
+        self.engine_log_handle_failure("read", short=True)
+
+    def test_engine_log_final_open_failure_is_not_pass(self):
+        # The final read opens a fresh deny-writers handle (no seek); a non-sharing failure is not retried.
+        self.engine_log_handle_failure("open_final")
+
+    def test_engine_log_close_failure_retains_handle_and_is_not_pass(self):
+        self.engine_log_handle_failure("close")
 
     def test_primary_request_error_survives_separate_worker_artifact_error(self):
         self.worker_write_failure("server.log", "flush", primary=True)
@@ -5122,7 +5763,8 @@ class AcceptanceAdmissionTests(unittest.TestCase):
             return self.case.clock()
 
         def creating(file):
-            active.append(True)
+            if file.path.name == "provisional.json":  # The engine-log handle has its own create.
+                active.append(True)
             try:
                 return create(file)
             finally:
@@ -5140,7 +5782,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
             return native_open(path)
 
         def closing(file):
-            if phase == "close" and edge == "before":
+            if phase == "close" and edge == "before" and file.path.name == "provisional.json":
                 crossed.append(offset)
             return close(file)
 
@@ -5336,7 +5978,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         def closing(file):
             identity = file.identity if file.handle is not None else None
             close(file)
-            if identity is None or attempts:
+            if identity is None or attempts or file.path.name != "provisional.json":
                 return
             self.assertIsNone(file.handle)
             self.assertEqual(len(self.receipt_handles), 1, "The controller receipt handle must be live")
@@ -5406,7 +6048,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
             return result
 
         def closing(file):
-            active = file.handle is not None
+            active = file.handle is not None and file.path.name == "provisional.json"
             close(file)
             if active and not rewritten:
                 data = change(published)
@@ -5484,35 +6126,58 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.assertEqual((self.case.output / "provisional.json").read_bytes(), published[-2])
 
     def worker_log_changed_after_close(self, name, mode):
-        create, changed = bench.bounded_create, []
+        create, close, changed = bench.bounded_create, bench.AcceptanceProvisionalFile.close, []
         target = self.case.output / name
+
+        def change(path, data):
+            if mode == "rewritten":
+                with open(path, "r+b") as stream:
+                    stream.write(b"X")
+            else:
+                path.unlink()
+                path.write_bytes(data if mode == "identical" else data + b"foreign suffix\n")
+            changed.append(data)
 
         def creating(path, data, *args, **kwargs):
             result = create(path, data, *args, **kwargs)
             if path == target:
-                if mode == "rewritten":
-                    with open(path, "r+b") as stream:
-                        stream.write(b"X")
-                else:
-                    path.unlink()
-                    path.write_bytes(data if mode == "identical" else data + b"foreign suffix\n")
-                changed.append(data)
+                change(path, data)
             return result
 
-        if mode == "identical":
-            with patch.object(bench, "bounded_create", side_effect=creating):
+        def closing(file):
+            active = file.handle is not None and file.path == target
+            close(file)
+            if active:
+                # The engine and the worker have closed their handles; the guard is not mid-read.
+                with self.case.clock_lock:
+                    change(target, target.read_bytes())
+
+        hook = (patch.object(bench.AcceptanceProvisionalFile, "close", closing) if name == "engine.log"
+                else patch.object(bench, "bounded_create", side_effect=creating))
+        if mode == "identical" and name != "engine.log":
+            with hook:
                 result = self.case.invoke_selected()
         else:
-            with patch.object(bench, "bounded_create", side_effect=creating), \
-                    self.assertRaises(bench.AcceptanceFailure) as caught:
+            with hook, self.assertRaises(bench.AcceptanceFailure) as caught:
                 self.case.invoke_selected()
             result = caught.exception.record
         self.assertEqual(len(changed), 1)
         digest = hashlib.sha256(changed[0]).hexdigest()
         worker = json.loads((self.case.output / "provisional.json").read_bytes())
         self.assertEqual(worker["artifact_sha256"][name], digest)
-        self.assertEqual(result["worker_exit"], 0)
-        if mode == "identical":
+        self.assertEqual(worker["status"], "provisional_complete")
+        if name != "engine.log" or mode == "rewritten":
+            self.assertEqual(result["worker_exit"], 0)  # A guard refusal can precede the recorded exit.
+        if name == "engine.log" and mode != "rewritten":
+            # A replaced object, even with identical bytes, is refused by the guard's bound identity.
+            self.assertIn(result["memory"]["cuda"]["errors"][0], ("Engine log identity changed.",
+                                                                  "Engine log disappeared."))
+            self.assertEqual(result["error"], "RuntimeError: Engine CUDA-stage evidence failed: "
+                             + result["memory"]["cuda"]["errors"][0])
+            self.assertEqual(result["memory"]["cuda"]["status"], "refused")
+            self.assertFalse(bench.acceptance_final_predicate(result))
+            self.assertNotIn(name, result.get("artifact_sha256", {}))
+        elif mode == "identical":
             self.assertTrue(bench.acceptance_final_predicate(result))
             self.assertEqual(target.read_bytes(), changed[0])
             self.assertEqual(result["artifact_sha256"][name], digest)
@@ -5529,7 +6194,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
     def test_byte_identical_server_log_replacement_passes_with_recorded_digest(self):
         self.worker_log_changed_after_close("server.log", "identical")
 
-    def test_byte_identical_engine_log_replacement_passes_with_recorded_digest(self):
+    def test_byte_identical_engine_log_replacement_refuses_by_guard_identity(self):
         self.worker_log_changed_after_close("engine.log", "identical")
 
     def test_modified_server_log_replacement_refuses(self):
@@ -5543,6 +6208,292 @@ class AcceptanceAdmissionTests(unittest.TestCase):
 
     def test_in_place_engine_log_rewrite_refuses(self):
         self.worker_log_changed_after_close("engine.log", "rewritten")
+
+    def engine_run(self, mark=None, *, selection="short", refused=False):
+        clones = []
+        spawn = self.case.spawn
+        def spawning(argv, **kwargs):
+            if "--engine" in argv:
+                clones.append((json.loads(Path(argv[argv.index("--config") + 1]).read_text()), dict(kwargs["env"])))
+            return spawn(argv, **kwargs)
+        if mark is not None:
+            self.case.engine_mark = mark
+        with patch.object(bench.subprocess, "Popen", side_effect=spawning):
+            if refused:
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+                    self.case.invoke_selected(selection=selection)
+                result = caught.exception.record
+            else:
+                result = self.case.invoke_selected(selection=selection)
+        self.assertEqual(self.engine_log_handles, set())
+        return result, clones
+
+    def test_manifest_short_run_enforces_eleven_marks_from_the_worker_owned_engine_log(self):
+        result, clones = self.engine_run()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        cuda = result["memory"]["cuda"]
+        self.assertEqual((cuda["status"], cuda["errors"], cuda["serving_rows"], cuda["completed_request_rows"],
+                          cuda["minimum_enforced_mib"]), ("satisfied", [], 1, 11, 731))
+        self.assertEqual([row["stage"] for row in cuda["rows"]], ["serving"] + ["the completed request"] * 11)
+        self.assertEqual(result["memory"]["cuda_floor_mib"], 256)
+        lifecycle = json.loads((self.case.output / "lifecycle.json").read_bytes())
+        self.assertEqual(lifecycle["memory"]["cuda"]["status"], "satisfied")
+        self.assertEqual(len(lifecycle["memory"]["cuda"]["rows"]), 12)
+        # The engine, not the worker, wrote the retained log; it is never rewritten.
+        engine = (self.case.output / "engine.log").read_bytes()
+        self.assertEqual(engine, ("strata serve: 761 MiB of VRAM free with everything loaded\r\n"
+                                  + "strata trace: 731 MiB free after the completed request\r\n" * 11).encode())
+        self.assertEqual(result["artifact_sha256"]["engine.log"], hashlib.sha256(engine).hexdigest())
+        self.assertNotIn(b"Engine file logging held", engine)
+        # The retained handle, then the final read's deny-writers handle, closed before the retained one.
+        (_, retained), (_, final), *closes = self.engine_log_events
+        self.assertEqual([kind for kind, _ in self.engine_log_events], ["open", "final", "close", "close"])
+        self.assertEqual([handle for _, handle in closes], [final, retained])
+        # The acceptance clone carries the trace, so the run is diagnostic and never normal-comparable.
+        (clone, environment), = clones
+        self.assertEqual(clone["env"]["STRATA_TRACE"], "1")
+        self.assertEqual(clone["log"], str(self.case.output.resolve() / "engine.log"))
+        self.assertNotIn("STRATA_TRACE", environment)
+        for record in (result, json.loads((self.case.output / "provisional.json").read_bytes())):
+            self.assertFalse(record["normal_comparison"]["eligible"])
+            self.assertIn(TRACE_CONTROL, record["normal_comparison"]["controls"])
+            self.assertIn(TRACE_EXCLUSION, record["normal_comparison"]["exclusions"])
+        self.assertTrue(json.loads((self.case.output / "provisional.json").read_bytes())["timing_diagnostic"])
+
+    def test_manifest_near_full_run_enforces_three_marks(self):
+        cfg = json.loads(self.case.config.read_text())
+        cfg["memory_policy"] = {"version": 1}
+        self.case.config.write_text(json.dumps(cfg))
+        self.args.acceptance_workload, self.args.cohort = "near-full", "automatic"
+        manifest = self.root / "near-full-manifest.json"
+        self.args.acceptance_manifest = None
+        self.args.write_acceptance_manifest, self.args.manifest_not_after_unix = manifest, 1800010000.0
+        self.assertEqual(bench.run(self.args), 0)
+        self.args.acceptance_manifest = manifest
+        self.args.write_acceptance_manifest = self.args.manifest_not_after_unix = None
+        result, _ = self.engine_run(selection="near-full")
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        cuda = result["memory"]["cuda"]
+        self.assertEqual((cuda["status"], cuda["serving_rows"], cuda["completed_request_rows"]), ("satisfied", 1, 3))
+        self.assertEqual(json.loads(manifest.read_text())["workload"], "near-full")
+
+    def test_manifest_run_missing_one_request_mark_is_refused_evidence(self):
+        result, _ = self.engine_run(lambda index: "" if index == 7 else
+                                    "strata trace: 731 MiB free after the completed request\n")
+        cuda = result["memory"]["cuda"]
+        self.assertEqual(cuda["status"], "refused")
+        self.assertEqual(cuda["errors"], ["Completed-request CUDA marks: 10 of 11 required."])
+        self.assertEqual(json.loads((self.case.output / "lifecycle.json").read_bytes())["memory"]["cuda"]["status"],
+                         "refused")
+
+    def test_manifest_run_without_serving_row_is_refused_evidence(self):
+        self.case.engine_serving = "strata generate: loading\n"
+        result, _ = self.engine_run()
+        self.assertEqual(result["memory"]["cuda"]["errors"], ["No enforced serving CUDA-free row was observed."])
+
+    def assert_guard_stop(self, result, reason):
+        self.assertEqual(result["memory"]["errors"][0], reason)  # The guard's first reason survives.
+        self.assertIn("cancel-job", self.case.events)
+        # The fake Job cancellation also advances the clock past the work deadline, so the
+        # controller loop may record that edge before it re-checks the guard.
+        self.assertIn(result["error"], ("RuntimeError: " + reason,
+                                        "TimeoutError: Absolute worker deadline reached, including capture/finalization."))
+        self.assertFalse(bench.acceptance_final_predicate(result))
+
+    def test_manifest_run_255_mib_mark_stops_owner_and_keeps_the_primary_reason(self):
+        result, _ = self.engine_run(lambda index: f"strata trace: {255 if index == 2 else 731} MiB free after "
+                                    "the completed request\n", refused=True)
+        reason = "Actual engine CUDA-free memory below 256 MiB at the completed request"
+        self.assert_guard_stop(result, reason)
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        cuda = result["memory"]["cuda"]
+        self.assertEqual((cuda["status"], cuda["minimum_enforced_mib"], cuda["completed_request_rows"]),
+                         ("refused", 255, 2))
+        self.assertEqual(result["memory"]["errors"][0], reason)
+
+    def test_manifest_run_unrecognized_free_memory_trace_stops_owner(self):
+        result, _ = self.engine_run(lambda index: "strata trace: 731 MiB free before the request\n"
+                                    if index == 3 else "strata trace: 731 MiB free after the completed request\n",
+                                    refused=True)
+        self.assert_guard_stop(result, "Engine CUDA-stage evidence failed: Unrecognized CUDA memory trace.")
+        self.assertEqual(result["memory"]["cuda"]["errors"][0], "Unrecognized CUDA memory trace.")
+
+    def test_manifest_run_api_key_in_engine_log_fails_worker_without_copying_it(self):
+        secret = json.loads(self.case.config.read_text())["api_key"]
+        result, _ = self.engine_run(lambda index: "strata trace: 731 MiB free after the completed request\n"
+                                    + ("strata generate: echoed " + secret + "\n" if index == 4 else ""), refused=True)
+        receipt = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(receipt["status"], "provisional_failed")
+        self.assertEqual(receipt["artifact_error"], "ValueError: Engine log contains the API key.")
+        self.assertNotIn("artifact_sha256", receipt)  # No digest is published for a refused log.
+        self.assertEqual(result["worker_exit"], 1)
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertIn(secret.encode(), (self.case.output / "engine.log").read_bytes())  # Retained, never rewritten.
+        for name in ("provisional.json", "lifecycle.json", "controller.log", "server.log"):
+            self.assertNotIn(secret.encode(), (self.case.output / name).read_bytes())
+
+    def private_value_in_trace_stage(self, value):
+        written = []
+        def mark(index):
+            line = "strata trace: 731 MiB free after the completed request\n"
+            if index == 4:
+                written.append(value())
+                line += "strata trace: 731 MiB free after " + written[0] + "\n"  # A recognized stage.
+            return line
+        result, _ = self.engine_run(mark, refused=True)
+        secret, = written
+        self.assertIn(secret.encode(), (self.case.output / "engine.log").read_bytes())  # Retained, never rewritten.
+        self.assert_guard_stop(result, "Engine CUDA-stage evidence failed: CUDA memory trace contains a private value.")
+        cuda = result["memory"]["cuda"]
+        self.assertEqual((cuda["status"], cuda["errors"][0]), ("refused", "CUDA memory trace contains a private value."))
+        self.assertEqual(cuda["completed_request_rows"], 4)  # Rows before the refused one only.
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertTrue((self.case.output / "lifecycle.json").is_file())
+        for path in self.case.output.iterdir():
+            if path.name != "engine.log":
+                self.assertNotIn(secret.encode(), path.read_bytes(), path.name)
+
+    def test_manifest_run_api_key_in_a_recognized_trace_stage_refuses_cuda_evidence(self):
+        self.private_value_in_trace_stage(lambda: json.loads(self.case.config.read_text())["api_key"])
+
+    def test_manifest_run_output_authority_in_a_recognized_trace_stage_refuses_cuda_evidence(self):
+        self.private_value_in_trace_stage(lambda: json.loads(self.case.bootstrap_settings)["output_authority"])
+
+    def test_manifest_run_escaped_over_budget_stage_refuses_without_copying_it(self):
+        stage = "\x01" * 128  # The parent's 4096-row receipt counterexample, refused at its first row.
+        result, _ = self.engine_run(lambda index: "strata trace: 731 MiB free after the completed request\n"
+                                    + ("strata trace: 731 MiB free after " + stage + "\n" if index == 4 else ""),
+                                    refused=True)
+        self.assert_guard_stop(result, "Engine CUDA-stage evidence failed: CUDA memory trace exceeds its evidence bounds.")
+        cuda = result["memory"]["cuda"]
+        self.assertEqual((cuda["status"], cuda["errors"][0], cuda["completed_request_rows"]),
+                         ("refused", "CUDA memory trace exceeds its evidence bounds.", 4))
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertNotIn("\\u0001", json.dumps(result))
+        lifecycle = (self.case.output / "lifecycle.json").read_bytes()
+        self.assertNotIn(b"\\u0001", lifecycle)
+        self.assertEqual(json.loads(lifecycle)["memory"]["cuda"]["status"], "refused")
+        self.assertIn(stage.encode(), (self.case.output / "engine.log").read_bytes())
+
+    def late_engine_writer(self, closes):
+        # The engine is killed after the server exits; its append handle can outlive the wait.
+        late, attempts, raised = [], [], []
+        final, check = self.engine_log_api.open_final, bench.acceptance_engine_log
+        def stopped():
+            late.append(self.case.engine_stream)
+            self.case.engine_stream = None
+        def opening(path):
+            try:
+                return final(path)
+            except OSError as exc:
+                attempts.append(exc.winerror)
+                if closes:
+                    late[0].write("strata generate: late engine line\n")
+                    late[0].close()  # The engine exits before the deadline.
+                else:
+                    with self.case.clock_lock:  # The engine outlives the worker's absolute deadline.
+                        self.case.now = json.loads(self.case.bootstrap_settings)["work_deadline"] + 0.01
+                raise
+        def checked(*args):
+            try:
+                return check(*args)
+            except BaseException as exc:
+                raised.append(exc)
+                raise
+        try:
+            with patch.object(self.case, "engine_close", side_effect=stopped), \
+                    patch.object(self.engine_log_api, "open_final", side_effect=opening), \
+                    patch.object(bench, "acceptance_engine_log", side_effect=checked):
+                result, _ = self.engine_run(refused=not closes)
+        finally:
+            for stream in late:
+                stream.close()
+        self.assertEqual(attempts[0], 32, "A live writer must make the deny-writers open fail")
+        return result, attempts, raised
+
+    def test_late_engine_writer_is_awaited_and_its_bytes_are_bound(self):
+        result, attempts, raised = self.late_engine_writer(closes=True)
+        self.assertEqual((attempts, raised), ([32], []))
+        engine = (self.case.output / "engine.log").read_bytes()
+        self.assertTrue(engine.endswith(b"strata generate: late engine line\r\n"))
+        self.assertEqual(result["artifact_sha256"]["engine.log"], hashlib.sha256(engine).hexdigest())
+        self.assertEqual(result["memory"]["cuda"]["status"], "satisfied")
+        self.assertTrue(bench.acceptance_final_predicate(result))
+
+    def test_late_engine_writer_past_the_deadline_refuses(self):
+        result, attempts, raised = self.late_engine_writer(closes=False)
+        self.assertEqual(attempts, [32])
+        self.assertEqual([(type(exc), str(exc)) for exc in raised],
+                         [(TimeoutError, "Engine log writers remained open at the absolute deadline.")])
+        self.assertNotIn("engine.log", result.get("artifact_sha256", {}))
+        self.assertNotEqual(result["memory"]["cuda"]["status"], "satisfied")
+        self.assertFalse(bench.acceptance_final_predicate(result))
+
+    def mid_run(self, attack, index=3):
+        target, done = self.case.output / "engine.log", []
+        def mark(current):
+            if current == index:
+                with self.case.clock_lock:  # A third process acts between the guard's reads.
+                    attack(target)
+                done.append(True)
+            return "strata trace: 731 MiB free after the completed request\n"
+        return target, done, mark
+
+    def test_engine_log_names_cannot_be_replaced_while_the_run_owns_them(self):
+        import _winapi
+        alias, foreign = self.root / "engine-alias.log", self.root / "engine-foreign.log"
+        foreign.write_bytes(b"external foreign bytes")
+        (self.root / "engine-foreign-directory").mkdir()
+        outcomes = []
+        def attack(target):
+            for name, operation in (
+                    ("unlink", target.unlink), ("rename", lambda: target.rename(self.root / "moved.log")),
+                    ("replace", lambda: foreign.replace(target)), ("symlink", lambda: target.symlink_to(foreign)),
+                    ("junction", lambda: _winapi.CreateJunction(str(self.root / "engine-foreign-directory"),
+                                                                str(target)))):
+                with self.assertRaises(OSError):
+                    operation()
+                outcomes.append(name)
+            bench.os.link(target, alias)  # Allowed, but it names the same retained object.
+            self.assertTrue(bench.os.path.samefile(target, alias))
+            outcomes.append("hardlink")
+        target, done, mark = self.mid_run(attack)
+        result, _ = self.engine_run(mark)
+        self.assertEqual(done, [True])
+        self.assertEqual(outcomes, ["unlink", "rename", "replace", "symlink", "junction", "hardlink"])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(result["memory"]["cuda"]["status"], "satisfied")
+        self.assertEqual(foreign.read_bytes(), b"external foreign bytes")
+        self.assertFalse(target.is_symlink())
+        self.assertTrue(bench.os.path.samefile(target, alias))
+
+    def test_mid_run_engine_log_truncation_stops_owner(self):
+        def attack(target):
+            with open(target, "r+b") as stream:
+                stream.truncate(10)
+        target, done, mark = self.mid_run(attack)
+        result, _ = self.engine_run(mark, refused=True)
+        self.assertEqual(done, [True])
+        self.assert_guard_stop(result, "Engine CUDA-stage evidence failed: Engine log truncated.")
+        self.assertEqual(result["memory"]["cuda"]["status"], "refused")
+
+    def test_mid_run_rewrite_of_consumed_rows_refuses_at_final_binding(self):
+        def attack(target):
+            with open(target, "r+b") as stream:  # Same size; the worker's own final digest includes it.
+                data = stream.read()
+                stream.seek(0)
+                stream.write(data.replace(b"761 MiB", b"999 MiB"))
+        target, done, mark = self.mid_run(attack)
+        result, _ = self.engine_run(mark, refused=True)
+        self.assertEqual(done, [True])
+        error = "Engine CUDA-stage evidence failed: Engine log changed after guard consumption."
+        self.assertFalse(result["finalization"])
+        self.assertEqual(result["finalization_error"], "RuntimeError: " + error)
+        self.assertEqual(result["error"], error)
+        self.assertEqual(result["memory"]["cuda"]["status"], "refused")
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(worker["artifact_sha256"]["engine.log"], hashlib.sha256(target.read_bytes()).hexdigest())
+        self.assertIn(b"999 MiB", target.read_bytes())
 
     def receipt_mac_refused(self, change, error, *, claim=False):
         receipt, injected = bench.acceptance_receipt, []
@@ -5899,7 +6850,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
             return result
 
         def closing(file):
-            active = file.handle is not None
+            active = file.handle is not None and file.path.name == "provisional.json"
             try:
                 close(file)  # After the stop this close also reports the passed deadline.
             finally:
@@ -6784,7 +7735,9 @@ class StageCRepairTests(unittest.TestCase):
                     with self.subTest(key=key, value=value, explicit=explicit), \
                             patch.dict(bench.os.environ, {key: "1"}, clear=True):
                         record = case.invoke()
-                    self.assertEqual(record["timing_diagnostic"], explicit and (key in presence or value == "1"))
+                    self.assertTrue(record["timing_diagnostic"])  # The acceptance trace is always active.
+                    self.assertEqual(other_active_diagnostics(record["normal_comparison"]),
+                                     [key] if explicit and (key in presence or value == "1") else [])
                     if explicit:
                         self.assertEqual(record["effective_settings"]["env"][key], value)
                     else:
@@ -6960,9 +7913,12 @@ class StageCRepairTests(unittest.TestCase):
                     with patch.dict(bench.os.environ, {}, clear=True):
                         cfg, inherited = bench.clean_environment({"env": {key: value}}, False, acceptance=True)
                     evidence = bench.safe_engine_environment(cfg, inherited, acceptance=True)
-                    self.assertEqual(evidence[key], value)
-                    expected = key in presence or (bool(value) if key in ("STRATA_BATCH_TRACE", "STRATA_DEBUG") else value == "1")
-                    self.assertEqual(bench.diagnostic_environment(evidence), expected)
+                    # The acceptance clone's own trace replaces any saved STRATA_TRACE value.
+                    self.assertEqual(evidence.pop("STRATA_TRACE"), "1")
+                    if key != "STRATA_TRACE":
+                        self.assertEqual(evidence[key], value)
+                        expected = key in presence or (bool(value) if key in ("STRATA_BATCH_TRACE", "STRATA_DEBUG") else value == "1")
+                        self.assertEqual(bench.diagnostic_environment(evidence), expected)
                     if key in ("STRATA_BATCH_TRACE", "STRATA_DEBUG"):
                         self.assertEqual(inherited[key], value)
         for gate in ("0", "1"):
@@ -6973,7 +7929,9 @@ class StageCRepairTests(unittest.TestCase):
                 self.assertNotIn("STRATA_PIPELINE_FORCE_MISS", inherited)
                 self.assertNotIn("STRATA_PIPELINE_LOG", inherited)
                 cfg, inherited = bench.clean_environment({"env": {"STRATA_PIPELINE_LOG": "0"}}, False, acceptance=True)
-                self.assertEqual(bench.diagnostic_environment(bench.safe_engine_environment(cfg, inherited, acceptance=True)), gate == "1")
+                evidence = bench.safe_engine_environment(cfg, inherited, acceptance=True)
+                self.assertEqual(evidence.pop("STRATA_TRACE"), "1")
+                self.assertEqual(bench.diagnostic_environment(evidence), gate == "1")
         for name in ("STRATA_LOGPOS_EXTRA", "STRATA_LOGPOS_TOPK", "STRATA_QSA_DUMP_LAST"):
             parent = "STRATA_QSA_DUMP" if name == "STRATA_QSA_DUMP_LAST" else "STRATA_LOGPOS"
             self.assertFalse(bench.diagnostic_environment({name: "1"}))
@@ -6996,7 +7954,9 @@ class StageCRepairTests(unittest.TestCase):
                 case.config.write_text(json.dumps(case.cfg))
             with patch.dict(bench.os.environ, {key: "1" for key in keys}, clear=True):
                 result = case.invoke()
-            self.assertEqual(result["timing_diagnostic"], explicit)
+            self.assertTrue(result["timing_diagnostic"])  # The acceptance trace is always active.
+            self.assertEqual(other_active_diagnostics(result["normal_comparison"]),
+                             sorted(keys) if explicit else [])
             for key in keys:
                 if explicit:
                     self.assertEqual(result["effective_settings"]["env"][key], "0")
@@ -7044,7 +8004,8 @@ class NormalComparisonTests(unittest.TestCase):
                             result = case.saved()
                         else:
                             result = case.invoke()
-                    self.assertEqual(bench.active_diagnostics(self.effective(case)), ["STRATA_VERIFY_PROFILE"])
+                    self.assertEqual(bench.active_diagnostics(self.effective(case)),
+                                     ["STRATA_VERIFY_PROFILE", "STRATA_TRACE"])
                     self.assertTrue(result["timing_diagnostic"])
                     self.assertEqual(result["acceptance_workload_passed"], not failed)
                     self.assertEqual(result["status"], "provisional_failed" if failed else "complete")
@@ -7095,10 +8056,12 @@ class NormalComparisonTests(unittest.TestCase):
                     case.config.write_text(json.dumps(case.cfg))
                     with patch.dict(bench.os.environ, {}, clear=True):
                         result = case.invoke()
-                    self.assertEqual(result["timing_diagnostic"], diagnostic)
+                    self.assertTrue(result["timing_diagnostic"])  # The acceptance trace is always active.
                     self.assertTrue(result["acceptance_workload_passed"])
                     classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
                     self.assertTrue(classified["complete"])
+                    self.assertIn(TRACE_CONTROL, classified["controls"])
+                    self.assertEqual(bool(other_active_diagnostics(classified)), diagnostic)
                     self.assertEqual(result["normal_comparison"]["complete"], cohort != "automatic")
 
     def test_automatic_refresh_public_worker_and_outer_consumer_have_no_final_digest(self):
@@ -7127,8 +8090,9 @@ class NormalComparisonTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     refreshed = prep.prepare_launch(path)
                 after = bench.normal_comparison_environment(refreshed, kwargs["env"])
-                self.assertTrue(before["eligible"])
-                self.assertTrue(after["eligible"])
+                for evidence in (before, after):  # Only the acceptance trace excludes the clone.
+                    self.assertFalse(evidence["eligible"])
+                    self.assertEqual(evidence["exclusions"], [TRACE_EXCLUSION])
                 self.assertNotEqual(template["env"]["STRATA_FILE_CACHE_MIB"],
                                     refreshed["env"]["STRATA_FILE_CACHE_MIB"])
                 self.assertNotEqual(before["environment_sha256"], after["environment_sha256"])
@@ -7150,10 +8114,10 @@ class NormalComparisonTests(unittest.TestCase):
             self.assertFalse(evidence["complete"])
             self.assertIsNone(evidence["environment_sha256"])
             self.assertEqual(evidence["controls"], observed[0][0]["controls"])
-            self.assertEqual(evidence["exclusions"], [{"reason": "automatic-environment-unbound"}])
+            self.assertEqual(evidence["exclusions"], [TRACE_EXCLUSION, {"reason": "automatic-environment-unbound"}])
         self.assertEqual(worker["status"], "provisional_complete")
         self.assertTrue(worker["acceptance_workload_passed"])
-        self.assertFalse(worker["timing_diagnostic"])
+        self.assertTrue(worker["timing_diagnostic"])
         self.assertTrue(result["worker_complete"])
         self.assertTrue(bench.acceptance_final_predicate(result))  # Existing CPU lifecycle predicate only.
         self.assertEqual(json.loads((case.output / "lifecycle.json").read_text())["status"], "held")
@@ -7183,7 +8147,10 @@ class NormalComparisonTests(unittest.TestCase):
                             result = case.invoke()
                     classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
                     evidence = result["normal_comparison"]
-                    self.assertEqual(classified["eligible"], reason is None)
+                    self.assertFalse(classified["eligible"])  # The acceptance trace always excludes it.
+                    self.assertIn(TRACE_EXCLUSION, classified["exclusions"])
+                    self.assertEqual([item["reason"] for item in classified["exclusions"] if item != TRACE_EXCLUSION],
+                                     [] if reason is None else [reason])
                     self.assertTrue(classified["complete"])
                     self.assertIsNotNone(classified["environment_sha256"])
                     self.assertFalse(evidence["complete"])
@@ -7192,7 +8159,8 @@ class NormalComparisonTests(unittest.TestCase):
                     self.assertEqual(evidence["controls"], classified["controls"])
                     self.assertEqual(evidence["exclusions"], classified["exclusions"] +
                                      [{"reason": "automatic-environment-unbound"}])
-                    self.assertEqual(result["timing_diagnostic"], diagnostic)
+                    self.assertTrue(result["timing_diagnostic"])
+                    self.assertEqual(bool(other_active_diagnostics(classified)), diagnostic)
                     self.assertEqual(result["acceptance_workload_passed"], not failed)
                     self.assertEqual(result["status"], "provisional_failed" if failed else "complete")
                     self.assertEqual(len(result["requests"]), 3)
@@ -7215,7 +8183,8 @@ class NormalComparisonTests(unittest.TestCase):
                 classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
                 self.assertEqual(result["normal_comparison"], classified)
                 self.assertTrue(classified["complete"])
-                self.assertTrue(classified["eligible"])
+                self.assertFalse(classified["eligible"])
+                self.assertEqual(classified["exclusions"], [TRACE_EXCLUSION])
                 pairs = sorted([name, value] for name, value in self.effective(case).items()
                                if name.startswith("STRATA_") or name == "CUDA_MODULE_LOADING")
                 expected = hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest()
@@ -7276,13 +8245,15 @@ class NormalComparisonTests(unittest.TestCase):
         self.assertEqual(result["status"], "complete")
         self.assertTrue(result["acceptance_workload_passed"])
         self.assertTrue(result["normal_comparison"]["complete"])
-        self.assertTrue(result["normal_comparison"]["eligible"])
-        self.assertEqual(result["normal_comparison"]["exclusions"], [])
-        self.assertFalse(result["timing_diagnostic"])
+        self.assertFalse(result["normal_comparison"]["eligible"])
+        self.assertEqual(result["normal_comparison"]["exclusions"], [TRACE_EXCLUSION])
+        self.assertTrue(result["timing_diagnostic"])
         effective = self.effective(case)
         for key, value in controls.items():
             self.assertEqual(effective[key], value)
-        self.assertEqual({item["kind"] for item in result["normal_comparison"]["controls"]}, {"reviewed-normal"})
+        self.assertIn(TRACE_CONTROL, result["normal_comparison"]["controls"])
+        self.assertEqual({item["kind"] for item in result["normal_comparison"]["controls"]
+                          if item != TRACE_CONTROL}, {"reviewed-normal"})
 
     def test_public_unseen_controls_survive_both_layers_even_empty_or_zero_without_value_leaks(self):
         key, secret = "STRATA_FUTURE_TREATMENT_74B9", "UNCLASSIFIED-SECRET-SENTINEL-20261022"
@@ -7299,10 +8270,11 @@ class NormalComparisonTests(unittest.TestCase):
                 self.assertTrue(result["normal_comparison"]["complete"])
                 self.assertFalse(result["normal_comparison"]["eligible"])
                 self.assertEqual(result["normal_comparison"]["exclusions"], [{"reason": "unclassified-control",
-                    "control": "sha256:" + hashlib.sha256(key.encode()).hexdigest()}])
+                    "control": "sha256:" + hashlib.sha256(key.encode()).hexdigest()}, TRACE_EXCLUSION])
                 self.assertTrue(result["acceptance_workload_passed"])
                 self.assertEqual(result["status"], "complete")
-                self.assertFalse(result["timing_diagnostic"])
+                self.assertTrue(result["timing_diagnostic"])
+                self.assertEqual(other_active_diagnostics(result["normal_comparison"]), [])
                 self.assertNotIn(key, json.dumps(result["normal_comparison"]))
                 for path in case.args.output.iterdir():
                     self.assertNotIn(secret, path.read_text())
@@ -7354,10 +8326,10 @@ class NormalComparisonTests(unittest.TestCase):
                 evidence = result["normal_comparison"]
                 self.assertEqual(result["status"], "complete")
                 self.assertTrue(result["acceptance_workload_passed"])
-                self.assertFalse(result["timing_diagnostic"])
+                self.assertTrue(result["timing_diagnostic"])
                 self.assertTrue(evidence["complete"])
-                self.assertTrue(evidence["eligible"])
-                self.assertEqual(evidence["exclusions"], [])
+                self.assertFalse(evidence["eligible"])
+                self.assertEqual(evidence["exclusions"], [TRACE_EXCLUSION])
                 selected = [item for item in evidence["controls"] if item["control"] in controls]
                 self.assertEqual(selected, [{"control": key, "kind": "reviewed-normal"} for key in sorted(controls)])
                 self.assertEqual(bench.consume_normal_comparison(result, case.clones[0], case.server_environments[0]), evidence)
@@ -7438,8 +8410,10 @@ class NormalComparisonTests(unittest.TestCase):
                 result = case.invoke()
             effective = self.effective(case)
             self.assertEqual(effective["STRATA_PIPELINE_DEBUG"], "1")
-            self.assertEqual(result["normal_comparison"]["eligible"], not explicit)
-            self.assertEqual(result["timing_diagnostic"], explicit)
+            self.assertFalse(result["normal_comparison"]["eligible"])
+            self.assertEqual(result["normal_comparison"]["exclusions"] == [TRACE_EXCLUSION], not explicit)
+            self.assertTrue(result["timing_diagnostic"])
+            self.assertEqual(bool(other_active_diagnostics(result["normal_comparison"])), explicit)
             self.assertEqual(result["status"], "complete")
             for key in ("STRATA_PIPELINE_FORCE_MISS", "STRATA_LAYER_SPLIT_GATE"):
                 if explicit:
@@ -7473,7 +8447,8 @@ class NormalComparisonTests(unittest.TestCase):
             effective = self.effective(case)
             self.assertNotIn(key, effective)
             classified = bench.normal_comparison_environment(case.clones[0], case.server_environments[0])
-            self.assertEqual(classified["eligible"], not unknown)
+            self.assertFalse(classified["eligible"])
+            self.assertEqual(classified["exclusions"] == [TRACE_EXCLUSION], not unknown)
             self.assertFalse(result["normal_comparison"]["eligible"])
             self.assertFalse(result["normal_comparison"]["complete"])
             self.assertIsNone(result["normal_comparison"]["environment_sha256"])
@@ -7545,7 +8520,8 @@ class NormalComparisonTests(unittest.TestCase):
         with patch.dict(bench.os.environ, {"ProgramFiles(x86)": "C:\\Program Files (x86)"}, clear=True):
             result = case.invoke()
         self.assertTrue(result["normal_comparison"]["complete"])
-        self.assertTrue(result["normal_comparison"]["eligible"])
+        self.assertFalse(result["normal_comparison"]["eligible"])
+        self.assertEqual(result["normal_comparison"]["exclusions"], [TRACE_EXCLUSION])
 
     def test_public_invalid_unknown_name_keeps_workload_outcome_and_redacts_inventory(self):
         case = self.source()
@@ -7665,7 +8641,9 @@ class NormalComparisonTests(unittest.TestCase):
                 self.assertTrue(bench.acceptance_final_predicate(result))
                 self.assertTrue(result["worker_complete"])
                 self.assertTrue(result["normal_comparison"]["complete"])
-                self.assertEqual(result["normal_comparison"]["eligible"], not unknown)
+                self.assertFalse(result["normal_comparison"]["eligible"])
+                self.assertIn(TRACE_EXCLUSION, result["normal_comparison"]["exclusions"])
+                self.assertEqual(result["normal_comparison"]["exclusions"] == [TRACE_EXCLUSION], not unknown)
                 self.assertEqual(json.loads((case.output / "lifecycle.json").read_text())["status"], "held")
             finally:
                 case.doCleanups()

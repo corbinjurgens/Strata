@@ -247,6 +247,11 @@ def clean_environment(cfg, timing, fetch_timing=False, *, acceptance=False, inhe
         for key, value in (("CUDA_MODULE_LOADING", "EAGER"), ("STRATA_FILE_COPY_READY", "0")):
             if key not in names:
                 cfg["env"][key] = value
+        # Per-request CUDA-stage evidence needs the engine's presence-gated trace marks,
+        # so every selected run is diagnostic; one exact spelling replaces any saved one.
+        for key in [key for key in cfg["env"] if (key.upper() if os.name == "nt" else key) == "STRATA_TRACE"]:
+            del cfg["env"][key]
+        cfg["env"]["STRATA_TRACE"] = "1"
     if timing:
         cfg["env"]["STRATA_DECODE_TIMING"] = "1"
     if fetch_timing:
@@ -1270,10 +1275,19 @@ class WindowsProcessAPI:
 
 
 class MemoryGuard:
-    def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None, sample_limit=4096):
+    def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None, sample_limit=4096,
+                 engine_log_limit=2 * LOG_LIMIT, required_request_marks=None):
         self.owner, self.engine_log = owner, engine_log
         self.deadline = deadline
         self.sample_limit = sample_limit
+        self.engine_log_limit = engine_log_limit
+        self.required_request_marks = required_request_marks
+        # Acceptance-mode incremental engine-log state (the guard.py TraceReader rules).
+        self.engine_offset, self.engine_pending, self.engine_identity = 0, b"", None
+        self.engine_consumed = hashlib.sha256()
+        self.engine_log_secrets = ()  # The manifest controller sets the API key and output authority.
+        self.engine_stopped = self.engine_final = self.cuda_serving = False
+        self.cuda_rows, self.cuda_errors = [], []
         self.done = threading.Event()
         self.reason = None
         self.cleanup_error = None
@@ -1341,6 +1355,159 @@ class MemoryGuard:
                 raise
             self.cleanup_error = type(exc).__name__ + ": " + str(exc)
 
+    def engine_failure(self, reason, error=None):
+        """Stop reading at the first CUDA-stage failure; the first guard reason always survives."""
+        self.engine_stopped = True
+        if error is not None:
+            self.cuda_errors.append(error)
+        if self.reason is None:
+            self.reason = reason
+            if self.owner is not None:
+                self.stop_owner()
+
+    def engine_row(self, line):
+        """guard.py TraceReader.line: a later format on the same line overrides an earlier one."""
+        value, stage, enforced = None, "startup", False
+        try:
+            m = re.search(r"strata trace: (prefill )?(\d+) MiB free after (.+)", line)
+            if m:
+                value, stage = int(m[2]), (m[1] or "") + m[3].strip()
+                enforced = self.cuda_serving or stage == "the completed request"
+            m = re.search(r"strata serve: (?:WARNING: )?(\d+) MiB of VRAM free with everything loaded", line)
+            if m:
+                value, stage, enforced = int(m[1]), "serving", True
+                self.cuda_serving = True
+            m = re.search(r"\bvram_free_mib[=:]\s*(\d+)", line)
+            if m:
+                value, stage, enforced = int(m[1]), "engine-metric", True
+                self.cuda_serving = True
+            m = re.search(r"strata serve: VRAM .*?, (\d+) MiB free now", line)
+            if m:
+                value, stage, enforced = int(m[1]), "request-runtime", True
+            m = re.search(r"strata generate: CUDA\d+ context ready, ([\d.]+) GiB free", line)
+            if m:
+                value, stage, enforced = float(m[1]) * 1024, "context-ready", False
+        except ValueError:
+            # int() and float() messages quote or describe engine text; the reason stays fixed.
+            raise ValueError("CUDA memory trace has an unreadable value.") from None
+        if value is None:
+            # A changed memory-bearing trace format must not silently bypass the guard.
+            if "strata trace:" in line and "MiB free" in line:
+                raise ValueError("Unrecognized CUDA memory trace.")
+            return None
+        if any(secret in line for secret in self.engine_log_secrets):
+            # Refused, never redacted: a row carrying the API key or output authority is not recorded.
+            raise ValueError("CUDA memory trace contains a private value.")
+        # Receipt JSON escapes controls and non-ASCII: allow 128 encoded stage bytes plus quotes.
+        if not valid_number(value) or not 0 <= value < 2**53 or len(json.dumps(stage)) > 130:
+            raise ValueError("CUDA memory trace exceeds its evidence bounds.")
+        if len(self.cuda_rows) >= 4096:
+            raise ValueError("CUDA-stage row limit reached; evidence is incomplete.")
+        row = {"cuda_free_mib": value, "stage": stage, "enforced": enforced,
+               "observed_monotonic": time.monotonic()}
+        self.cuda_rows.append(row)
+        return row
+
+    def consume_engine_log(self, data):
+        self.engine_offset += len(data)
+        self.engine_consumed.update(data)
+        lines = (self.engine_pending + data).split(b"\n")
+        self.engine_pending = lines.pop()
+        if len(self.engine_pending) > 65536 or any(len(line) > 65536 for line in lines):
+            raise ValueError("Engine log line exceeded 64 KiB.")
+        for raw in lines:
+            try:
+                line = raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                raise ValueError("Engine log is not strict UTF-8.") from None
+            row = self.engine_row(line)
+            if row is not None and row["enforced"] and row["cuda_free_mib"] < 256:
+                self.engine_failure("Actual engine CUDA-free memory below 256 MiB at " + row["stage"])
+                return
+
+    def read_engine_log(self):
+        """Consume new bytes of the one engine-log object in place; any defect fails closed.
+
+        Disappearance, replacement, shrinking and rewriting of consumed bytes are refused
+        here and in finish_engine_log. Declared limit: serve/server.py:628 opens the log by
+        path with write sharing, so during the run a same-credential process can append
+        forged lines or rewrite bytes not yet read, and nothing in this file can stop it.
+        CUDA "satisfied" is evidence against ordinary failures, not against an active
+        same-user writer during the run.
+        """
+        if self.engine_stopped or self.engine_final:
+            return
+        try:
+            path = self.engine_log
+            if path.is_symlink() or path.is_junction():
+                raise ValueError("Engine log is linked.")
+            if not path.exists():
+                if self.engine_identity is not None:
+                    raise ValueError("Engine log disappeared.")
+                return
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if self.engine_identity is None:
+                    self.engine_identity = (opened.st_dev, opened.st_ino)
+                elif (opened.st_dev, opened.st_ino) != self.engine_identity:
+                    raise ValueError("Engine log identity changed.")
+                if opened.st_size > self.engine_log_limit:
+                    raise ValueError("Engine log exceeded its size limit.")
+                if opened.st_size < self.engine_offset:
+                    raise ValueError("Engine log truncated.")
+                if opened.st_size - self.engine_offset > 1024**2:
+                    raise ValueError("Engine log parsing backlog exceeded 1 MiB.")
+                stream.seek(self.engine_offset)
+                data = stream.read(opened.st_size - self.engine_offset)
+            self.consume_engine_log(data)
+        except Exception as exc:
+            self.engine_stage_error(exc)
+
+    def finish_engine_log(self, data, identity):
+        """Bind every consumed row to the authenticated final bytes, then parse their remainder."""
+        if self.engine_stopped or self.engine_final:
+            return
+        try:
+            if ((self.engine_identity is not None and identity != self.engine_identity)
+                    or len(data) > self.engine_log_limit or len(data) < self.engine_offset
+                    or not hmac.compare_digest(hashlib.sha256(data[:self.engine_offset]).digest(),
+                                               self.engine_consumed.digest())):
+                raise ValueError("Engine log changed after guard consumption.")
+            self.consume_engine_log(data[self.engine_offset:])
+            if self.engine_pending:
+                raise ValueError("Engine log ends with an incomplete line.")
+            self.engine_final = not self.engine_stopped
+        except Exception as exc:
+            self.engine_stage_error(exc)
+
+    def engine_stage_error(self, exc):
+        # Fixed messages only: decoder and OS details could quote log bytes or paths.
+        error = str(exc) if type(exc) is ValueError else type(exc).__name__
+        self.engine_failure("Engine CUDA-stage evidence failed: " + error, error)
+
+    def cuda_summary(self):
+        enforced = [row for row in self.cuda_rows if row["enforced"]]
+        minimum = min((row["cuda_free_mib"] for row in enforced), default=None)
+        serving = sum(row["stage"] == "serving" for row in enforced)
+        completed = sum(row["stage"] == "the completed request" for row in enforced)
+        required = self.required_request_marks
+        errors = list(self.cuda_errors)
+        if self.engine_log is None:
+            errors.append("No engine log is collected on this route.")
+        elif not self.engine_final:
+            errors.append("Engine log was not bound to its authenticated final bytes.")
+        if not serving:
+            errors.append("No enforced serving CUDA-free row was observed.")
+        if type(required) is not int or required < 1:
+            errors.append("Required completed-request marks are not configured.")
+        elif completed < required:
+            errors.append(f"Completed-request CUDA marks: {completed} of {required} required.")
+        if minimum is not None and minimum < 256:
+            errors.append("An enforced CUDA-free row is below 256 MiB.")
+        return {"rows": [dict(row) for row in self.cuda_rows], "minimum_enforced_mib": minimum,
+                "serving_rows": serving, "completed_request_rows": completed,
+                "status": "refused" if errors else "satisfied", "errors": errors}
+
     def acceptance_summary(self, start=None, end=None):
         rows = list(self.host_samples)
         errors = [self.reason] if self.reason else []
@@ -1360,9 +1527,8 @@ class MemoryGuard:
                 "errors": errors, "floors_gib": dict(zip(("physical", "commit"), self.acceptance_floors)),
                 "raw_samples": rows, "minima": minima, "max_gap_seconds": self.max_gap_seconds,
                 "coverage_start_monotonic": start, "coverage_end_monotonic": end,
-                "sample_limit": self.sample_limit, "cuda_stage_evidence": "missing; later-stage hold",
-                "cleanup_error": self.cleanup_error,
-                "cuda_floor_mib": 256, "cuda_coverage": "stage evidence required; not collected",
+                "sample_limit": self.sample_limit, "cuda": self.cuda_summary(),
+                "cleanup_error": self.cleanup_error, "cuda_floor_mib": 256,
                 "lifecycle_acceptance": "pending", "cleanup": "pending", "finalization": "pending"}
 
     def sample(self, available, pagefile):
@@ -1388,8 +1554,10 @@ class MemoryGuard:
                     self.acceptance_sample(snapshot, started, time.monotonic())
                     if self.reason:
                         return
-                    if self.engine_log is not None and self.engine_log.exists() and self.engine_log.stat().st_size > 2 * LOG_LIMIT:
-                        raise RuntimeError("Engine log exceeded the diagnostic size limit.")
+                    if self.engine_log is not None:
+                        self.read_engine_log()  # Includes the engine_log_limit size check.
+                        if self.reason:
+                            return
                     if once:
                         return
                     self.done.wait(0.25)
@@ -1406,7 +1574,7 @@ class MemoryGuard:
                 self.sample(available, pagefile)
                 if self.reason:
                     return
-                if self.engine_log.exists() and self.engine_log.stat().st_size > 2 * LOG_LIMIT:
+                if self.engine_log.exists() and self.engine_log.stat().st_size > self.engine_log_limit:
                     self.reason = "Engine log exceeded the diagnostic size limit."
                     self.owner.stop()
                     return
@@ -2026,13 +2194,38 @@ class WindowsReceiptAPI(WindowsProvisionalAPI):
         return data
 
 
-class AcceptanceProvisionalFile:
-    """Retain the original receipt object from claim through the last worker save."""
+class WindowsEngineLogAPI(WindowsReceiptAPI):
+    """The worker's create-only engine-log handle shares what the engine's append open needs.
 
-    def __init__(self, owner, deadline):
+    serve/server.py opens the configured log with open(log, "a"): an OPEN_ALWAYS write
+    handle sharing reads and writes, never deletion, inherited by the engine as stderr.
+    """
+
+    def open(self, path):
+        handle = self.kernel.CreateFileW(str(path), 0x80000000, 3, None, 1, 0x200080, None)
+        # GENERIC_READ, FILE_SHARE_READ|WRITE, no FILE_SHARE_DELETE, CREATE_NEW,
+        # OPEN_REPARSE_POINT|NORMAL: a planted file, link or junction makes this fail.
+        if handle == self.c.c_void_p(-1).value:
+            raise self.c.WinError(self.c.get_last_error())
+        return handle
+
+    def open_final(self, path):
+        handle = self.kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0x200000, None)
+        # GENERIC_READ, FILE_SHARE_READ only, OPEN_EXISTING, OPEN_REPARSE_POINT: a live
+        # writer handle makes this fail with a sharing violation, and while it is held
+        # no new writer can open the log.
+        if handle == self.c.c_void_p(-1).value:
+            raise self.c.WinError(self.c.get_last_error())
+        return handle
+
+
+class AcceptanceProvisionalFile:
+    """Retain one create-only worker object, the receipt or the engine log, for the worker's lifetime."""
+
+    def __init__(self, owner, deadline, name="provisional.json", api=None):
         self.owner, self.deadline = owner, deadline
-        self.path = owner.path / "provisional.json"
-        self.api, self.handle = WindowsProvisionalAPI(), None
+        self.path = owner.path / name
+        self.api, self.handle = WindowsProvisionalAPI() if api is None else api, None
         self.failed = self.claimed = False
 
     def check_deadline(self):
@@ -2083,6 +2276,32 @@ class AcceptanceProvisionalFile:
         except BaseException:
             self.failed = True
             raise
+
+    def read(self, limit):
+        """Read the retained engine log once no writer remains, through a handle that denies new ones.
+
+        The engine is killed asynchronously after the server exits; the worker waits within
+        its absolute deadline so no engine byte can follow this read.
+        """
+        self.validate()
+        while True:
+            if time.monotonic() >= self.deadline:
+                raise TimeoutError("Engine log writers remained open at the absolute deadline.")
+            try:
+                final = self.api.open_final(self.path)
+                break
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 32:  # Only a live writer's sharing violation is retried.
+                    raise
+            time.sleep(min(0.05, max(0, self.deadline - time.monotonic())))
+        try:
+            if self.step(self.api.identity, final) != self.identity:
+                raise ValueError("Provisional file identity differs.")
+            data = self.step(self.api.read, final, limit)
+        finally:
+            self.api.close(final)
+        self.validate()
+        return data
 
     def close(self):
         if self.handle is not None:
@@ -2186,6 +2405,35 @@ def bounded_create(path, data, deadline, limit=ACCEPTANCE_LOG_LIMIT):
         stream.flush()
     if time.monotonic() >= deadline:
         raise TimeoutError("Artifact finalization exceeded the absolute deadline.")
+
+
+def acceptance_config_secret(config, manifest):
+    """The API key of the manifest-bound config bytes, which the worker's admission also binds."""
+    with Path(config).open("rb") as stream:
+        data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+    row, = [row for row in manifest["inputs"] if row["role"] == "config"]
+    if len(data) > ACCEPTANCE_LOG_LIMIT or hashlib.sha256(data).hexdigest() != row["sha256"]:
+        raise ValueError("Manifest config identity changed.")
+    secret = json.loads(data.decode("utf-8-sig")).get("api_key")
+    if type(secret) is not str or not secret.strip():
+        raise ValueError("An API key is required for the authenticated loopback benchmark.")
+    return secret
+
+
+def acceptance_engine_log(file, secret):
+    """One strict bounded read of the engine-written object; it is checked, never rewritten."""
+    if file is None or file.handle is None:
+        raise RuntimeError("Engine log is missing.")
+    data = file.read(ACCEPTANCE_LOG_LIMIT + 1)
+    if len(data) > ACCEPTANCE_LOG_LIMIT:
+        raise ValueError("Engine log exceeds its size budget.")
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError("Engine log is not strict UTF-8.") from None
+    if secret in text:
+        raise ValueError("Engine log contains the API key.")
+    return data
 
 
 def acceptance_acquire_output(output, expected_output, authority):
@@ -2630,7 +2878,7 @@ def acceptance_worker(envelope):
     args._admitted_manifest_sha256 = envelope.get("admitted_manifest_sha256")
     args._output_authority = envelope.get("output_authority")
     args._output_owner = None
-    args._provisional_file = None
+    args._provisional_file = args._engine_log = None
     if not valid_number(args._acceptance_deadline) or time.monotonic() >= args._acceptance_deadline:
         raise TimeoutError("START arrived after the worker deadline.")
     # The existing smoke helper owns an unrestricted file writer; retain its hold.
@@ -2653,6 +2901,12 @@ def acceptance_worker(envelope):
         if getattr(exc, "output_cleanup_error", None):
             print("Worker output authority cleanup failed (acquisition).", file=sys.stderr)
     finally:
+        if args._engine_log is not None:
+            try:
+                args._engine_log.close()
+            except Exception as cleanup:
+                print("Worker engine log close failed (" + type(cleanup).__name__ + ").", file=sys.stderr)
+                code = 1
         if args._provisional_file is not None:
             try:
                 args._provisional_file.close()
@@ -2699,12 +2953,18 @@ def acceptance_controller(args, started):
     work_deadline = total_deadline - CLEANUP_SECONDS
     floors = tuple(4 if value is None else value for value in (
         getattr(args, "acceptance_physical_gib", None), getattr(args, "acceptance_commit_gib", None)))
-    guard = MemoryGuard(None, None, acceptance_floors=floors, sample_limit=4 * total_seconds + 256)
     manifest_path = getattr(args, "acceptance_manifest", None)
     if manifest_path is not None and os.name != "nt":
         reason = "Manifest containment requires Windows directory authority."
         raise AcceptanceFailure({"status": "held", "lifecycle_evidence": "refused",
                                  "admission": {"status": "refused", "reason": reason}, "error": reason}, None)
+    if manifest_path is None:
+        guard = MemoryGuard(None, None, acceptance_floors=floors, sample_limit=4 * total_seconds + 256)
+    else:
+        # The admitted worker's engine writes its per-request CUDA-stage rows into this log.
+        guard = MemoryGuard(None, Path(args.output) / "engine.log", acceptance_floors=floors,
+                            sample_limit=4 * total_seconds + 256, engine_log_limit=ACCEPTANCE_LOG_LIMIT,
+                            required_request_marks=len(acceptance_case_specs(args.acceptance_workload)))
     if not acceptance_ready():
         return _run_workload(args)  # Existing held receipt, with no native/resource entry.
     if manifest_path is None and args.output.exists():
@@ -2720,6 +2980,7 @@ def acceptance_controller(args, started):
               "normal_comparison": normal_comparison_excluded("worker-classification-unavailable")}
     coverage_start = coverage_end = None
     eof = False
+    output_authority = os.urandom(32).hex()
 
     if manifest_path is not None:
         admission = record["admission"] = {"status": "refused"}
@@ -2728,6 +2989,8 @@ def acceptance_controller(args, started):
                 raise ValueError("Manifest containment requires Windows directory authority.")
             manifest, admission["manifest_sha256"] = load_acceptance_manifest(manifest_path, with_digest=True)
             acceptance_admission(args, manifest, time.time())
+            # Bound before any engine-log read: rows carrying either private value are refused.
+            guard.engine_log_secrets = (acceptance_config_secret(args.config, manifest), output_authority)
             args.output = Path(manifest["output"])
             guard.monitor(once=True)
             guard.check()
@@ -2740,7 +3003,6 @@ def acceptance_controller(args, started):
         admission["status"] = "admitted"
         args._controller_manifest_sha256 = admission["manifest_sha256"]  # Post-exit protection binding.
 
-    output_authority = os.urandom(32).hex()
     admitted_output = manifest["output"] if manifest_path is not None else str(args.output.resolve())
 
     def cleanup_failure(error):
@@ -2880,11 +3142,16 @@ def acceptance_controller(args, started):
                 for name in ("server.log", "engine.log"):
                     with (args.output / name).open("rb") as stream:
                         data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+                        opened = os.fstat(stream.fileno())
                     digest = hashlib.sha256(data).hexdigest()
                     if (len(data) > ACCEPTANCE_LOG_LIMIT or type(digests) is not dict
                             or type(digests.get(name)) is not str or not hmac.compare_digest(digests[name], digest)):
                         raise ValueError("Worker " + name + " differs from its authenticated digest.")
                     record["artifact_sha256"][name] = digest
+                    if name == "engine.log":
+                        # The authenticated bytes complete the guard's stream; consumed rows must be their prefix.
+                        guard.finish_engine_log(data, (opened.st_dev, opened.st_ino))
+                        record["memory"]["cuda"] = guard.cuda_summary()  # The receipt carries the bound stream.
             record["worker_complete"] = worker_record.get("status") == "provisional_complete"
             selection = getattr(args, "acceptance_workload", None)
             if selection:
@@ -3183,8 +3450,10 @@ def _run_workload(args):
         record["timing_diagnostic"] = (record["timing_diagnostic"] or not classification["complete"] or any(
             item.get("active") is True for item in classification["controls"]))
         record["normal_comparison"] = normal_comparison_binding(cfg, classification)
-        cfg.update(host="127.0.0.1", port=getattr(args, "port", PORT),
-                   log=None if worker_deadline is not None else str(engine_log))
+        # A manifest worker's engine appends to the retained output object the worker creates below.
+        log = (str(Path(args._acceptance_manifest["output"]) / "engine.log") if defer_output
+               else None if worker_deadline is not None else str(engine_log))
+        cfg.update(host="127.0.0.1", port=getattr(args, "port", PORT), log=log)
         record["effective_settings"] = {key: cfg.get(key) for key in (
             "model_name", "args", "fit_max_tokens", "open_browser",
             "expert_profile_save", "expert_profile_save_every")}
@@ -3215,6 +3484,11 @@ def _run_workload(args):
                 # The same no-write/no-delete-share handle owns every later snapshot.
                 output_ready = True
                 acceptance_wait_for_controller(args._output_owner, output_authority, worker_deadline)
+                # Create-once before the server exists: its append open can only reach this
+                # object, which no other process can delete or rename while the worker lives.
+                args._engine_log = AcceptanceProvisionalFile(args._output_owner, worker_deadline,
+                                                             "engine.log", WindowsEngineLogAPI())
+                args._engine_log.create()
                 if time.monotonic() >= worker_deadline:
                     raise TimeoutError("Absolute worker deadline reached before server start.")
             proc = subprocess.Popen([sys.executable, str(ROOT / "serve/server.py"), "--engine", "strata",
@@ -3368,10 +3642,14 @@ def _run_workload(args):
                         if defer_output:
                             args._output_owner.validate()
                         write = bounded_create if defer_output else bounded_write
-                        logs = {"server.log": redact(capture.text(), secret).encode("utf-8"),
-                                "engine.log": b"Engine file logging held for bounded Stage C collection.\n"}
+                        logs = {"server.log": redact(capture.text(), secret).encode("utf-8")}
+                        if not defer_output:
+                            logs["engine.log"] = b"Engine file logging held for bounded Stage C collection.\n"
                         for name, data in logs.items():
                             write(args.output / name, data, worker_deadline)
+                        if defer_output and (proc is not None or args._engine_log is not None):
+                            # After the retained server is terminated and waited.
+                            logs["engine.log"] = acceptance_engine_log(args._engine_log, secret)
                         if defer_output:
                             # The authenticated final receipt binds the exact closed log bytes.
                             record["artifact_sha256"] = {name: hashlib.sha256(data).hexdigest()
