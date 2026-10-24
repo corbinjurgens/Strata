@@ -30,6 +30,139 @@ def other_active_diagnostics(evidence):
             if item.get("active") is True and item != TRACE_CONTROL]
 
 
+class ControllerTimingTests(unittest.TestCase):
+    def test_wall_intervals_sleep_request_and_exception_without_error_text(self):
+        timing = bench.ControllerTiming()
+        with patch.object(bench.time, "monotonic", side_effect=[10.0, 10.85, 11.0, 12.1, 12.2]):
+            with timing.phase("sleep", requested_seconds=0.25):
+                pass
+            error = OSError("PRIVATE-KEY C:/private/profile.json")
+            with self.assertRaises(OSError) as caught:
+                with timing.phase("capture"):
+                    raise error
+            timing.freeze()
+        self.assertIs(caught.exception, error)
+        result = timing.summary()
+        sleep, capture = result["recent_operations"]
+        self.assertEqual((sleep["operation"], sleep["started_monotonic"], sleep["finished_monotonic"],
+                          sleep["requested_seconds"], sleep["outcome"]), ("sleep", 10, 10.85, 0.25, "completed"))
+        self.assertAlmostEqual(sleep["elapsed_seconds"], 0.85)
+        self.assertEqual(capture["outcome"], "raised")
+        self.assertAlmostEqual(capture["elapsed_seconds"], 1.1)
+        self.assertEqual(result["last_completed_operation"], capture)
+        self.assertEqual(result["refusal"]["last_completed_operation"], capture)
+        self.assertIsNone(result["current_operation"])
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertNotIn("profile.json", json.dumps(result))
+
+    def test_ring_and_inflight_refusal_survive_later_cleanup_and_summary_mutation(self):
+        timing = bench.ControllerTiming()
+        with patch.object(bench.time, "monotonic", return_value=100.0):
+            for _ in range(100):
+                with timing.phase("poll"):
+                    pass
+            with timing.phase("log_parse"):
+                timing.freeze()
+                frozen = timing.summary()
+            after = timing.summary()
+            for _ in range(100):
+                with timing.phase("discovery"):
+                    pass
+                timing.freeze()
+        self.assertEqual(len(after["recent_operations"]), 32)
+        self.assertEqual(after["recent_operations"][0]["operation"], "poll")
+        self.assertEqual(after["recent_operations"][-1]["operation"], "log_parse")
+        self.assertEqual(frozen["current_operation"]["outcome"], "running")
+        self.assertEqual(after["refusal"]["current_operation"], frozen["current_operation"])
+        self.assertEqual(after, timing.summary())
+        after["recent_operations"].clear()
+        after["refusal"]["current_operation"]["operation"] = "mutated"
+        self.assertEqual(len(timing.summary()["recent_operations"]), 32)
+        self.assertEqual(timing.summary()["refusal"]["current_operation"]["operation"], "log_parse")
+
+    def test_only_fixed_labels_and_bounded_sleep_values_are_accepted(self):
+        timing = bench.ControllerTiming()
+        for label in ("PRIVATE-KEY", "C:/private/profile.json", "capture\n", "x" * 100000):
+            with self.subTest(label=label[:20]), self.assertRaisesRegex(ValueError, "Unknown controller timing"):
+                with timing.phase(label):
+                    self.fail("Invalid label reached operation")
+        for request in (True, -1, 0.251, float("inf"), float("nan"), "0.25"):
+            with self.subTest(request=request), self.assertRaisesRegex(ValueError, "Invalid controller timing sleep"):
+                with timing.phase("sleep", requested_seconds=request):
+                    self.fail("Invalid sleep request reached operation")
+        self.assertEqual(timing.summary()["recent_operations"], [])
+
+    def test_invalid_or_backwards_clocks_never_publish_nonfinite_times(self):
+        for started, finished in ((float("nan"), 10), (10, float("inf")), (True, 10), (-1, 10), (10, 9)):
+            with self.subTest(started=started, finished=finished):
+                timing = bench.ControllerTiming()
+                with patch.object(bench.time, "monotonic", side_effect=[started, finished, float("nan")]):
+                    with timing.phase("host_read"):
+                        pass
+                    timing.freeze()
+                result = timing.summary()
+                self.assertFalse(result["clock_valid"])
+                row, = result["recent_operations"]
+                self.assertIsNone(row["finished_monotonic"])
+                self.assertIsNone(row["elapsed_seconds"])
+                self.assertIsNone(result["refusal"]["observed_monotonic"])
+                json.dumps(result, allow_nan=False)
+
+    def test_unselected_guard_uses_no_diagnostic_clock_or_summary_fields(self):
+        guard = bench.MemoryGuard(None, None, acceptance_floors=(4, 4))
+        with patch.object(bench.time, "monotonic", side_effect=AssertionError("Diagnostic clock on unselected route")):
+            with guard.timing_phase("capture"):
+                pass
+            guard.timing_refusal()
+            self.assertNotIn("controller_timing", guard.acceptance_summary())
+        self.assertFalse(guard.thread.is_alive())
+
+    def test_serial_gap_bounds_and_refusal_survive_cleanup_without_attributing_unmeasured_time(self):
+        from tools import prepare_unsloth_q2 as preparation
+        for timed in (False, True):
+            with self.subTest(timed=timed):
+                now = [10.0]
+                def snapshot():
+                    now[0] += 0.0001191
+                    return {"available_gib": 8, "commit_available_gib": 9}
+                def stop():
+                    now[0] += 100
+                    raise OSError("synthetic cleanup failure")
+                owner = Mock()
+                owner.stop.side_effect = stop
+                guard = bench.MemoryGuard(owner, None, acceptance_floors=(4, 4))
+                guard.controller_timing = bench.ControllerTiming()
+                with patch.object(bench.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(preparation, "memory_snapshot", side_effect=snapshot):
+                    guard.monitor(once=True)
+                    with guard.timing_phase("capture") if timed else contextlib.nullcontext():
+                        now[0] += 0.8485836
+                    with guard.timing_phase("sleep", requested_seconds=0.25):
+                        now[0] += 0.25
+                    guard.monitor(once=True)
+                    result = guard.acceptance_summary()
+                    diagnostic = result["controller_timing"]
+                    guard.owner = None
+                    guard.monitor(once=True)
+                    self.assertEqual(guard.acceptance_summary()["controller_timing"], diagnostic)
+                self.assertEqual(guard.reason,
+                    "Acceptance telemetry failed: Host sampling gap or read duration exceeded one second.")
+                self.assertAlmostEqual(result["max_gap_seconds"], 1.0987027)
+                self.assertEqual(guard.cleanup_error, "OSError: synthetic cleanup failure")
+                self.assertLess(diagnostic["refusal"]["observed_monotonic"], 12)
+                samples = result["raw_samples"]
+                reads = [row for row in diagnostic["recent_operations"] if row["operation"] == "host_read"]
+                self.assertEqual(len(reads), 2)
+                for row, sample in zip(reads, samples):
+                    self.assertEqual(row["started_monotonic"], sample["started_monotonic"])
+                    self.assertEqual(row["finished_monotonic"], sample["finished_monotonic"])
+                    self.assertAlmostEqual(row["elapsed_seconds"], 0.0001191)
+                capture = [row for row in diagnostic["recent_operations"] if row["operation"] == "capture"]
+                self.assertEqual(len(capture), int(timed))
+                if timed:
+                    self.assertAlmostEqual(capture[0]["elapsed_seconds"], 0.8485836)
+
+
 class HelperTests(unittest.TestCase):
     def test_snapshot_replacement_survives_a_temporary_reader_lock(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -574,6 +707,25 @@ class AcceptanceTelemetryTests(unittest.TestCase):
         guard.owner.stop.assert_called_once_with()
 
     def test_maximum_duration_host_receipt_fits_six_mib(self):
+        composition = StageCCompositionTests("test_short_static_full_public_composition_passes")
+        composition.setUp()
+        self.addCleanup(composition.doCleanups)
+        complete_record = composition.invoke()
+        self.assertTrue(bench.acceptance_final_predicate(complete_record))
+        timing = bench.ControllerTiming()
+        # Saturate the fixed ring and refusal/current/last fields with long finite floats.
+        with patch.object(bench.time, "monotonic", side_effect=lambda: next(clock)):
+            clock = iter([value for _ in range(32) for value in (1.2345678901234567e+200,
+                                                                    1.2345678901234567e+201)]
+                         + [1.2345678901234567e+200, 1.2345678901234567e+201,
+                            1.7976931348623157e+308])
+            for _ in range(32):
+                with timing.phase("sleep", requested_seconds=0.25):
+                    pass
+            with timing.phase("sleep", requested_seconds=0.25):
+                timing.freeze()
+        self.assertEqual(len(timing.summary()["recent_operations"]), 32)
+        self.assertLessEqual(len(json.dumps(timing.summary(), indent=4).encode()), 16384)
         temporary = tempfile.TemporaryDirectory(prefix="receipt-cap-")
         self.addCleanup(temporary.cleanup)
         log = Path(temporary.name) / "engine.log"
@@ -616,11 +768,12 @@ class AcceptanceTelemetryTests(unittest.TestCase):
                     "cuda_free_mib": 9007199254740991, "stage": stage, "enforced": True,
                     "observed_monotonic": sys.float_info.max})
                 self.assertEqual(summary["cuda"]["errors"], ["Completed-request CUDA marks: 0 of 11 required."])
-                record = {"status": "held", "memory": summary,
-                          "memory_finalization": "provisional until post-artifact host edge in returned result"}
+                summary["controller_timing"] = timing.summary()
+                record = dict(complete_record, memory=summary)
                 payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
                 self.assertEqual(bench.ACCEPTANCE_RECEIPT_LIMIT, 6 * 1024**2)
                 self.assertLessEqual(len(payload), bench.ACCEPTANCE_RECEIPT_LIMIT)
+                self.assertEqual(json.loads(payload)["memory"]["controller_timing"], timing.summary())
 
     def test_actual_monitor_uses_repository_commit_snapshot_not_swap_usage(self):
         from tools import prepare_unsloth_q2 as preparation
@@ -2780,10 +2933,17 @@ class ContainedLifecycleTests(unittest.TestCase):
             launch_memory=getattr(self, "launch_memory", {"cohort": "static", "sample_status": "unavailable"}))
         base_client = StageCSourceTests.client_type(adapter)
         guards = []
+        controller_thread = threading.current_thread()
         real_guard, real_workload, real_idle, real_open = (bench.MemoryGuard, bench.acceptance_workload_tests,
                                                          bench.acceptance_idle, Path.open)
         def make_guard(*args, **kwargs):
             guard = real_guard(*args, **kwargs)
+            phase = guard.timing_phase
+            # advance() synthesizes host observations on the fake worker thread.
+            # Production monitor calls are serial on the controller; only those
+            # calls participate in its operation timing, not this fixture's clock driver.
+            guard.timing_phase = lambda *args, **kwargs: (phase(*args, **kwargs)
+                if threading.current_thread() is controller_thread else contextlib.nullcontext())
             monitor = guard.monitor
             def sample(*args, **kwargs):
                 # One lock order on every thread: the owner's lock, then the clock, as in
@@ -7888,6 +8048,121 @@ class StageCCompositionTests(unittest.TestCase):
         self.assertNotIn("job_drain_seconds", result)
         self.assertEqual(len(polls), 1)
         self.assertLess(result["worker_observed_exit_monotonic"], result["work_deadline"])
+
+
+class ControllerTimingCompositionTests(unittest.TestCase):
+    setUp = StageCCompositionTests.setUp
+    invoke = StageCCompositionTests.invoke
+    refused = StageCCompositionTests.refused
+
+    def delayed(self, target, attribute, operation, *, raised=False, cleanup_error=False):
+        timing = bench.ControllerTiming()
+        original = getattr(target, attribute)
+        controller_thread = threading.current_thread()
+        injected = []
+        def delayed(*args, **kwargs):
+            if (not injected and threading.current_thread() is controller_thread and self.case.samples >= 2
+                    and timing.current is not None and timing.current["operation"] == operation):
+                injected.append(self.case.now)
+                with self.case.clock_lock:
+                    self.case.now += 1.1
+                if raised:
+                    raise OSError("synthetic controller operation failure")
+            return original(*args, **kwargs)
+        if cleanup_error:
+            terminate = self.case.native.terminate_job
+            def fail_cleanup(job):
+                terminate(job)
+                raise OSError("synthetic controller cleanup failure")
+            self.enterContext(patch.object(self.case.native, "terminate_job", side_effect=fail_cleanup))
+        with patch.object(bench, "ControllerTiming", return_value=timing), patch.object(target, attribute, delayed):
+            result = self.refused()
+        self.assertEqual(len(injected), 1, "The selected controller operation must actually execute")
+        diagnostic = result["memory"]["controller_timing"]
+        rows = diagnostic["recent_operations"]
+        delayed_row = next(row for row in rows if row["operation"] == operation and row["elapsed_seconds"] >= 1.1)
+        self.assertEqual(delayed_row["outcome"], "raised" if raised else "completed")
+        self.assertIsNone(diagnostic["current_operation"])
+        self.assertIsNotNone(diagnostic["refusal"])
+        self.assertLessEqual(len(rows), 32)
+        self.assertEqual(diagnostic, timing.summary())  # Stopped/final probes cannot erase the refusal interval.
+        if raised:
+            expected = ("Memory/process monitor failed: OSError" if operation == "discovery" else
+                        "Engine CUDA-stage evidence failed: OSError" if operation in ("log_read", "log_parse") else
+                        "OSError: synthetic controller operation failure")
+            self.assertIn(expected, result["error"])
+            self.assertEqual(diagnostic["refusal"]["last_completed_operation"], delayed_row)
+        else:
+            self.assertEqual(result["memory"]["errors"][0],
+                             "Acceptance telemetry failed: Host sampling gap or read duration exceeded one second.")
+            self.assertGreater(result["memory"]["max_gap_seconds"], 1)
+            if operation != "host_read":
+                row = result["memory"]["raw_samples"][-1]
+                self.assertLess(row["finished_monotonic"] - row["started_monotonic"], 0.1)
+            self.assertIn("host_read", {row["operation"] for row in rows})
+        if operation == "sleep":
+            self.assertEqual(delayed_row["requested_seconds"], 0.25)
+            self.assertGreater(delayed_row["finished_monotonic"] - delayed_row["started_monotonic"], 1.1)
+        if cleanup_error:
+            self.assertIn("synthetic controller cleanup failure", result["cleanup_error"])
+        return result
+
+    def test_capture_delay_is_retained_at_unchanged_gap_refusal(self):
+        self.delayed(self.case.native, "capture", "capture")
+
+    def test_capture_bookkeeping_delay_is_distinct_from_memory_read(self):
+        self.delayed(bench.BoundedCapture, "write", "capture")
+
+    def test_poll_delay_is_retained_at_unchanged_gap_refusal(self):
+        self.delayed(bench.OwnedProcess, "poll", "poll")
+
+    def test_discovery_delay_is_retained_before_memory_read_start(self):
+        self.delayed(bench.OwnedProcess, "discover", "discovery")
+
+    def test_output_acquisition_delay_is_retained(self):
+        self.delayed(bench, "acceptance_acquire_output", "output_acquisition")
+
+    def test_log_filesystem_delay_is_separate_from_parsing(self):
+        self.delayed(Path, "open", "log_read")
+
+    def test_log_parsing_delay_is_separate_from_filesystem_read(self):
+        self.delayed(bench.MemoryGuard, "consume_engine_log", "log_parse")
+
+    def test_host_read_delay_remains_a_read_duration_refusal(self):
+        from tools import prepare_unsloth_q2 as preparation
+        self.delayed(preparation, "memory_snapshot", "host_read")
+
+    def test_sleep_requested_duration_and_actual_resume_are_retained(self):
+        self.delayed(bench.time, "sleep", "sleep")
+
+    def test_controller_exception_retains_last_raised_operation_and_primary_error(self):
+        self.delayed(self.case.native, "capture", "capture", raised=True)
+
+    def test_discovery_exception_retains_guard_primary_error_and_operation(self):
+        self.delayed(bench.OwnedProcess, "discover", "discovery", raised=True)
+
+    def test_log_read_exception_retains_fixed_error_and_operation(self):
+        self.delayed(Path, "open", "log_read", raised=True)
+
+    def test_log_parse_exception_retains_fixed_error_and_operation(self):
+        self.delayed(bench.MemoryGuard, "consume_engine_log", "log_parse", raised=True)
+
+    def test_gap_refusal_diagnostics_survive_failing_owned_cleanup(self):
+        self.delayed(self.case.native, "capture", "capture", cleanup_error=True)
+
+    def test_complete_run_has_bounded_diagnostics_only_in_controller_receipts(self):
+        result = self.invoke()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        timing = result["memory"]["controller_timing"]
+        self.assertTrue(timing["clock_valid"])
+        self.assertIsNone(timing["refusal"])
+        self.assertLessEqual(len(timing["recent_operations"]), 32)
+        self.assertIn("sleep", {row["operation"] for row in timing["recent_operations"]})
+        lifecycle = json.loads((self.case.output / "lifecycle.json").read_bytes())
+        self.assertIn("controller_timing", lifecycle["memory"])
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertNotIn("controller_timing", json.dumps(worker))
+        self.assertFalse(any("controller_timing" in row for row in result["memory"]["raw_samples"]))
 
 
 class AcceptanceProtectionTests(unittest.TestCase):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import contextlib
 import copy
 import hashlib
@@ -1277,6 +1278,78 @@ class WindowsProcessAPI:
 ENGINE_SERVING_PATTERN = r"strata serve: (?:WARNING: )?(\d+) MiB of VRAM free with everything loaded"
 
 
+class ControllerTiming:
+    """Selected-controller wall intervals, not CPU time or evidence of descheduling.
+
+    A loop has at most ten operations between host reads; 32 completed entries
+    retain both bounding reads and their intervening work. Freeze before cleanup
+    can replace that interval. No extra sampler or per-host-row payload is needed.
+    """
+    OPERATIONS = frozenset(("capture", "poll", "output_acquisition", "discovery", "host_read",
+                            "log_read", "log_parse", "sleep"))
+    LIMIT = 32
+
+    def __init__(self):
+        self.recent = deque(maxlen=self.LIMIT)
+        self.current = self.refusal = None
+        self.clock_valid = True
+
+    def clock(self):
+        value = time.monotonic()
+        if not valid_number(value) or value < 0:
+            self.clock_valid = False
+            return None
+        return float(value)
+
+    @contextlib.contextmanager
+    def phase(self, operation, *, requested_seconds=None):
+        if operation not in self.OPERATIONS:
+            raise ValueError("Unknown controller timing operation.")
+        if requested_seconds is not None and (operation != "sleep" or not valid_number(requested_seconds)
+                                              or not 0 <= requested_seconds <= 0.25):
+            raise ValueError("Invalid controller timing sleep request.")
+        if self.refusal is not None:
+            yield
+            return
+        if self.current is not None:
+            raise RuntimeError("Controller timing operations must be serial.")
+        row = {"operation": operation, "started_monotonic": self.clock(),
+               "finished_monotonic": None, "elapsed_seconds": None, "outcome": "running"}
+        if requested_seconds is not None:
+            row["requested_seconds"] = float(requested_seconds)
+        self.current = row
+        try:
+            yield
+        except BaseException:
+            row["outcome"] = "raised"
+            raise
+        else:
+            row["outcome"] = "completed"
+        finally:
+            finished = self.clock()
+            started = row["started_monotonic"]
+            if started is not None and finished is not None and finished >= started:
+                row["finished_monotonic"] = finished
+                row["elapsed_seconds"] = finished - started
+            else:
+                self.clock_valid = False
+            self.recent.append(row)
+            self.current = None
+
+    def freeze(self):
+        if self.refusal is None:
+            self.refusal = {"observed_monotonic": self.clock(),
+                            "current_operation": dict(self.current) if self.current else None,
+                            "last_completed_operation": dict(self.recent[-1]) if self.recent else None}
+
+    def summary(self):
+        return {"operation_limit": self.LIMIT, "clock_valid": self.clock_valid,
+                "recent_operations": [dict(row) for row in self.recent],
+                "current_operation": dict(self.current) if self.current else None,
+                "last_completed_operation": dict(self.recent[-1]) if self.recent else None,
+                "refusal": copy.deepcopy(self.refusal)}
+
+
 class MemoryGuard:
     def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None, sample_limit=4096,
                  engine_log_limit=2 * LOG_LIMIT, required_request_marks=None):
@@ -1308,7 +1381,16 @@ class MemoryGuard:
                     raise ValueError("Acceptance floors must be finite positive GiB values.")
         self.host_samples = []
         self.max_gap_seconds = 0
+        self.controller_timing = None  # Enabled only by the selected, manifest-backed controller.
         self.thread = threading.Thread(target=self.monitor, daemon=True)
+
+    def timing_phase(self, operation, **kwargs):
+        return (self.controller_timing.phase(operation, **kwargs) if self.controller_timing is not None
+                else contextlib.nullcontext())
+
+    def timing_refusal(self):
+        if self.controller_timing is not None:
+            self.controller_timing.freeze()
 
     def acceptance_sample(self, snapshot, started, finished):
         """Record unadjusted host availability; pagefile use is never commit availability."""
@@ -1345,11 +1427,13 @@ class MemoryGuard:
         except (KeyError, TypeError, ValueError) as exc:
             if self.reason is None:
                 self.reason = "Acceptance telemetry failed: " + str(exc)
+                self.timing_refusal()
                 if self.owner is not None:
                     self.stop_owner()
 
     def stop_owner(self):
         """Keep the first guard reason even if its cancellation also fails."""
+        self.timing_refusal()
         try:
             if self.owner is not None:
                 self.owner.stop()
@@ -1365,6 +1449,7 @@ class MemoryGuard:
             self.cuda_errors.append(error)
         if self.reason is None:
             self.reason = reason
+            self.timing_refusal()
             if self.owner is not None:
                 self.stop_owner()
 
@@ -1441,28 +1526,30 @@ class MemoryGuard:
         if self.engine_stopped or self.engine_final:
             return
         try:
-            path = self.engine_log
-            if path.is_symlink() or path.is_junction():
-                raise ValueError("Engine log is linked.")
-            if not path.exists():
-                if self.engine_identity is not None:
-                    raise ValueError("Engine log disappeared.")
-                return
-            with path.open("rb") as stream:
-                opened = os.fstat(stream.fileno())
-                if self.engine_identity is None:
-                    self.engine_identity = (opened.st_dev, opened.st_ino)
-                elif (opened.st_dev, opened.st_ino) != self.engine_identity:
-                    raise ValueError("Engine log identity changed.")
-                if opened.st_size > self.engine_log_limit:
-                    raise ValueError("Engine log exceeded its size limit.")
-                if opened.st_size < self.engine_offset:
-                    raise ValueError("Engine log truncated.")
-                if opened.st_size - self.engine_offset > 1024**2:
-                    raise ValueError("Engine log parsing backlog exceeded 1 MiB.")
-                stream.seek(self.engine_offset)
-                data = stream.read(opened.st_size - self.engine_offset)
-            self.consume_engine_log(data)
+            with self.timing_phase("log_read"):
+                path = self.engine_log
+                if path.is_symlink() or path.is_junction():
+                    raise ValueError("Engine log is linked.")
+                if not path.exists():
+                    if self.engine_identity is not None:
+                        raise ValueError("Engine log disappeared.")
+                    return
+                with path.open("rb") as stream:
+                    opened = os.fstat(stream.fileno())
+                    if self.engine_identity is None:
+                        self.engine_identity = (opened.st_dev, opened.st_ino)
+                    elif (opened.st_dev, opened.st_ino) != self.engine_identity:
+                        raise ValueError("Engine log identity changed.")
+                    if opened.st_size > self.engine_log_limit:
+                        raise ValueError("Engine log exceeded its size limit.")
+                    if opened.st_size < self.engine_offset:
+                        raise ValueError("Engine log truncated.")
+                    if opened.st_size - self.engine_offset > 1024**2:
+                        raise ValueError("Engine log parsing backlog exceeded 1 MiB.")
+                    stream.seek(self.engine_offset)
+                    data = stream.read(opened.st_size - self.engine_offset)
+            with self.timing_phase("log_parse"):
+                self.consume_engine_log(data)
         except Exception as exc:
             self.engine_stage_error(exc)
 
@@ -1526,13 +1613,16 @@ class MemoryGuard:
                              "finished_monotonic": row["finished_monotonic"]} if row else None)
             if row is None or row[name + "_available_bytes"] < floor * 1024**3:
                 errors.append(name + " configured headroom evidence failed.")
-        return {"host_evidence": "refused" if errors else "satisfied",
+        result = {"host_evidence": "refused" if errors else "satisfied",
                 "errors": errors, "floors_gib": dict(zip(("physical", "commit"), self.acceptance_floors)),
                 "raw_samples": rows, "minima": minima, "max_gap_seconds": self.max_gap_seconds,
                 "coverage_start_monotonic": start, "coverage_end_monotonic": end,
                 "sample_limit": self.sample_limit, "cuda": self.cuda_summary(),
                 "cleanup_error": self.cleanup_error, "cuda_floor_mib": 256,
                 "lifecycle_acceptance": "pending", "cleanup": "pending", "finalization": "pending"}
+        if self.controller_timing is not None:
+            result["controller_timing"] = self.controller_timing.summary()
+        return result
 
     def sample(self, available, pagefile):
         self.samples += 1
@@ -1549,12 +1639,15 @@ class MemoryGuard:
         try:
             while not self.done.is_set():
                 if self.owner is not None:
-                    self.owner.discover()
+                    with self.timing_phase("discovery"):
+                        self.owner.discover()
                 if self.acceptance_floors is not None:
                     from tools.prepare_unsloth_q2 import memory_snapshot
-                    started = time.monotonic()
-                    snapshot = memory_snapshot()
-                    self.acceptance_sample(snapshot, started, time.monotonic())
+                    with self.timing_phase("host_read"):
+                        started = time.monotonic()
+                        snapshot = memory_snapshot()
+                        finished = time.monotonic()
+                    self.acceptance_sample(snapshot, started, finished)
                     if self.reason:
                         return
                     if self.engine_log is not None:
@@ -3043,6 +3136,8 @@ def acceptance_controller(args, started):
                             required_request_marks=len(acceptance_case_specs(args.acceptance_workload)))
     if not acceptance_ready(args):
         return _run_workload(args)  # Existing held receipt, with no native/resource entry.
+    if manifest_path is not None and getattr(args, "acceptance_workload", None):
+        guard.controller_timing = ControllerTiming()
     if manifest_path is None and args.output.exists():
         raise RuntimeError("Output directory already exists; choose a new directory.")
     native, owner, proc, output_owner = None, None, None, None
@@ -3073,6 +3168,7 @@ def acceptance_controller(args, started):
             guard.check()
             acceptance_floor_check(guard.host_samples[0], manifest, in_bytes=True)
         except Exception as exc:
+            guard.timing_refusal()
             admission["reason"] = str(exc)
             record["error"] = type(exc).__name__ + ": " + str(exc)
             record["memory"] = guard.acceptance_summary()
@@ -3131,11 +3227,13 @@ def acceptance_controller(args, started):
                     record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
                     raise TimeoutError("Job members remained after worker exit.")
                 raise TimeoutError("Absolute worker deadline reached, including capture/finalization.")
-            chunk, eof = native.capture(proc.stdout)
-            capture.write(chunk)
-            if capture.total > ACCEPTANCE_LOG_LIMIT:
-                raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
-            code = owner.poll()
+            with guard.timing_phase("capture"):
+                chunk, eof = native.capture(proc.stdout)
+                capture.write(chunk)
+                if capture.total > ACCEPTANCE_LOG_LIMIT:
+                    raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
+            with guard.timing_phase("poll"):
+                code = owner.poll()
             if code is not None:
                 record["worker_exit"] = code
                 record.setdefault("worker_observed_exit_monotonic", time.monotonic())
@@ -3143,30 +3241,37 @@ def acceptance_controller(args, started):
                     guard.check()  # Keep an already-recorded guard failure as the primary reason.
                     raise RuntimeError("Worker exited unsuccessfully.")
             if manifest_path is not None and output_owner is None and code is None:
-                try:
-                    output_owner = acceptance_acquire_output(args.output, admitted_output, output_authority)
-                except (FileNotFoundError, json.JSONDecodeError) as incomplete:
-                    if getattr(incomplete, "output_owner", None) is not None:
-                        raise
-                    pass  # Birth/partial claim may complete only within the original deadline.
-                else:
-                    # One shot: a failure stops the owned job while output_owner stays held.
-                    acceptance_publish_acknowledgment(output_owner, output_authority, work_deadline)
+                with guard.timing_phase("output_acquisition"):
+                    try:
+                        output_owner = acceptance_acquire_output(args.output, admitted_output, output_authority)
+                    except (FileNotFoundError, json.JSONDecodeError) as incomplete:
+                        if getattr(incomplete, "output_owner", None) is not None:
+                            raise
+                        pass  # Birth/partial claim may complete only within the original deadline.
+                    else:
+                        # One shot: a failure stops the owned job while output_owner stays held.
+                        acceptance_publish_acknowledgment(output_owner, output_authority, work_deadline)
             guard.monitor(once=True)
             guard.check()
             if code is not None:
-                job_active = owner.discover()
+                with guard.timing_phase("discovery"):
+                    job_active = owner.discover()
                 record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
                 if job_active == 0 and eof:
                     break
-            time.sleep(min(0.25, max(0, work_deadline - time.monotonic())))
+            seconds = min(0.25, max(0, work_deadline - time.monotonic()))
+            with guard.timing_phase("sleep", requested_seconds=seconds):
+                time.sleep(seconds)
         # Explicit final edge after externally observed exit and inherited-pipe EOF.
-        time.sleep(min(0.001, max(0, total_deadline - time.monotonic())))
+        seconds = min(0.001, max(0, total_deadline - time.monotonic()))
+        with guard.timing_phase("sleep", requested_seconds=seconds):
+            time.sleep(seconds)
         guard.monitor(once=True)
         guard.check()
         record["natural_exit"] = not owner.forced
         record["capture_complete"] = eof
     except BaseException as exc:
+        guard.timing_refusal()
         record["error"] = type(exc).__name__ + ": " + str(exc)
         if getattr(exc, "output_owner", None) is not None:
             output_owner = exc.output_owner
@@ -3315,6 +3420,7 @@ def acceptance_controller(args, started):
             output_owner.validate()
         record["finalization"] = True
     except Exception as exc:
+        guard.timing_refusal()
         record["finalization_error"] = type(exc).__name__ + ": " + str(exc)
         record["finalization"] = False
     finally:
@@ -3337,6 +3443,9 @@ def acceptance_controller(args, started):
             for name in ("physical", "commit"))
         record["within_deadline"] = time.monotonic() < total_deadline
     if not acceptance_final_predicate(record):
+        guard.timing_refusal()
+        if guard.controller_timing is not None:
+            record["memory"]["controller_timing"] = guard.controller_timing.summary()
         raise AcceptanceFailure(record, owner, output_owner)
     record["lifecycle_evidence"] = "satisfied"
     return record
