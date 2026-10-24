@@ -1828,9 +1828,9 @@ def make_client(validation, cfg, record, save, guard, secret):
     return Client(cfg)
 
 
-def acceptance_ready():
-    # Workload CPU coverage does not supply native, current admission or CUDA proof.
-    return False
+def acceptance_ready(args):
+    return (getattr(args, "acceptance_workload", None) is not None
+            and getattr(args, "acceptance_manifest", None) is not None)
 
 
 def acceptance_preflight(args):
@@ -2938,7 +2938,10 @@ def acceptance_final_predicate(record):
             and record.get("protection") is True and record.get("finalization") is True
             and record.get("within_deadline") is True and record.get("worker_complete") is True
             and record.get("base_host_floors_satisfied") is True
+            and record.get("admission", {}).get("status") == "admitted"
             and record.get("memory", {}).get("host_evidence") == "satisfied"
+            and record.get("memory", {}).get("cuda", {}).get("status") == "satisfied"
+            and record.get("launch_evidence", {}).get("status") == "satisfied"
             and not record.get("error") and not record.get("cleanup_error"))
 
 
@@ -3038,7 +3041,7 @@ def acceptance_controller(args, started):
         guard = MemoryGuard(None, Path(args.output) / "engine.log", acceptance_floors=floors,
                             sample_limit=4 * total_seconds + 256, engine_log_limit=ACCEPTANCE_LOG_LIMIT,
                             required_request_marks=len(acceptance_case_specs(args.acceptance_workload)))
-    if not acceptance_ready():
+    if not acceptance_ready(args):
         return _run_workload(args)  # Existing held receipt, with no native/resource entry.
     if manifest_path is None and args.output.exists():
         raise RuntimeError("Output directory already exists; choose a new directory.")
@@ -3048,9 +3051,10 @@ def acceptance_controller(args, started):
     worker_environment.pop("STRATA_BENCHMARK_BOOTSTRAP", None)  # Consumed by bootstrap, never passed to the engine.
     record = {"status": "held", "lifecycle_evidence": "refused", "started_monotonic": started,
               "total_deadline": total_deadline, "work_deadline": work_deadline,
-              "pending_stages": ["Stage C", "CUDA", "current admission"],
               "external_limits": "Controller OS calls must return; caller must keep controller alive.",
               "normal_comparison": normal_comparison_excluded("worker-classification-unavailable")}
+    if manifest_path is None:
+        record["pending_stages"] = ["Stage C", "CUDA", "current admission"]
     coverage_start = coverage_end = None
     eof = False
     output_authority = os.urandom(32).hex()
@@ -3120,14 +3124,24 @@ def acceptance_controller(args, started):
         if proc.stdin.write(data) != len(data):
             raise OSError("Short START write.")
         proc.stdin.close()
+        job_active = None
         while True:
             if time.monotonic() >= work_deadline:
+                if record.get("worker_exit") == 0 and job_active:
+                    record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
+                    raise TimeoutError("Job members remained after worker exit.")
                 raise TimeoutError("Absolute worker deadline reached, including capture/finalization.")
             chunk, eof = native.capture(proc.stdout)
             capture.write(chunk)
             if capture.total > ACCEPTANCE_LOG_LIMIT:
                 raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
             code = owner.poll()
+            if code is not None:
+                record["worker_exit"] = code
+                record.setdefault("worker_observed_exit_monotonic", time.monotonic())
+                if code != 0:
+                    guard.check()  # Keep an already-recorded guard failure as the primary reason.
+                    raise RuntimeError("Worker exited unsuccessfully.")
             if manifest_path is not None and output_owner is None and code is None:
                 try:
                     output_owner = acceptance_acquire_output(args.output, admitted_output, output_authority)
@@ -3141,13 +3155,9 @@ def acceptance_controller(args, started):
             guard.monitor(once=True)
             guard.check()
             if code is not None:
-                record["worker_exit"] = code
-                record.setdefault("worker_observed_exit_monotonic", time.monotonic())
-                if code != 0:
-                    raise RuntimeError("Worker exited unsuccessfully.")
-                if owner.discover() != 0:
-                    raise RuntimeError("Worker exited with live Job members.")
-                if eof:
+                job_active = owner.discover()
+                record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
+                if job_active == 0 and eof:
                     break
             time.sleep(min(0.25, max(0, work_deadline - time.monotonic())))
         # Explicit final edge after externally observed exit and inherited-pipe EOF.
@@ -3475,6 +3485,8 @@ def _run_workload(args):
                                         "Actual per-request CUDA-stage evidence (minimum 256 MiB).",
                                         "Final recent-cache allocation."] +
                                        (["Server's once-refreshed automatic policy sample."] if automatic else []))
+        if record.get("admission", {}).get("status") == "admitted" and getattr(args, "acceptance_manifest", None) is not None:
+            record["missing_evidence"] = ["Server's once-refreshed automatic policy sample."] if automatic else []
     guard = None
 
     def save():
@@ -3606,6 +3618,10 @@ def _run_workload(args):
             record["engine"] = client.get("/metrics")["engine"]
             if selection:
                 record["launch_memory"] = client.get("/metrics").get("launch_memory")
+                if record.get("admission", {}).get("status") == "admitted" and getattr(args, "acceptance_manifest", None) is not None:
+                    launch = record["launch_memory"]
+                    record["missing_evidence"] = (["Server's once-refreshed automatic policy sample."]
+                        if automatic and (type(launch) is not dict or launch.get("sample_status") != "available") else [])
             record["status"] = "running"
             save()
             if held_out or transfer_workload or long_context or selection:
@@ -3778,7 +3794,7 @@ def main(argv=None):
     parser.add_argument("--expected-context", type=int, choices=(65536, CONTEXT), default=CONTEXT,
                         help="Required loaded context capacity (default 131072)")
     parser.add_argument("--acceptance-workload", choices=("short", "near-full"),
-                        help="Contained opt-in eleven-request short or separate near-full/sustained workload; admission held")
+                        help="Contained opt-in eleven-request short or separate near-full/sustained workload")
     parser.add_argument("--cohort", choices=("saved-static", "automatic", "frozen-control"),
                         help="Explicit policy cohort for the selected acceptance workload")
     parser.add_argument("--candidate-exe", type=Path,
@@ -3790,7 +3806,7 @@ def main(argv=None):
     parser.add_argument("--idle-seconds", type=float, default=0,
                         help="Idle 0-600 seconds between timed rounds while keeping the memory guard active")
     parser.add_argument("--acceptance-telemetry", action="store_true",
-                        help="Prepare opt-in host acceptance telemetry; runtime remains held for Stage B/C")
+                        help="Opt-in contained acceptance run; starts processes only with --acceptance-manifest")
     parser.add_argument("--acceptance-total-seconds", type=int,
                         help="Opt-in total acceptance budget, 900-5400 seconds (default 900)")
     parser.add_argument("--write-acceptance-manifest", type=Path, metavar="PATH",

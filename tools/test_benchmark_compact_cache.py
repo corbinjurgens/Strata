@@ -2179,6 +2179,23 @@ class ContainedLifecycleTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return bench.run(self.args)
 
+    def invoke_held(self):
+        # This isolated lifecycle fixture forces readiness without a manifest. Its
+        # old lifecycle qualifiers still complete, but cannot supply Stage C proof.
+        with self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.invoke()
+        record = caught.exception.record
+        self.assertEqual(record["worker_exit"], 0)
+        for key in ("natural_exit", "capture_complete", "owned_cleanup", "protection", "finalization",
+                    "within_deadline", "worker_complete", "base_host_floors_satisfied"):
+            self.assertIs(record[key], True, key)
+        self.assertEqual(record["memory"]["host_evidence"], "satisfied")
+        self.assertNotIn("admission", record)
+        self.assertNotIn("error", record)
+        self.assertNotIn("cleanup_error", record)
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        return record
+
     def refused(self, mode):
         with self.assertRaises(bench.AcceptanceFailure) as caught:
             self.invoke(mode)
@@ -2191,9 +2208,9 @@ class ContainedLifecycleTests(unittest.TestCase):
         return caught.exception
 
     def test_public_run_composes_bootstrap_existing_workload_monitor_owner_and_finalizer(self):
-        result = self.invoke()
-        self.assertTrue(bench.acceptance_final_predicate(result))
-        self.assertEqual(result["lifecycle_evidence"], "satisfied")
+        result = self.invoke_held()
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertEqual(result["lifecycle_evidence"], "refused")
         self.assertEqual(result["identity"], {"pid": "321", "creation_filetime": str(2**63 + 7)})
         self.assertEqual(len(self.requests), 3)
         self.assertGreaterEqual(self.samples, 3)
@@ -2211,7 +2228,7 @@ class ContainedLifecycleTests(unittest.TestCase):
     def test_main_uses_the_same_complete_public_composition(self):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = bench.main(["--config", str(self.config), "--output", str(self.output), "--acceptance-telemetry"])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)  # Forced readiness alone cannot qualify missing Stage C evidence.
         self.assertEqual(len(self.requests), 3)
         self.assertTrue(self.closed)
 
@@ -2673,14 +2690,14 @@ class ContainedLifecycleTests(unittest.TestCase):
 
     def test_controller_default_duration_is_900_seconds_with_cleanup_reserved(self):
         self.args.acceptance_total_seconds = None
-        result = self.invoke()
+        result = self.invoke_held()
         self.assertAlmostEqual(result["total_deadline"] - result["started_monotonic"], 900)
         self.assertAlmostEqual(result["work_deadline"] - result["started_monotonic"], 890)
         self.assertEqual(result["memory"]["sample_limit"], 3856)
 
     def test_controller_maximum_duration_scales_deadlines_and_sample_cap(self):
         self.args.acceptance_total_seconds = 5400
-        result = self.invoke()
+        result = self.invoke_held()
         self.assertAlmostEqual(result["total_deadline"] - result["started_monotonic"], 5400)
         self.assertAlmostEqual(result["work_deadline"] - result["started_monotonic"], 5390)
         self.assertEqual(result["memory"]["sample_limit"], 21856)
@@ -2695,8 +2712,8 @@ class ContainedLifecycleTests(unittest.TestCase):
             return self.spawn(argv, **kwargs)
         with patch.object(bench, "assert_idle") as idle, \
                 patch.object(bench.subprocess, "Popen", side_effect=spawn):
-            result = self.invoke()
-        self.assertTrue(bench.acceptance_final_predicate(result))
+            result = self.invoke_held()
+        self.assertFalse(bench.acceptance_final_predicate(result))
         self.assertEqual([call.args for call in idle.call_args_list], [(18081,), (18081,)])
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0][commands[0].index("--port") + 1], "18081")
@@ -2704,7 +2721,7 @@ class ContainedLifecycleTests(unittest.TestCase):
 
     def test_controller_uses_six_mib_receipt_cap_and_keeps_other_artifact_caps(self):
         with patch.object(bench, "bounded_write", wraps=bench.bounded_write) as write:
-            self.invoke()
+            self.invoke_held()
         receipt_calls = [call for call in write.call_args_list if call.args[0].name == "lifecycle.json.tmp"]
         self.assertEqual(len(receipt_calls), 1)
         self.assertEqual(receipt_calls[0].kwargs, {"limit": 6 * 1024**2})
@@ -2748,18 +2765,19 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.assertFalse(error.record["worker_complete"])
         self.assertEqual(error.record["workload_evidence"]["cohort"], "frozen-control")
 
-    def invoke_selected(self, mutate=None, selection="short", missing=False, floors=(4, 4)):
+    def invoke_selected(self, mutate=None, selection="short", missing=False, floors=(4, 4), held=False,
+                        worker_evidence=False, cohort=None):
         self.args.acceptance_workload = selection
         self.args.acceptance_physical_gib, self.args.acceptance_commit_gib = floors
         self.args.expected_context = 131072
-        self.args.cohort = "saved-static" if selection == "short" else "automatic"
+        self.args.cohort = cohort or ("saved-static" if selection == "short" else "automatic")
         if selection == "near-full":
             cfg = json.loads(self.config.read_text())
             cfg.setdefault("memory_policy", {"version": 1})
             self.config.write_text(json.dumps(cfg))
         adapter = types.SimpleNamespace(args=self.args, count=StageCSourceTests.count, calls=[], change=None,
             metric_change=None, reference_text="synthetic reference with planted codes",
-            launch_memory=getattr(self, "launch_memory", None))
+            launch_memory=getattr(self, "launch_memory", {"cohort": "static", "sample_status": "unavailable"}))
         base_client = StageCSourceTests.client_type(adapter)
         guards = []
         real_guard, real_workload, real_idle, real_open = (bench.MemoryGuard, bench.acceptance_workload_tests,
@@ -2810,7 +2828,7 @@ class ContainedLifecycleTests(unittest.TestCase):
         def workload(*args):
             real_workload(*args)
             record, save = args[2:4]
-            if not missing:
+            if not missing and not worker_evidence:
                 record["missing_evidence"] = []  # Only this CPU fixture supplies the remaining producer seams.
             save()
         def open_file(path, *args, **kwargs):
@@ -2828,7 +2846,7 @@ class ContainedLifecycleTests(unittest.TestCase):
                 patch.object(bench, "acceptance_workload_tests", side_effect=workload), \
                 patch.object(bench, "acceptance_idle", side_effect=idle), patch.object(Path, "open", open_file), \
                 patch.object(bench.time, "time", side_effect=lambda: 1800000000 + self.now):
-            return self.invoke()
+            return self.invoke_held() if held else self.invoke()
 
 
 class StageCSourceTests(unittest.TestCase):
@@ -3000,7 +3018,7 @@ class StageCSourceTests(unittest.TestCase):
         self.assertEqual(result["executable_provenance"]["saved"]["source_provenance"], "source-unproven")
         self.assertEqual(result["rows"], [])
         self.assertTrue(result["missing_evidence"])
-        self.assertFalse(bench.acceptance_ready())
+        self.assertFalse(bench.acceptance_ready(self.args))
         self.assertEqual(self.saved()["status"], "provisional_complete")
         self.processes[0].terminate.assert_called_once()
         self.processes[0].wait.assert_called_once()
@@ -3454,7 +3472,7 @@ class AcceptanceManifestTests(unittest.TestCase):
              *[str(path.relative_to(self.root)) for path in self.harness]], ["git", "rev-parse", "HEAD"]])
         for call in self.git.call_args_list:
             self.assertEqual(call.kwargs, {"cwd": self.root, "capture_output": True, "timeout": 30, "check": True})
-        self.assertFalse(bench.acceptance_ready())
+        self.assertFalse(bench.acceptance_ready(self.args))
 
     def test_cli_writes_prints_manifest_path_and_returns_zero(self):
         stdout = io.StringIO()
@@ -3909,6 +3927,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         # Imports performed on synthetic trees must not accumulate their paths
         # across otherwise independent controller bootstrap envelopes.
         self.enterContext(patch.object(sys, "path", list(sys.path)))
+        self.real_ready = bench.acceptance_ready
         real_preflight = bench.acceptance_preflight
         self.real_preflight = real_preflight
         self.directory_api = bench.WindowsDirectoryAPI()
@@ -4521,19 +4540,89 @@ class AcceptanceAdmissionTests(unittest.TestCase):
     def test_partial_claim_close_failure_is_not_retried_as_unacknowledged_success(self):
         close, failures = self.directory_api.close, []
         def fail(handle):
-            if threading.current_thread() is not self.case.worker_thread and not failures:
+            if threading.current_thread() is not self.case.worker_thread and receipt_read.called and not failures:
                 failures.append(True)
                 raise OSError("synthetic partial acquisition close failure")
             return close(handle)
-        with patch.object(self.directory_api, "close", side_effect=fail),                 patch.object(self.receipt_api, "read", return_value=b'{"output_claim":'):
+        with patch.object(self.receipt_api, "read", return_value=b'{"output_claim":') as receipt_read, \
+                patch.object(self.directory_api, "close", side_effect=fail):
             result, writes = self.failed_with_controller_writes()
         self.assertEqual(failures, [True])
+        receipt_read.assert_called_once()
         self.assertTrue(result["error"].startswith("JSONDecodeError:"))
         self.assertIn("synthetic partial acquisition close failure", result["cleanup_error"])
         self.assertEqual(writes, [])
         self.assertNotIn("server", self.case.events)
         self.assertFalse((self.case.output / "controller-ack.json").exists())
         self.assertEqual(self.directory_handles, set())
+
+    def test_missing_receipt_close_failure_is_not_retried_as_unacknowledged_success(self):
+        ready, owners, failures, controller_writes = threading.Event(), [], [], []
+        acquire, wait = bench.acceptance_acquire_output, bench.acceptance_wait_for_controller
+        close, create = self.directory_api.close, bench.bounded_create
+        def worker_wait(*args):
+            ready.set()  # The worker has published and is waiting for acknowledgment.
+            return wait(*args)
+        def acquired(*args):
+            self.assertTrue(ready.wait(5), "Worker did not publish its initial receipt")
+            return acquire(*args)
+        def missing(owner):
+            self.assertIn(owner.handle, self.directory_handles)
+            owners.append(owner)
+            raise FileNotFoundError("synthetic missing receipt after directory acquisition")
+        def fail(handle):
+            if threading.current_thread() is not self.case.worker_thread and not failures:
+                self.assertEqual(len(owners), 1)
+                self.assertEqual(handle, owners[0].handle)
+                failures.append(True)
+                raise OSError("synthetic missing receipt acquisition close failure")
+            return close(handle)
+        def created(path, *args, **kwargs):
+            if threading.current_thread() is not self.case.worker_thread and path.parent == self.case.output:
+                controller_writes.append(path)
+            return create(path, *args, **kwargs)
+        with patch.object(bench, "acceptance_wait_for_controller", side_effect=worker_wait), \
+                patch.object(bench, "acceptance_acquire_output", side_effect=acquired) as acquisition, \
+                patch.object(bench.AcceptanceOutputOwner, "open_receipt", missing), \
+                patch.object(self.receipt_api, "read", wraps=self.receipt_api.read) as receipt_read, \
+                patch.object(self.directory_api, "close", side_effect=fail), \
+                patch.object(bench, "bounded_create", side_effect=created), \
+                patch.object(bench, "acceptance_publish_acknowledgment", wraps=bench.acceptance_publish_acknowledgment) as ack:
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(failures, [True])
+        acquisition.assert_called_once()
+        receipt_read.assert_not_called()
+        ack.assert_not_called()
+        self.assertEqual(result["error"], "FileNotFoundError: synthetic missing receipt after directory acquisition")
+        self.assertEqual(result["cleanup_error"], "OSError: synthetic missing receipt acquisition close failure")
+        self.assertEqual(writes, [])
+        self.assertEqual(controller_writes, [])
+        self.assertNotIn("server", self.case.events)
+        self.assertEqual(self.case.requests, [])
+        for name in ("controller-ack.json", "controller.log", "lifecycle.json", "lifecycle.json.tmp", "server.log", "engine.log"):
+            self.assertFalse((self.case.output / name).exists(), name)
+        self.assertFalse(result["finalization"])
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertIs(result["owned_cleanup"], True)
+        self.assertEqual(result["owned_accounting"]["job_active"], 0)
+        self.assertEqual(result["owned_accounting"]["wait_result"], 0)
+        self.assertTrue(self.case.closed)
+        self.assertFalse(self.case.worker_thread.is_alive())
+        self.assertFalse(hasattr(self.case, "child_error"))
+        self.assertIn("cancel-job", self.case.events)
+        self.assertIn("close-job", self.case.events)
+        self.assertIn("close-process", self.case.events)
+        owner, = owners
+        self.assertIsNone(owner.handle)
+        self.assertIsNone(owner.receipt)
+        self.assertFalse(owner.acknowledged)
+        self.assertIsNone(self.worker_args._output_owner.handle)
+        self.assertIsNone(self.worker_args._provisional_file.handle)
+        self.assertIsNone(self.worker_args._engine_log)
+        self.assertEqual(self.directory_handles, set())
+        self.assertEqual(self.receipt_handles, set())
+        self.assertEqual(self.provisional_handles, set())
+        self.assertEqual(self.engine_log_handles, set())
 
     def test_worker_identity_failure_and_failed_acquisition_close_keep_primary_reason(self):
         close, identity, calls, failures = self.directory_api.close, self.directory_api.identity, [], []
@@ -6385,7 +6474,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.assertEqual(self.engine_log_handles, set())
         return result, clones
 
-    def automatic_launch_run(self, *, floors=(8, 8), startup=None, launch=None):
+    def automatic_launch_run(self, *, floors=(8, 8), startup=None, launch=None, refused=False):
         cfg = json.loads(self.case.config.read_text())
         cfg["memory_policy"] = {"version": 1}
         self.case.config.write_text(json.dumps(cfg))
@@ -6401,7 +6490,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
                                     "sample": {"headroom_requested_gib": 8}} if launch is None else launch)
         self.case.engine_startup = (LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED + LaunchEvidenceTests.RECENT
                                    if startup is None else startup)
-        return self.engine_run(selection="near-full", floors=floors)
+        return self.engine_run(selection="near-full", floors=floors, refused=refused)
 
     def test_controller_checks_realized_automatic_launch_and_authenticated_startup_allocations(self):
         result, clones = self.automatic_launch_run()
@@ -6422,20 +6511,21 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.assertEqual(lifecycle["allocation_evidence"], result["allocation_evidence"])
 
     def test_controller_compares_automatic_headroom_with_its_commit_floor_independently(self):
-        result, _ = self.automatic_launch_run(floors=(8, 4))
+        result, _ = self.automatic_launch_run(floors=(8, 4), refused=True)
         self.assertEqual(result["launch_evidence"], {
             "status": "refused", "reason": "Automatic launch headroom exceeds the physical or commit floor."})
         self.assertEqual(result["memory"]["floors_gib"], {"physical": 8, "commit": 4})
 
     def test_controller_missing_recent_allocation_refuses_an_otherwise_available_automatic_launch(self):
-        result, _ = self.automatic_launch_run(startup=LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED)
+        result, _ = self.automatic_launch_run(startup=LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED,
+                                             refused=True)
         self.assertEqual(result["launch_evidence"], {
             "status": "refused", "reason": "Automatic launch recent-cache startup allocation is missing."})
         self.assertIsNone(result["allocation_evidence"]["recent_cache"])
 
     def test_controller_unavailable_automatic_sample_refuses_despite_startup_allocations(self):
         result, _ = self.automatic_launch_run(launch={"cohort": "automatic", "sample_status": "unavailable",
-                                                    "sample": {"headroom_requested_gib": 8}})
+                                                    "sample": {"headroom_requested_gib": 8}}, refused=True)
         self.assertEqual(result["launch_evidence"], {
             "status": "refused", "reason": "Automatic launch sample is unavailable."})
         self.assertEqual(result["allocation_evidence"]["recent_cache"], {"actual_mib": 4525.0, "requested_mib": 4525})
@@ -6443,7 +6533,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
     def test_controller_refuses_a_realized_automatic_sample_in_a_saved_static_arm(self):
         self.case.launch_memory = {"cohort": "automatic", "sample_status": "available",
                                    "sample": {"headroom_requested_gib": 8}}
-        result, _ = self.engine_run()
+        result, _ = self.engine_run(refused=True)
         self.assertEqual(result["launch_evidence"], {
             "status": "refused", "reason": "Realized launch cohort differs from the selected cohort."})
         self.assertEqual(json.loads((self.case.output / "lifecycle.json").read_bytes())["launch_evidence"],
@@ -6498,6 +6588,9 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.assertEqual(bench.run(self.args), 0)
         self.args.acceptance_manifest = manifest
         self.args.write_acceptance_manifest = self.args.manifest_not_after_unix = None
+        self.case.launch_memory = {"cohort": "automatic", "sample_status": "available",
+                                   "sample": {"headroom_requested_gib": 4}}
+        self.case.engine_startup = LaunchEvidenceTests.RECENT
         result, _ = self.engine_run(selection="near-full")
         self.assertTrue(bench.acceptance_final_predicate(result))
         cuda = result["memory"]["cuda"]
@@ -6506,7 +6599,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
 
     def test_manifest_run_missing_one_request_mark_is_refused_evidence(self):
         result, _ = self.engine_run(lambda index: "" if index == 7 else
-                                    "strata trace: 731 MiB free after the completed request\n")
+                                    "strata trace: 731 MiB free after the completed request\n", refused=True)
         cuda = result["memory"]["cuda"]
         self.assertEqual(cuda["status"], "refused")
         self.assertEqual(cuda["errors"], ["Completed-request CUDA marks: 10 of 11 required."])
@@ -6515,7 +6608,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
 
     def test_manifest_run_without_serving_row_is_refused_evidence(self):
         self.case.engine_serving = "strata generate: loading\n"
-        result, _ = self.engine_run()
+        result, _ = self.engine_run(refused=True)
         self.assertEqual(result["memory"]["cuda"]["errors"], ["No enforced serving CUDA-free row was observed."])
 
     def assert_guard_stop(self, result, reason):
@@ -7552,13 +7645,249 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0].acceptance_manifest, self.args.acceptance_manifest)
         self.assertNotIn("create", self.case.events)
 
-    def test_real_ready_hold_with_manifest_still_avoids_all_host_and_process_work(self):
-        with patch.object(bench, "acceptance_ready", return_value=False), \
+    def test_real_readiness_without_manifest_avoids_all_host_and_process_work(self):
+        self.args.acceptance_manifest = None
+        with patch.object(bench, "acceptance_ready", self.real_ready), \
                 self.assertRaisesRegex(RuntimeError, "Acceptance telemetry preparation held"):
             self.case.invoke()
         self.assertEqual(self.case.events, [])
         self.assertEqual(self.case.samples, 0)
         self.assertEqual(json.loads((self.case.output / "results.json").read_text())["status"], "held")
+
+
+class StageCCompositionTests(unittest.TestCase):
+    """Activate the public route with real Stage C owners and synthetic external effects."""
+
+    def setUp(self):
+        ready, preflight, protection = bench.acceptance_ready, bench.acceptance_preflight, bench.acceptance_protection
+        admission = AcceptanceAdmissionTests()
+        admission.setUp()
+        self.addCleanup(admission.doCleanups)
+        self.admission, self.case, self.args = admission, admission.case, admission.args
+        # Restore the actual owners over the older isolated lifecycle fixture's stubs.
+        self.enterContext(patch.object(bench, "acceptance_ready", ready))
+        self.enterContext(patch.object(bench, "acceptance_preflight", preflight))
+        self.enterContext(patch.object(bench, "acceptance_protection", protection))
+        self.selection, self.floors = "short", (4, 4)
+
+    def automatic(self, selection="near-full"):
+        self.selection, self.floors = selection, (8, 8)
+        cfg = json.loads(self.args.config.read_text())
+        cfg["memory_policy"] = {"version": 1}
+        self.args.config.write_text(json.dumps(cfg))
+        self.args.acceptance_workload, self.args.cohort = selection, "automatic"
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 8
+        manifest = self.case.root / "composition-manifest.json"
+        self.args.acceptance_manifest = None
+        self.args.write_acceptance_manifest, self.args.manifest_not_after_unix = manifest, 1800010000.0
+        self.assertEqual(bench.run(self.args), 0)
+        self.args.acceptance_manifest = manifest
+        self.args.write_acceptance_manifest = self.args.manifest_not_after_unix = None
+        self.case.launch_memory = {"cohort": "automatic", "sample_status": "available",
+                                   "sample": {"headroom_requested_gib": 8}}
+        self.case.engine_startup = LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED + LaunchEvidenceTests.RECENT
+
+    def invoke(self):
+        # The helper drives the real workload and guard; it must not fill missing_evidence.
+        return self.case.invoke_selected(selection=self.selection, floors=self.floors, worker_evidence=True,
+                                         cohort=self.args.cohort)
+
+    def refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.invoke()
+        result = caught.exception.record
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertNotIn("pending_stages", result)
+        return result
+
+    def assert_complete(self, result, requests):
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(result["admission"]["status"], "admitted")
+        self.assertIs(result["protection"], True)
+        self.assertEqual(result["protection_evidence"]["status"], "protected")
+        self.assertEqual(result["memory"]["cuda"]["status"], "satisfied")
+        self.assertEqual(result["memory"]["cuda"]["completed_request_rows"], requests)
+        self.assertEqual(result["launch_evidence"], {"status": "satisfied"})
+        self.assertGreaterEqual(result["job_drain_seconds"], 0)
+        self.assertNotIn("pending_stages", result)
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(worker["admission"]["status"], "admitted")
+        self.assertEqual(worker["missing_evidence"], [])
+        self.assertEqual(len(worker["acceptance_cases"]), requests)
+        lifecycle = json.loads((self.case.output / "lifecycle.json").read_bytes())
+        self.assertNotIn("pending_stages", lifecycle)
+        self.assertEqual(lifecycle["job_drain_seconds"], result["job_drain_seconds"])
+        self.assertEqual(lifecycle["status"], "held")  # A saved receipt still cannot assert its own external exit.
+
+    def test_readiness_requires_both_selected_workload_and_manifest(self):
+        for selection, manifest, expected in ((None, None, False), ("short", None, False),
+                (None, self.args.acceptance_manifest, False), ("short", self.args.acceptance_manifest, True),
+                ("near-full", self.args.acceptance_manifest, True)):
+            with self.subTest(selection=selection, manifest=manifest):
+                self.assertIs(bench.acceptance_ready(argparse.Namespace(
+                    acceptance_workload=selection, acceptance_manifest=manifest)), expected)
+        self.assertFalse(bench.acceptance_ready(argparse.Namespace()))
+        with self.assertRaisesRegex(RuntimeError, "^Acceptance manifest is required\\.$"):
+            bench.acceptance_preflight(argparse.Namespace())
+
+    def test_short_static_full_public_composition_passes(self):
+        self.assert_complete(self.invoke(), 11)
+
+    def test_near_full_automatic_full_public_composition_passes(self):
+        self.automatic()
+        self.assert_complete(self.invoke(), 3)
+
+    def test_short_automatic_full_public_composition_passes(self):
+        self.automatic("short")
+        self.assert_complete(self.invoke(), 11)
+
+    def test_final_predicate_requires_each_stage_c_evidence_field(self):
+        complete = self.invoke()
+        self.assert_complete(complete, 11)
+        for key, path in (("admission", ("admission",)), ("protection", ("protection",)),
+                          ("CUDA", ("memory", "cuda")), ("launch", ("launch_evidence",))):
+            for replacement in (None, {"status": "refused"}):
+                changed = bench.copy.deepcopy(complete)
+                target = changed
+                for part in path[:-1]:
+                    target = target[part]
+                if replacement is None:
+                    target.pop(path[-1])
+                else:
+                    target[path[-1]] = replacement
+                with self.subTest(evidence=key, replacement=replacement):
+                    self.assertFalse(bench.acceptance_final_predicate(changed))
+
+    def test_missing_controller_admission_refuses_before_resource_or_process_entry(self):
+        manifest = json.loads(self.args.acceptance_manifest.read_bytes())
+        manifest["not_after_unix"] = 1800000500.0
+        self.args.acceptance_manifest.write_text(json.dumps(manifest))
+        result = self.refused()
+        self.assertEqual(result["admission"]["status"], "refused")
+        self.assertEqual(self.case.samples, 0)
+        self.assertEqual(self.case.events, [])
+
+    def test_missing_worker_admission_refuses_before_server(self):
+        assign = self.case.native.assign
+        def changed(job, handle):
+            assign(job, handle)
+            self.admission.extra[0].write_bytes(b"changed after controller admission")
+        with patch.object(self.case.native, "assign", side_effect=changed):
+            result = self.refused()
+        self.assertEqual(result["admission"]["status"], "admitted")
+        self.assertEqual(result["worker_exit"], 1)
+        self.assertEqual(result["error"], "RuntimeError: Worker exited unsuccessfully.")
+        self.assertNotIn("server", self.case.events)
+
+    def test_missing_post_exit_protection_refuses(self):
+        capture, changed = self.case.native.capture, []
+        def mutate(pipe):
+            result = capture(pipe)
+            if self.case.code == 0 and not changed:
+                changed.append(True)
+                self.admission.extra[0].write_bytes(b"changed after worker exit")
+            return result
+        with patch.object(self.case.native, "capture", side_effect=mutate):
+            result = self.refused()
+        self.assertEqual(changed, [True])
+        self.assertIs(result["protection"], False)
+        self.assertTrue(result["worker_complete"])
+        self.assertEqual(result["memory"]["cuda"]["status"], "satisfied")
+        self.assertEqual(result["launch_evidence"]["status"], "satisfied")
+
+    def test_missing_cuda_request_row_refuses_an_otherwise_complete_run(self):
+        self.case.engine_mark = lambda index: ("" if index == 11 else
+            "strata trace: 731 MiB free after the completed request\n")
+        result = self.refused()
+        self.assertEqual(result["memory"]["cuda"]["errors"], ["Completed-request CUDA marks: 10 of 11 required."])
+        self.assertTrue(result["worker_complete"])
+        self.assertTrue(result["protection"])
+        self.assertEqual(result["launch_evidence"]["status"], "satisfied")
+
+    def test_missing_launch_record_refuses_static_worker_with_no_worker_owned_evidence_gap(self):
+        self.case.launch_memory = None
+        result = self.refused()
+        self.assertEqual(result["launch_evidence"], {"status": "refused", "reason": "Launch memory evidence is unavailable."})
+        self.assertTrue(result["worker_complete"])
+        self.assertEqual(result["workload_evidence"]["missing_evidence"], [])
+
+    def test_unavailable_automatic_sample_is_the_only_worker_owned_missing_evidence(self):
+        self.automatic()
+        self.case.launch_memory = {"cohort": "automatic", "sample_status": "unavailable", "sample": None}
+        result = self.refused()
+        self.assertEqual(result["workload_evidence"]["missing_evidence"], ["Server's once-refreshed automatic policy sample."])
+        self.assertFalse(result["worker_complete"])
+        self.assertEqual(result["launch_evidence"], {"status": "refused", "reason": "Automatic launch sample is unavailable."})
+
+    def test_missing_automatic_startup_allocation_is_controller_owned(self):
+        self.automatic()
+        self.case.engine_startup = LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED
+        result = self.refused()
+        self.assertTrue(result["worker_complete"])
+        self.assertEqual(result["workload_evidence"]["missing_evidence"], [])
+        self.assertEqual(result["launch_evidence"], {
+            "status": "refused", "reason": "Automatic launch recent-cache startup allocation is missing."})
+
+    def drain(self, *, never=False):
+        capture, active, sleep = self.case.native.capture, self.case.native.active, self.case.sleep
+        polls, counts = [], []
+        def captured(pipe):
+            result = capture(pipe)
+            if self.case.code == 0:
+                polls.append(self.case.now)
+            return result
+        def counted(job):
+            if self.case.code == 0 and not self.case.killed:
+                value = int(never or len(polls) <= 3)
+                counts.append((len(polls), value))
+                return value
+            return active(job)
+        def slept(seconds):
+            if self.case.code == 0:
+                with self.case.clock_lock:
+                    self.case.now += seconds
+            else:
+                sleep(seconds)
+        self.enterContext(patch.object(self.case.native, "capture", side_effect=captured))
+        self.enterContext(patch.object(self.case.native, "active", side_effect=counted))
+        self.enterContext(patch.object(bench.time, "sleep", side_effect=slept))
+        return polls, counts
+
+    def test_job_count_one_for_three_post_exit_polls_then_zero_passes(self):
+        polls, counts = self.drain()
+        result = self.invoke()
+        self.assert_complete(result, 11)
+        self.assertEqual(len(polls), 4)
+        for poll in (1, 2, 3):
+            self.assertEqual({count for index, count in counts if index == poll}, {1})
+        self.assertEqual({count for index, count in counts if index == 4}, {0})
+        self.assertGreaterEqual(result["job_drain_seconds"], 0.75)
+        self.assertLess(result["job_drain_seconds"], 2)
+        self.assertFalse(self.case.killed)
+
+    def test_job_never_empty_refuses_at_work_deadline_with_owned_cleanup(self):
+        polls, counts = self.drain(never=True)
+        result = self.refused()
+        self.assertEqual(result["error"], "TimeoutError: Job members remained after worker exit.")
+        self.assertEqual(result["worker_exit"], 0)
+        self.assertTrue(all(count == 1 for _, count in counts))
+        self.assertGreater(len(polls), 3)
+        self.assertGreaterEqual(result["job_drain_seconds"],
+                                result["work_deadline"] - result["worker_observed_exit_monotonic"])
+        self.assertTrue(result["owned_cleanup"])
+        self.assertTrue(result["within_deadline"])
+        self.assertTrue(self.case.killed)
+        self.assertLessEqual(result["memory"]["max_gap_seconds"], 1)
+
+    def test_nonzero_exit_refuses_immediately_without_waiting_for_job_drain(self):
+        polls, _ = self.drain(never=True)
+        with patch.object(self.case.native, "exit_code", return_value=7):
+            result = self.refused()
+        self.assertEqual(result["worker_exit"], 7)
+        self.assertEqual(result["error"], "RuntimeError: Worker exited unsuccessfully.")
+        self.assertNotIn("job_drain_seconds", result)
+        self.assertEqual(len(polls), 1)
+        self.assertLess(result["worker_observed_exit_monotonic"], result["work_deadline"])
 
 
 class AcceptanceProtectionTests(unittest.TestCase):
@@ -7943,7 +8272,7 @@ class StageCRepairTests(unittest.TestCase):
                     self.assertFalse(caught.exception.record["worker_complete"])
                     self.assertIn("workload_error", caught.exception.record)
                 else:
-                    self.assertTrue(bench.acceptance_final_predicate(case.invoke_selected()))
+                    self.assertFalse(bench.acceptance_final_predicate(case.invoke_selected(held=True)))
             finally:
                 case.doCleanups()
 
@@ -8001,8 +8330,8 @@ class StageCRepairTests(unittest.TestCase):
         for selection in ("short", "near-full"):
             case = self.contained()
             try:
-                result = case.invoke_selected(selection=selection)
-                self.assertTrue(bench.acceptance_final_predicate(result))
+                result = case.invoke_selected(selection=selection, held=True)
+                self.assertFalse(bench.acceptance_final_predicate(result))
                 self.assertTrue(result["worker_complete"])
                 saved = json.loads((case.output / "provisional.json").read_bytes())
                 self.assertEqual(len(saved["acceptance_cases"]), 11 if selection == "short" else 3)
@@ -8332,7 +8661,7 @@ class NormalComparisonTests(unittest.TestCase):
                 patch.object(bench.subprocess, "Popen", side_effect=spawn), \
                 patch.object(prep, "memory_snapshot", side_effect=lambda: dict(case.sample(), **sample)), \
                 patch.object(prep.setup, "gpu_info", return_value={"index": 0, "vram_gb": 6}):
-            result = case.invoke_selected(selection="near-full")
+            result = case.invoke_selected(selection="near-full", held=True)
         self.assertEqual(len(observed), 1)
         worker = json.loads((case.output / "provisional.json").read_text())
         for record in (worker, result):
@@ -8346,10 +8675,10 @@ class NormalComparisonTests(unittest.TestCase):
         self.assertTrue(worker["acceptance_workload_passed"])
         self.assertTrue(worker["timing_diagnostic"])
         self.assertTrue(result["worker_complete"])
-        self.assertTrue(bench.acceptance_final_predicate(result))  # Existing CPU lifecycle predicate only.
+        self.assertFalse(bench.acceptance_final_predicate(result))  # The isolated fixture has no manifest.
         self.assertEqual(json.loads((case.output / "lifecycle.json").read_text())["status"], "held")
         case.doCleanups()
-        self.assertFalse(bench.acceptance_ready())
+        self.assertFalse(bench.acceptance_ready(argparse.Namespace()))
 
     def test_automatic_unbound_retains_diagnostics_unknowns_and_failed_workload_evidence(self):
         unknown = "STRATA_PRIVATE_UNKNOWN_SENTINEL"
@@ -8841,8 +9170,8 @@ class NormalComparisonTests(unittest.TestCase):
                             {"env": {"CUDA_MODULE_LOADING": "EAGER", "STRATA_FILE_COPY_READY": "0"}}, {})
                 with self.subTest(mutation=mutation), \
                         patch.dict(bench.os.environ, {"STRATA_UNSEEN_CONSUMER_TREATMENT": "PRIVATE-UNKNOWN-SENTINEL"}, clear=True):
-                    result = case.invoke_selected(mutate)
-                self.assertTrue(bench.acceptance_final_predicate(result))
+                    result = case.invoke_selected(mutate, held=True)
+                self.assertFalse(bench.acceptance_final_predicate(result))
                 self.assertTrue(result["worker_complete"])
                 self.assertFalse(result["normal_comparison"]["eligible"])
                 self.assertFalse(result["normal_comparison"]["complete"])
@@ -8864,8 +9193,8 @@ class NormalComparisonTests(unittest.TestCase):
                     cfg["env"] = {"STRATA_UNSEEN_LATER_CONTROL": ""}
                     case.config.write_text(json.dumps(cfg))
                 with patch.dict(bench.os.environ, environment, clear=True):
-                    result = case.invoke_selected()
-                self.assertTrue(bench.acceptance_final_predicate(result))
+                    result = case.invoke_selected(held=True)
+                self.assertFalse(bench.acceptance_final_predicate(result))
                 self.assertTrue(result["worker_complete"])
                 self.assertTrue(result["normal_comparison"]["complete"])
                 self.assertFalse(result["normal_comparison"]["eligible"])
@@ -8874,7 +9203,7 @@ class NormalComparisonTests(unittest.TestCase):
                 self.assertEqual(json.loads((case.output / "lifecycle.json").read_text())["status"], "held")
             finally:
                 case.doCleanups()
-        self.assertFalse(bench.acceptance_ready())
+        self.assertFalse(bench.acceptance_ready(argparse.Namespace()))
         self.assertFalse(bench.acceptance_protection(None, None))
         with self.assertRaisesRegex(RuntimeError, "^Acceptance manifest is required\\.$"):
             bench.acceptance_preflight(None)
