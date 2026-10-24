@@ -5,11 +5,13 @@ import argparse
 import contextlib
 import ctypes
 import hashlib
+import hmac
 import io
 import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -1285,6 +1287,8 @@ class ContainedLifecycleTests(unittest.TestCase):
                 pipe.envelope = pipe.getvalue()
         self.root_proc.stdin = StartPipe()
         self.code, self.assigned, self.killed, self.closed = None, False, False, False
+        self.worker_thread = None
+        self.clock_lock = threading.RLock()
         self.stage = None
         self.cleanup = contextlib.ExitStack()
         self.addCleanup(self.cleanup.close)
@@ -1322,12 +1326,16 @@ class ContainedLifecycleTests(unittest.TestCase):
             self.cleanup.enter_context(item)
 
     def clock(self):
-        self.now += 0.001
-        return self.now
+        with self.clock_lock:
+            self.now += 0.001
+            return self.now
 
     def sleep(self, seconds):
         self.assertGreaterEqual(seconds, 0)
-        self.now += seconds
+        with self.clock_lock:
+            self.now += min(seconds, 0.001) if self.worker_thread is not None else seconds
+        if self.worker_thread is not None:
+            threading.Event().wait(0.001)  # Let the contained CPU worker and controller exchange artifacts.
 
     def git(self, argv, **kwargs):
         self.assertEqual(argv[0], "git", "Unintercepted external command")
@@ -1342,6 +1350,7 @@ class ContainedLifecycleTests(unittest.TestCase):
         if self.mode == "blocked-admission":
             self.stage = "admission"
             raise self.BlockedChild()
+        return {"status": "admitted"}
 
     def sample(self):
         self.samples += 1
@@ -1443,6 +1452,8 @@ class ContainedLifecycleTests(unittest.TestCase):
             t = self.t
             t.events.append("cancel-job")
             t.killed = True
+            if t.worker_thread is not None:
+                t.now = max(t.now, json.loads(t.bootstrap_settings)["work_deadline"] + 0.01)
             if t.mode == "guard-cleanup":
                 raise OSError("synthetic cancel failure")
             if t.mode != "survivor":
@@ -1478,6 +1489,9 @@ class ContainedLifecycleTests(unittest.TestCase):
         def close_process(self, proc):
             if self.t.mode == "process-close-fail":
                 raise OSError("process close failed")
+            if self.t.worker_thread is not None:
+                self.t.worker_thread.join(5)
+                self.t.assertFalse(self.t.worker_thread.is_alive(), "Contained CPU worker did not finish")
             self.t.events.append("close-process")
             self.t.closed = True
 
@@ -1494,14 +1508,22 @@ class ContainedLifecycleTests(unittest.TestCase):
                         item = json.loads(envelope)
                         item["identity"]["creation_filetime"] = "01"
                         envelope = json.dumps(item) + "\n"
-                    try:
-                        t.code = bench.worker_bootstrap(io.StringIO(envelope), bench.acceptance_worker, pid=321,
-                                                       settings=t.bootstrap_settings)
-                    except t.BlockedChild:
-                        pass  # A parked external syscall: the process, not the controller, is blocked.
-                    except BaseException as exc:
-                        t.child_error = exc
-                        t.code = 1
+                    def execute():
+                        try:
+                            t.code = bench.worker_bootstrap(io.StringIO(envelope), bench.acceptance_worker, pid=321,
+                                                           settings=t.bootstrap_settings)
+                        except t.BlockedChild:
+                            pass  # A parked external syscall: the process, not the controller, is blocked.
+                        except BaseException as exc:
+                            t.child_error = exc
+                            t.code = 1
+                    if getattr(t.args, "acceptance_manifest", None) is None:
+                        execute()
+                    else:
+                        t.worker_thread = threading.Thread(target=execute, daemon=True)
+                        t.worker_thread.start()
+            if t.worker_thread is not None:
+                threading.Event().wait(0.001)
             return (b"X" * (bench.ACCEPTANCE_LOG_LIMIT + 1) if t.mode == "capture-overflow" else b"",
                     t.code is not None and t.mode != "blocked-capture")
 
@@ -2092,18 +2114,24 @@ class ContainedLifecycleTests(unittest.TestCase):
             metric_change=None, reference_text="synthetic reference with planted codes")
         base_client = StageCSourceTests.client_type(adapter)
         guards = []
-        real_guard, real_workload, real_idle, real_read = (bench.MemoryGuard, bench.acceptance_workload_tests,
-                                                         bench.acceptance_idle, Path.read_bytes)
+        real_guard, real_workload, real_idle, real_open = (bench.MemoryGuard, bench.acceptance_workload_tests,
+                                                         bench.acceptance_idle, Path.open)
         def make_guard(*args, **kwargs):
             guard = real_guard(*args, **kwargs)
+            monitor = guard.monitor
+            def sample(*args, **kwargs):
+                with self.clock_lock:
+                    return monitor(*args, **kwargs)
+            guard.monitor = sample
             guards.append(guard)
             return guard
         def advance(seconds):
             while seconds > 0:
                 step = min(0.25, seconds)
-                self.now += step
-                seconds -= step
-                guards[0].monitor(once=True)  # Simulate the independent controller sampler during worker time.
+                with self.clock_lock:
+                    self.now += step
+                    seconds -= step
+                    guards[0].monitor(once=True)  # Advance the one external sampler without overlapping a read.
         class Client(base_client):
             def chat(client, *args, **kwargs):
                 response = super().chat(*args, **kwargs)
@@ -2120,19 +2148,20 @@ class ContainedLifecycleTests(unittest.TestCase):
             if not missing:
                 record["missing_evidence"] = []  # Only this CPU fixture supplies the remaining producer seams.
             save()
-        def read(path):
-            data = real_read(path)
-            if mutate and path == self.output / "provisional.json" and self.code == 0:
-                item = json.loads(data)
+        def open_file(path, *args, **kwargs):
+            stream = real_open(path, *args, **kwargs)
+            if mutate and path == self.output / "provisional.json" and self.code == 0 and args == ("rb",):
+                with stream:
+                    item = json.loads(stream.read(bench.ACCEPTANCE_LOG_LIMIT + 1))
                 mutate(item)
-                return json.dumps(item).encode()
-            return data
+                return io.BytesIO(json.dumps(item).encode())
+            return stream
         with patch.object(bench, "MemoryGuard", side_effect=make_guard), \
                 patch.object(bench, "load_workload", return_value=validation), \
                 patch.object(bench, "prompt_counter", return_value=StageCSourceTests.count), \
                 patch.object(bench, "check_authentication"), \
                 patch.object(bench, "acceptance_workload_tests", side_effect=workload), \
-                patch.object(bench, "acceptance_idle", side_effect=idle), patch.object(Path, "read_bytes", read), \
+                patch.object(bench, "acceptance_idle", side_effect=idle), patch.object(Path, "open", open_file), \
                 patch.object(bench.time, "time", side_effect=lambda: 1800000000 + self.now):
             return self.invoke()
 
@@ -3169,6 +3198,3189 @@ class AcceptanceManifestTests(unittest.TestCase):
         link.assert_not_called()
         self.assertFalse(self.args.write_acceptance_manifest.exists())
         self.assertEqual(set(self.root.iterdir()), before)
+
+
+class AcceptanceAdmissionTests(unittest.TestCase):
+    """Real manifest writer and preflight through the contained CPU lifecycle."""
+
+    def setUp(self):
+        # Imports performed on synthetic trees must not accumulate their paths
+        # across otherwise independent controller bootstrap envelopes.
+        self.enterContext(patch.object(sys, "path", list(sys.path)))
+        real_preflight = bench.acceptance_preflight
+        self.real_preflight = real_preflight
+        self.directory_api = bench.WindowsDirectoryAPI()
+        self.provisional_api = bench.WindowsProvisionalAPI()
+        self.receipt_api = bench.WindowsReceiptAPI()
+        self.case = case = ContainedLifecycleTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        self.enterContext(patch.object(bench, "WindowsDirectoryAPI", return_value=self.directory_api))
+        self.enterContext(patch.object(bench, "WindowsProvisionalAPI", return_value=self.provisional_api))
+        self.enterContext(patch.object(bench, "WindowsReceiptAPI", return_value=self.receipt_api))
+        self.root, self.args = case.root, case.args
+        self.enterContext(patch.object(bench, "ROOT", self.root))
+        self.enterContext(patch.object(bench, "WORKLOADS", self.root / "workloads"))
+        self.enterContext(patch.object(bench.time, "time", side_effect=lambda: 1800000000 + case.now))
+        self.head = "0123456789abcdef0123456789abcdef01234567"
+        self.git_calls = []
+
+        def git(argv, **kwargs):
+            self.assertEqual(argv[0], "git")
+            self.git_calls.append((argv, kwargs))
+            return types.SimpleNamespace(stdout=(self.head + "\n").encode() if argv[1] == "rev-parse" else b"")
+
+        self.enterContext(patch.object(bench.subprocess, "run", side_effect=git))
+        self.before_preflight = None
+        self.worker_args = None
+
+        def preflight(args):
+            self.worker_args = args
+            case.events.append("admission")
+            self.assertTrue(case.assigned)
+            self.assertTrue(case.started)
+            if self.before_preflight:
+                self.before_preflight(args)
+            from tools import prepare_unsloth_q2 as preparation
+            snapshot = preparation.memory_snapshot
+            samples = []
+            def observed():
+                if threading.current_thread() is case.worker_thread:
+                    samples.append(True)
+                return snapshot()
+            try:
+                with patch.object(preparation, "memory_snapshot", side_effect=observed):
+                    return real_preflight(args)
+            finally:
+                self.preflight_samples = len(samples)
+                self.preflight_output_exists = args.output.exists()
+
+        self.enterContext(patch.object(bench, "acceptance_preflight", side_effect=preflight))
+        self.saved = self.root / "saved.exe"
+        self.shard, self.pack = self.root / "shard.gguf", self.root / "pack"
+        self.pack_data = self.pack / "experts.bin"
+        self.extra = [self.root / "launcher.bat", self.root / "other.txt"]
+        tokenizer = self.root / "tokenizer"
+        files = [self.saved, self.shard, self.pack_data, self.pack / "native_experts.txt", *self.extra,
+                 *bench.acceptance_harness_paths(),
+                 *[tokenizer / name for name in ("vocab.json", "merges.txt", "token_type.json", "chat_template.jinja")]]
+        for path in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic input, never executed")
+        stat = self.shard.stat()
+        (self.pack / "source-verification.json").write_text(json.dumps({"shard.gguf": {
+            "path": str(self.shard), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+            "sha256": hashlib.sha256(self.shard.read_bytes()).hexdigest()}}))
+        cfg = json.loads(case.config.read_text())
+        cfg.update(exe=str(self.saved), tokenizer=str(tokenizer),
+                   args=["--pack", str(self.pack), "--native", str(self.shard), "--max-context", "131072"])
+        case.config.write_text(json.dumps(cfg))
+        self.args.acceptance_workload, self.args.cohort = "short", "saved-static"
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 4
+        self.args.expected_context, self.args.port = 131072, 8081
+        self.args.candidate_exe, self.args.protect_input = None, [str(path) for path in self.extra]
+        self.args.acceptance_total_seconds = None
+        self.args.write_acceptance_manifest = self.root / "manifest.json"
+        self.args.manifest_not_after_unix = 1800010000.0
+        self.assertEqual(bench.run(self.args), 0)
+        self.assertEqual(case.events, [])
+        self.assertEqual(case.samples, 0)
+        self.assertFalse(case.output.exists())
+        self.args.acceptance_manifest = self.args.write_acceptance_manifest
+        self.args.write_acceptance_manifest = self.args.manifest_not_after_unix = None
+        self.manifest = bench.load_acceptance_manifest(self.args.acceptance_manifest)
+        self.digest = hashlib.sha256(self.args.acceptance_manifest.read_bytes()).hexdigest()
+        self.git_calls.clear()
+        self.directory_handles = set()
+        handles_lock = threading.Lock()
+        native_open, native_close = self.directory_api.open, self.directory_api.close
+        def opened(*args, **kwargs):
+            with handles_lock:
+                handle = native_open(*args, **kwargs)
+                self.directory_handles.add(handle)
+                return handle
+        def closed(handle):
+            with handles_lock:
+                native_close(handle)
+                self.directory_handles.remove(handle)
+        self.enterContext(patch.object(self.directory_api, "open", side_effect=opened))
+        self.enterContext(patch.object(self.directory_api, "close", side_effect=closed))
+        self.addCleanup(lambda: self.assertEqual(self.directory_handles, set(), "Unclosed directory authorities"))
+        self.provisional_handles = set()
+        provisional_open, provisional_close = self.provisional_api.open, self.provisional_api.close
+        def opened_provisional(path):
+            handle = provisional_open(path)
+            self.provisional_handles.add(handle)
+            return handle
+        def closed_provisional(handle):
+            provisional_close(handle)
+            self.provisional_handles.remove(handle)
+        self.enterContext(patch.object(self.provisional_api, "open", side_effect=opened_provisional))
+        self.enterContext(patch.object(self.provisional_api, "close", side_effect=closed_provisional))
+        self.addCleanup(lambda: self.assertEqual(self.provisional_handles, set(), "Unclosed provisional handles"))
+        self.receipt_handles, self.receipt_opens, self.receipt_events = set(), [], []
+        receipt_open, receipt_close = self.receipt_api.open, self.receipt_api.close
+        def opened_receipt(path):
+            handle = receipt_open(path)
+            self.receipt_handles.add(handle)
+            self.receipt_opens.append(handle)
+            self.receipt_events.append(("open", handle))
+            return handle
+        def closed_receipt(handle):
+            receipt_close(handle)
+            self.receipt_handles.remove(handle)
+            self.receipt_events.append(("close", handle))
+        self.enterContext(patch.object(self.receipt_api, "open", side_effect=opened_receipt))
+        self.enterContext(patch.object(self.receipt_api, "close", side_effect=closed_receipt))
+        self.addCleanup(lambda: self.assertEqual(self.receipt_handles, set(), "Unclosed controller receipt handles"))
+
+    def test_windows_atomic_birth_and_overlapping_handles_prevent_replacement_until_both_close(self):
+        output, moved = self.root / "atomic-output", self.root / "moved-output"
+        original_mkdir = Path.mkdir
+        def no_mkdir(path, *args, **kwargs):
+            self.assertNotEqual(path, output, "Birth authority must come from the native create operation")
+            return original_mkdir(path, *args, **kwargs)
+        with patch.object(Path, "mkdir", no_mkdir):
+            worker = bench.AcceptanceOutputOwner(output, str(output), create=True)
+        controller = None
+        try:
+            self.assertIsNotNone(worker.handle)
+            self.assertTrue(output.is_dir())
+            self.assertNotEqual(worker.identity[1], "0" * 32)
+            with self.assertRaises(PermissionError):
+                output.rename(moved)
+            with self.assertRaises(PermissionError):
+                output.rmdir()
+            with self.assertRaises(FileExistsError):
+                bench.AcceptanceOutputOwner(output, str(output), create=True)
+            controller = bench.AcceptanceOutputOwner(output, str(output))
+            self.assertEqual(controller.identity, worker.identity)
+            self.assertNotEqual(controller.handle, worker.handle)
+            worker.close()
+            with self.assertRaises(PermissionError):
+                output.rename(moved)
+            with self.assertRaises(PermissionError):
+                output.rmdir()
+            controller.validate()
+        finally:
+            worker.close()
+            if controller is not None:
+                controller.close()
+        output.rename(moved)
+        self.assertTrue(moved.is_dir())
+        self.assertFalse(output.exists())
+        output.mkdir()
+        self.assertTrue(output.is_dir())
+
+    def test_worker_post_native_create_pre_identity_replacement_is_denied(self):
+        original = self.directory_api.open
+        moved, attempts = self.root / "post-create-owned", []
+        foreign = self.root / "pre-claim-foreign"
+        contents = self.foreign_artifacts(foreign)
+        def open_directory(path, **kwargs):
+            handle = original(path, **kwargs)
+            if kwargs.get("create"):
+                self.assertFalse((path / "provisional.json").exists())
+                with self.assertRaises(PermissionError):
+                    path.rename(moved)
+                with self.assertRaises(PermissionError):
+                    foreign.replace(path)
+                attempts.append(handle)
+            return handle
+        with patch.object(self.directory_api, "open", side_effect=open_directory):
+            result = self.case.invoke_selected()
+        self.assertEqual(len(attempts), 1)
+        self.assertFalse(moved.exists())
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual({p.name: p.read_bytes() for p in foreign.iterdir()}, contents)
+        self.assertIsNone(self.worker_args._output_owner.handle)
+
+    def publication_deadline_refused(self, offset, *, acknowledgment=False):
+        flush, wait = self.provisional_api.flush, bench.acceptance_wait_for_controller
+        crossed = []
+        def flushed(handle):
+            result = flush(handle)
+            if not acknowledgment and not crossed:
+                self.case.now = self.worker_args._acceptance_deadline + offset
+                crossed.append(self.case.now - self.worker_args._acceptance_deadline)
+            return result
+        def acquired(*args):
+            wait(*args)
+            if acknowledgment:
+                self.case.now = self.worker_args._acceptance_deadline + offset
+                crossed.append(self.case.now - self.worker_args._acceptance_deadline)
+        with patch.object(self.provisional_api, "flush", side_effect=flushed), \
+                patch.object(bench, "acceptance_wait_for_controller", side_effect=acquired), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(len(crossed), 1)
+        self.assertAlmostEqual(crossed[0], offset)
+        self.assertNotIn("server", self.case.events)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertIsNone(self.worker_args._output_owner.handle)
+
+    def test_claim_publication_at_deadline_equality_never_starts_server(self):
+        self.publication_deadline_refused(0.0)
+
+    def test_claim_publication_one_ms_after_deadline_never_starts_server(self):
+        self.publication_deadline_refused(0.001)
+
+    def test_acknowledgment_at_deadline_equality_never_starts_server(self):
+        self.publication_deadline_refused(0.0, acknowledgment=True)
+
+    def test_acknowledgment_one_ms_after_deadline_never_starts_server(self):
+        self.publication_deadline_refused(0.001, acknowledgment=True)
+
+    def post_second_proof_attack(self, *, populated=False, symlink=False):
+        foreign, moved = self.root / "post-proof-foreign", self.root / "post-proof-owned"
+        contents = self.foreign_artifacts(foreign) if populated else {}
+        if not populated:
+            foreign.mkdir()
+        claimed = bench.acceptance_claimed_output
+        proofs = []
+        def prove(*args, **kwargs):
+            record = claimed(*args, **kwargs)
+            if self.case.closed:
+                proofs.append(True)
+                if len(proofs) == 2:
+                    self.assertIsNotNone(kwargs["owner"].handle)
+                    with self.assertRaises(PermissionError):
+                        self.case.output.rename(moved)
+                    if symlink:
+                        with self.assertRaises(FileExistsError):
+                            self.case.output.symlink_to(foreign, target_is_directory=True)
+                    else:
+                        with self.assertRaises(PermissionError):
+                            foreign.replace(self.case.output)
+            return record
+        with patch.object(bench, "acceptance_claimed_output", side_effect=prove):
+            result = self.case.invoke_selected()
+        self.assertEqual(proofs, [True, True])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertFalse(moved.exists())
+        self.assertFalse(self.case.output.is_symlink())
+        self.assertEqual({p.name: p.read_bytes() for p in foreign.iterdir()}, contents)
+        self.assertTrue((self.case.output / "lifecycle.json").is_file())
+
+    def test_post_second_proof_empty_directory_replacement_is_denied(self):
+        self.post_second_proof_attack()
+
+    def test_post_second_proof_populated_directory_replacement_preserves_foreign_bytes(self):
+        self.post_second_proof_attack(populated=True)
+
+    def test_post_second_proof_symlink_replacement_preserves_foreign_bytes(self):
+        self.post_second_proof_attack(populated=True, symlink=True)
+
+    def controller_name_refused(self, name):
+        contents = {}
+        def protection(args):
+            (args.output / name).write_bytes(b"pre-existing foreign controller bytes")
+            contents.update({p.name: p.read_bytes() for p in args.output.iterdir()})
+            return True
+        with patch.object(bench, "acceptance_protection", side_effect=protection), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(caught.exception.record["finalization_error"], "FileExistsError: Controller artifact already exists.")
+        self.assertFalse(caught.exception.record["finalization"])
+        self.assertEqual({p.name: p.read_bytes() for p in self.case.output.iterdir()}, contents)
+
+    def test_preexisting_controller_log_refuses_without_replacement(self):
+        self.controller_name_refused("controller.log")
+
+    def test_preexisting_former_lifecycle_staging_name_is_foreign_and_refuses_untouched(self):
+        # The controller no longer stages lifecycle.json, so this name is only a foreign entry.
+        contents = {}
+        def protection(args):
+            (args.output / "lifecycle.json.tmp").write_bytes(b"pre-existing foreign controller bytes")
+            contents.update({p.name: p.read_bytes() for p in args.output.iterdir()})
+            return True
+        with patch.object(bench, "acceptance_protection", side_effect=protection), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(caught.exception.record["finalization_error"],
+                         "RuntimeError: Unexpected or oversized retained artifacts.")
+        self.assertFalse(caught.exception.record["finalization"])
+        after = {p.name: p.read_bytes() for p in self.case.output.iterdir()}
+        self.assertEqual({name: after[name] for name in contents}, contents)
+        self.assertEqual(set(after) - set(contents), {"controller.log", "lifecycle.json"})
+
+    def test_preexisting_lifecycle_destination_refuses_without_replacement(self):
+        self.controller_name_refused("lifecycle.json")
+
+    def test_controller_acquisition_failure_never_acknowledges_or_starts_server(self):
+        original = self.directory_api.open
+        failures = []
+        def open_directory(*args, **kwargs):
+            if threading.current_thread() is not self.case.worker_thread and self.case.output.exists():
+                failures.append(True)
+                raise PermissionError("synthetic controller acquisition failure")
+            return original(*args, **kwargs)
+        with patch.object(self.directory_api, "open", side_effect=open_directory):
+            result, writes = self.failed_with_controller_writes()
+        self.assertTrue(failures)
+        self.assertEqual(writes, [])
+        self.assertNotIn("server", self.case.events)
+        self.assertIn("synthetic controller acquisition failure", result["error"])
+        self.assertFalse((self.case.output / "controller-ack.json").exists())
+        self.assertIsNone(self.worker_args._output_owner.handle)
+
+    def test_controller_handle_identity_mismatch_never_acknowledges_or_starts_server(self):
+        original, calls = self.directory_api.identity, []
+        def identity(handle):
+            result = original(handle)
+            if threading.current_thread() is not self.case.worker_thread:
+                calls.append(handle)
+                if len(calls) == 1:
+                    return result[0] + 1, result[1]
+            return result
+        with patch.object(self.directory_api, "identity", side_effect=identity):
+            result, writes = self.failed_with_controller_writes()
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(writes, [])
+        self.assertNotIn("server", self.case.events)
+        self.assertIn("Worker output identity differs.", result["error"])
+        self.assertFalse((self.case.output / "controller-ack.json").exists())
+
+    def test_partial_claim_is_retried_without_ack_until_strict_parse_succeeds(self):
+        # The controller reads only through its retained receipt handle, never by path.
+        original, partial = self.receipt_api.read, []
+        def read(handle, limit):
+            if not partial:
+                partial.append(handle)
+                self.assertNotIn("server", self.case.events)
+                self.assertFalse((self.case.output / "controller-ack.json").exists())
+                return b'{"output_claim":'
+            return original(handle, limit)
+        with patch.object(self.receipt_api, "read", side_effect=read):
+            result = self.case.invoke_selected()
+        self.assertEqual(len(partial), 1)
+        self.assertEqual(self.receipt_opens[0], partial[0])
+        self.assertGreater(len(self.receipt_opens), 1, "A partial claim must be retried with a fresh handle")
+        self.assertTrue(bench.acceptance_final_predicate(result))
+
+    def test_malformed_acquisition_claim_is_never_acknowledged(self):
+        reads = []
+        def read(handle, limit):
+            reads.append(True)
+            return b'{"output_claim":false}'
+        with patch.object(self.receipt_api, "read", side_effect=read):
+            result, writes = self.failed_with_controller_writes()
+        self.assertTrue(reads)
+        self.assertEqual(writes, [])
+        self.assertNotIn("server", self.case.events)
+        # Authentication precedes every field, including the claim.
+        self.assertIn("Worker receipt authentication is missing or malformed.", result["error"])
+        self.assertFalse((self.case.output / "controller-ack.json").exists())
+
+    def test_acknowledgment_mismatch_refuses_before_server(self):
+        create = bench.bounded_create
+        def changed(path, data, *args, **kwargs):
+            if path.name == "controller-ack.json":
+                data = b'{"acquired_sha256":"' + b"0" * 64 + b'"}'
+            return create(path, data, *args, **kwargs)
+        with patch.object(bench, "bounded_create", side_effect=changed), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertNotIn("server", self.case.events)
+        self.assertEqual(self.worker_args._acceptance_admission["reason"], "Controller acknowledgment differs.")
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+
+    def test_acknowledgment_close_failure_is_terminal_and_keeps_the_held_receipt(self):
+        # The token is visible once its exclusive create has written it, so a later
+        # failure cannot unpublish it: it stops the run without any retry instead.
+        record = self.acknowledgment_failure_after_publication()
+        self.assertIn("OSError: synthetic acknowledgment failure after publication", record["error"])
+        self.assertTrue((self.case.output / "controller-ack.json").is_file())
+
+    def test_controller_publish_race_preserves_foreign_destination(self):
+        create, data, planted = bench.bounded_create, b"foreign lifecycle at publication", []
+        def publish(path, *args, **kwargs):
+            if path.name == "lifecycle.json":
+                path.write_bytes(data)
+                planted.append(True)
+            return create(path, *args, **kwargs)
+        with patch.object(bench, "bounded_create", side_effect=publish), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(planted, [True])
+        self.assertFalse(caught.exception.record["finalization"])
+        self.assertTrue(caught.exception.record["finalization_error"].startswith("FileExistsError: "))
+        self.assertEqual((self.case.output / "lifecycle.json").read_bytes(), data)
+        self.assertFalse((self.case.output / "lifecycle.json.tmp").exists())
+
+    def test_controller_readback_failure_refuses_with_closed_authorities(self):
+        original, reads = Path.open, []
+        def open_file(path, *args, **kwargs):
+            if path.name == "lifecycle.json" and args == ("rb",):
+                reads.append(True)
+                return io.BytesIO(b"corrupted receipt")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", open_file), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(reads, [True])
+        self.assertEqual(caught.exception.record["finalization_error"], "OSError: Final receipt readback mismatch.")
+        self.assertFalse(caught.exception.record["finalization"])
+        self.assertIsNone(self.worker_args._output_owner.handle)
+
+    def output_close_failure(self, *, worker):
+        close, failures = bench.AcceptanceOutputOwner.close, []
+        def failed(owner):
+            active = owner.handle is not None
+            close(owner)
+            if active and (threading.current_thread() is self.case.worker_thread) == worker:
+                if worker or self.case.closed:
+                    failures.append(True)
+                    raise OSError("synthetic output authority close failure")
+        stderr = io.StringIO()
+        with patch.object(bench.AcceptanceOutputOwner, "close", failed), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(failures, [True])
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        if worker:
+            self.assertEqual(caught.exception.record["worker_exit"], 1)
+            self.assertIn("Worker output authority close failed (OSError).", stderr.getvalue())
+        else:
+            self.assertFalse(caught.exception.record["finalization"])
+            self.assertIn("Controller output authority close failed", caught.exception.record["cleanup_error"])
+
+    def test_worker_authority_close_failure_cannot_pass(self):
+        self.output_close_failure(worker=True)
+
+    def test_controller_authority_close_failure_cannot_pass(self):
+        self.output_close_failure(worker=False)
+
+    def test_non_windows_manifest_route_refuses_before_host_worker_or_native_startup(self):
+        args = argparse.Namespace(**vars(self.args), _acceptance_deadline=990)
+        samples = self.case.samples
+        with patch.object(bench.os, "name", "posix"), \
+                patch.object(bench, "WindowsDirectoryAPI") as directory, \
+                patch.object(bench, "WindowsProcessAPI") as native, \
+                patch.object(bench.subprocess, "Popen") as spawn, \
+                patch.object(bench, "load_acceptance_manifest") as load:
+            with self.assertRaises(bench.AcceptanceFailure) as caught:
+                self.case.invoke()
+            with self.assertRaisesRegex(ValueError, "^Manifest containment requires Windows directory authority\\.$"):
+                self.real_preflight(args)
+        self.assertEqual(caught.exception.record["admission"], {
+            "status": "refused", "reason": "Manifest containment requires Windows directory authority."})
+        self.assertEqual(args._acceptance_admission["reason"], "Manifest containment requires Windows directory authority.")
+        self.assertEqual(self.case.samples, samples)
+        self.assertFalse(self.case.output.exists())
+        directory.assert_not_called()
+        native.assert_not_called()
+        spawn.assert_not_called()
+        load.assert_not_called()
+
+    def test_resolved_argument_alias_uses_the_canonical_manifest_object_through_finalization(self):
+        alias = self.root / "alias-component"
+        alias.mkdir()
+        self.args.output = alias / ".." / "output"
+        result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(self.args.output, Path(self.manifest["output"]))
+        self.assertEqual(self.worker_args._output_owner.path, Path(self.manifest["output"]))
+        self.assertIn("server", self.case.events)
+
+    def test_no_output_filesystem_or_native_finalization_follows_controller_close(self):
+        close, native_open, open_file = bench.AcceptanceOutputOwner.close, self.directory_api.open, Path.open
+        closed = []
+        def release(owner):
+            close(owner)
+            if self.case.closed:
+                closed.append(True)
+        def directory(*args, **kwargs):
+            self.assertFalse(closed, "Native finalization after controller authority close")
+            return native_open(*args, **kwargs)
+        def artifact(path, *args, **kwargs):
+            self.assertFalse(closed, "Filesystem finalization after controller authority close")
+            return open_file(path, *args, **kwargs)
+        with patch.object(bench.AcceptanceOutputOwner, "close", release), \
+                patch.object(self.directory_api, "open", side_effect=directory), patch.object(Path, "open", artifact):
+            result = self.case.invoke_selected()
+        self.assertEqual(closed, [True])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(self.directory_handles, set())
+
+    def test_controller_primary_finalization_failure_and_close_failure_are_separate(self):
+        close = bench.AcceptanceOutputOwner.close
+        def failed(owner):
+            close(owner)
+            if self.case.closed:
+                raise OSError("synthetic secondary close failure")
+        with patch.object(bench.AcceptanceOutputOwner, "close", failed), \
+                patch.object(bench, "acceptance_protection", side_effect=ValueError("synthetic primary protection failure")), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(caught.exception.record["finalization_error"], "ValueError: synthetic primary protection failure")
+        self.assertIn("synthetic secondary close failure", caught.exception.record["cleanup_error"])
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.directory_handles, set())
+
+    def test_private_handshake_artifacts_are_included_in_aggregate_budget(self):
+        create, budgets = bench.bounded_create, []
+        def publish(path, *args, **kwargs):
+            result = create(path, *args, **kwargs)
+            if path.name == "lifecycle.json":
+                paths = list(self.case.output.iterdir())
+                self.assertIn(self.case.output / "controller-ack.json", paths)
+                without_ack = sum(p.stat().st_size for p in paths if p.name != "controller-ack.json")
+                bench.ACCEPTANCE_ARTIFACT_LIMIT = without_ack
+                budgets.append(without_ack)
+            return result
+        with patch.object(bench, "ACCEPTANCE_ARTIFACT_LIMIT", bench.ACCEPTANCE_ARTIFACT_LIMIT), \
+                patch.object(bench, "bounded_create", side_effect=publish), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(len(budgets), 1)
+        self.assertGreater(sum(p.stat().st_size for p in self.case.output.iterdir()), budgets[0])
+        self.assertEqual(caught.exception.record["finalization_error"], "RuntimeError: Total retained artifact budget exceeded.")
+        self.assertFalse(caught.exception.record["finalization"])
+
+    def test_owned_request_failure_retains_bounded_primary_failure_receipt(self):
+        with patch.object(bench, "acceptance_workload_tests", side_effect=OSError("synthetic request failure")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        result = caught.exception.record
+        self.assertEqual(result["worker_exit"], 1)
+        self.assertTrue(result["finalization"])
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(worker["error"], "synthetic request failure")
+        self.assertEqual(worker["status"], "provisional_failed")
+        self.assertIn("server-stop", self.case.events)
+        self.assertLess(sum(p.stat().st_size for p in self.case.output.iterdir()), bench.ACCEPTANCE_ARTIFACT_LIMIT)
+
+    def test_failed_controller_native_close_retains_authority_for_bounded_caller_cleanup(self):
+        close, failures = self.directory_api.close, []
+        def fail(handle):
+            if self.case.closed and not failures:
+                failures.append(True)
+                raise OSError("synthetic retained controller close failure")
+            return close(handle)
+        with patch.object(self.directory_api, "close", side_effect=fail), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        owner = caught.exception.output_owner
+        self.assertEqual(failures, [True])
+        self.assertIn(owner.handle, self.directory_handles)
+        self.assertIn("synthetic retained controller close failure", caught.exception.record["cleanup_error"])
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        try:
+            with self.assertRaises(PermissionError):
+                self.case.output.rename(self.root / "unclosed-controller-output")
+        finally:
+            owner.close()
+        self.assertEqual(self.directory_handles, set())
+
+    def test_failed_worker_native_close_is_reported_and_cannot_pass(self):
+        close, failures = self.directory_api.close, []
+        def fail(handle):
+            if threading.current_thread() is self.case.worker_thread and not failures:
+                failures.append(True)
+                raise OSError("synthetic retained worker close failure")
+            return close(handle)
+        stderr = io.StringIO()
+        with patch.object(self.directory_api, "close", side_effect=fail), contextlib.redirect_stderr(stderr), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        owner = self.worker_args._output_owner
+        try:
+            self.assertEqual(failures, [True])
+            self.assertIn(owner.handle, self.directory_handles)
+            self.assertEqual(caught.exception.record["worker_exit"], 1)
+            self.assertIn("Worker output authority close failed (OSError).", stderr.getvalue())
+            self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        finally:
+            owner.close()  # A real worker's exit closes this process-local handle; the CPU fake must do so.
+        self.assertEqual(self.directory_handles, set())
+
+    def test_partial_claim_close_failure_is_not_retried_as_unacknowledged_success(self):
+        close, failures = self.directory_api.close, []
+        def fail(handle):
+            if threading.current_thread() is not self.case.worker_thread and not failures:
+                failures.append(True)
+                raise OSError("synthetic partial acquisition close failure")
+            return close(handle)
+        with patch.object(self.directory_api, "close", side_effect=fail),                 patch.object(self.receipt_api, "read", return_value=b'{"output_claim":'):
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(failures, [True])
+        self.assertTrue(result["error"].startswith("JSONDecodeError:"))
+        self.assertIn("synthetic partial acquisition close failure", result["cleanup_error"])
+        self.assertEqual(writes, [])
+        self.assertNotIn("server", self.case.events)
+        self.assertFalse((self.case.output / "controller-ack.json").exists())
+        self.assertEqual(self.directory_handles, set())
+
+    def test_worker_identity_failure_and_failed_acquisition_close_keep_primary_reason(self):
+        close, identity, calls, failures = self.directory_api.close, self.directory_api.identity, [], []
+        def identify(handle):
+            if threading.current_thread() is self.case.worker_thread:
+                calls.append(handle)
+                if len(calls) == 2:
+                    raise ValueError("synthetic primary birth identity failure")
+            return identity(handle)
+        def fail(handle):
+            if threading.current_thread() is self.case.worker_thread and not failures:
+                failures.append(True)
+                raise OSError("synthetic birth close failure")
+            return close(handle)
+        with patch.object(self.directory_api, "identity", side_effect=identify), \
+                patch.object(self.directory_api, "close", side_effect=fail):
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(failures, [True])
+        self.assertEqual(self.worker_args._acceptance_admission["reason"], "synthetic primary birth identity failure")
+        self.assertEqual(writes, [])
+        self.assertNotIn("server", self.case.events)
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertIsNone(self.worker_args._output_owner.handle)
+        self.assertEqual(self.directory_handles, set())
+
+    def test_final_handle_path_identity_failure_refuses_without_foreign_writes(self):
+        native_path, failures = self.directory_api.path, []
+        foreign = self.root / "final-identity-foreign"
+        contents = self.foreign_artifacts(foreign)
+        def identity(handle):
+            if self.case.closed:
+                failures.append(True)
+                return str(foreign)
+            return native_path(handle)
+        with patch.object(self.directory_api, "path", side_effect=identity):
+            result, writes = self.failed_with_controller_writes()
+        self.assertTrue(failures)
+        self.assertEqual(writes, [])
+        self.assertEqual(result["finalization_error"], "ValueError: Worker output identity differs.")
+        self.assertEqual({p.name: p.read_bytes() for p in foreign.iterdir()}, contents)
+
+    def test_exited_worker_claim_is_never_acquired_or_acknowledged(self):
+        capture = self.case.native.capture
+        def exited(pipe):
+            result = capture(pipe)
+            self.case.worker_thread.join(5)
+            self.assertFalse(self.case.worker_thread.is_alive())
+            return result[0], True
+        with patch.object(self.case.native, "capture", side_effect=exited), \
+                patch.object(bench, "acceptance_wait_for_controller", side_effect=ValueError("synthetic worker claim failure")), \
+                patch.object(bench, "acceptance_acquire_output", wraps=bench.acceptance_acquire_output) as acquire, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        acquire.assert_not_called()
+        self.assertNotIn("server", self.case.events)
+        self.assertEqual(caught.exception.record["worker_exit"], 1)
+        self.assertFalse(caught.exception.record["finalization"])
+        self.assertFalse((self.case.output / "controller-ack.json").exists())
+        self.assertIsNone(self.worker_args._output_owner.handle)
+
+    def changed_manifest(self, change):
+        change(self.manifest)
+        self.args.acceptance_manifest.write_text(json.dumps(self.manifest))
+        self.digest = hashlib.sha256(self.args.acceptance_manifest.read_bytes()).hexdigest()
+
+    def controller_refused(self, reason):
+        samples = self.case.samples
+        with self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke()
+        self.assertEqual(caught.exception.record["admission"], {
+            "manifest_sha256": self.digest, "status": "refused", "reason": reason})
+        self.assertEqual(caught.exception.record["error"], "ValueError: " + reason)
+        self.assertNotIn("create", self.case.events)
+        self.assertNotIn("server", self.case.events)
+        self.assertIsNone(caught.exception.owner)
+        self.assertEqual(self.case.samples, samples)
+        return caught.exception.record
+
+    def worker_refused(self, reason, *, consumed_digest=None):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke()
+        self.assertEqual(caught.exception.record["admission"], {
+            "manifest_sha256": self.digest, "status": "admitted"})
+        self.assertIn("create", self.case.events, caught.exception.record)
+        self.assertIn("admission", self.case.events)
+        self.assertNotIn("server", self.case.events)
+        self.assertEqual(self.worker_args._acceptance_admission, {
+            "manifest_sha256": self.digest if consumed_digest is None else consumed_digest,
+            "status": "refused", "reason": reason})
+        self.assertIn("Acceptance admission refused: " + reason + "\n", stderr.getvalue())
+        self.assertFalse((self.case.output / "provisional.json").exists())
+        self.assertEqual(self.case.code, 1)
+        return caught.exception.record
+
+    def test_green_real_preflight_and_manifest_order_survive_public_containment(self):
+        # The writer's extended inventory owns protection, including its supplied order.
+        self.changed_manifest(lambda value: value["inputs"].insert(3, value["inputs"].pop(2)))
+        result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        worker = json.loads((self.case.output / "provisional.json").read_text())
+        expected = {"manifest_sha256": self.digest, "status": "admitted"}
+        self.assertEqual(result["admission"], expected)
+        self.assertEqual(worker["admission"], expected)
+        identities = [{key: row[key] for key in ("path", "bytes", "sha256")} for row in self.manifest["inputs"]]
+        self.assertEqual(worker["protection"]["before"], identities)
+        self.assertEqual(worker["protection"]["after"], identities)
+        self.assertTrue(worker["protection"]["unchanged"])
+        self.assertEqual(len(worker["acceptance_cases"]), 11)
+        self.assertEqual([row["path"] for row in identities][-2:], [str(path) for path in self.extra])
+        head = next(call for call in self.git_calls if call[0] == ["git", "rev-parse", "HEAD"])
+        self.assertEqual(head[1]["cwd"], self.root)
+        self.assertTrue(head[1]["check"])
+        self.assertTrue(head[1]["capture_output"])
+        self.assertGreater(head[1]["timeout"], 0)
+        self.assertLessEqual(head[1]["timeout"], 30)
+
+    def test_valid_manifest_replacement_after_controller_admission_refuses_before_server(self):
+        replacement = bench.copy.deepcopy(self.manifest)
+        replacement["created_unix"] += 1
+        replacement_bytes = (json.dumps(replacement, indent=2) + "\n").encode()
+        replacement_digest = hashlib.sha256(replacement_bytes).hexdigest()
+        self.assertNotEqual(self.digest, replacement_digest)
+        self.assertEqual({key for key in replacement if replacement[key] != self.manifest[key]}, {"created_unix"})
+
+        def replace(args):
+            Path(args.acceptance_manifest).write_bytes(replacement_bytes)
+            self.assertEqual(bench.load_acceptance_manifest(args.acceptance_manifest), replacement)
+
+        self.before_preflight = replace
+        with patch.object(bench, "file_identity", wraps=bench.file_identity) as identity:
+            result = self.worker_refused("Controller manifest digest differs.", consumed_digest=replacement_digest)
+        identity.assert_not_called()
+        self.assertEqual(result["admission"], {"status": "admitted", "manifest_sha256": self.digest})
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertEqual(self.git_calls, [])
+        self.assertEqual(self.preflight_samples, 0)
+        self.assertFalse(self.preflight_output_exists)
+
+    def test_controller_digest_transport_overrides_public_private_arguments(self):
+        self.args._admitted_manifest_sha256 = "f" * 64
+        result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        settings = json.loads(self.case.bootstrap_settings)
+        self.assertEqual(settings["admitted_manifest_sha256"], self.digest)
+        self.assertEqual(self.worker_args._admitted_manifest_sha256, self.digest)
+
+    def test_missing_controller_digest_refuses_before_identity_git_memory_or_output(self):
+        def remove(args):
+            if hasattr(args, "_admitted_manifest_sha256"):
+                delattr(args, "_admitted_manifest_sha256")
+        self.before_preflight = remove
+        with patch.object(bench, "file_identity", wraps=bench.file_identity) as identity:
+            self.worker_refused("Controller manifest digest is required.")
+        identity.assert_not_called()
+        self.assertEqual(self.git_calls, [])
+        self.assertEqual(self.preflight_samples, 0)
+        self.assertFalse(self.preflight_output_exists)
+
+    def test_missing_bootstrap_digest_cannot_fall_back_to_public_private_value(self):
+        self.args._admitted_manifest_sha256 = self.digest
+        bootstrap = bench.worker_bootstrap
+        def missing(stream, worker, **kwargs):
+            settings = json.loads(kwargs["settings"])
+            settings.pop("admitted_manifest_sha256")
+            kwargs["settings"] = json.dumps(settings)
+            return bootstrap(stream, worker, **kwargs)
+        with patch.object(bench, "worker_bootstrap", side_effect=missing), \
+                patch.object(bench, "file_identity", wraps=bench.file_identity) as identity:
+            self.worker_refused("Controller manifest digest is required.")
+        identity.assert_not_called()
+        self.assertEqual(self.git_calls, [])
+        self.assertEqual(self.preflight_samples, 0)
+        self.assertFalse(self.preflight_output_exists)
+
+    def test_malformed_controller_digest_refuses_before_identity_git_memory_or_output(self):
+        for digest in (False, 64, "", "A" * 64, "a" * 63, "a" * 65, "g" * 64):
+            args = argparse.Namespace(**vars(self.args), _acceptance_deadline=990,
+                                      _admitted_manifest_sha256=digest)
+            samples = self.case.samples
+            with self.subTest(digest=digest), patch.object(bench, "file_identity") as identity, \
+                    self.assertRaisesRegex(ValueError, "^Invalid controller manifest digest\\.$"):
+                self.real_preflight(args)
+            identity.assert_not_called()
+            self.assertEqual(args._acceptance_admission, {"status": "refused", "manifest_sha256": self.digest,
+                                                         "reason": "Invalid controller manifest digest."})
+            self.assertEqual(self.git_calls, [])
+            self.assertEqual(self.case.samples, samples)
+            self.assertFalse(args.output.exists())
+
+    def test_late_foreign_output_directory_refuses_before_server_and_preserves_marker(self):
+        checks = []
+        marker = self.case.output / "foreign.txt"
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                self.case.output.mkdir()
+                marker.write_bytes(b"foreign output must survive")
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            self.worker_refused("Output directory already exists; choose a new directory.")
+        self.assertEqual(checks, [8081, 8081])
+        self.assertEqual(marker.read_bytes(), b"foreign output must survive")
+        self.assertFalse(self.preflight_output_exists)
+        self.assertNotIn("server-stop", self.case.events)
+
+    def foreign_artifacts(self, target):
+        target.mkdir()
+        contents = {name: ("foreign bytes: " + name).encode() for name in (
+            "controller.log", "lifecycle.json", "lifecycle.json.tmp", "provisional.json")}
+        for name, data in contents.items():
+            (target / name).write_bytes(data)
+        return contents
+
+    def failed_with_controller_writes(self):
+        writes = []
+        write, mkdir, replace = bench.bounded_write, Path.mkdir, Path.replace
+        def bounded(path, *args, **kwargs):
+            if self.case.closed:
+                writes.append(("write", path))
+            return write(path, *args, **kwargs)
+        def directory(path, *args, **kwargs):
+            if self.case.closed:
+                writes.append(("mkdir", path))
+            return mkdir(path, *args, **kwargs)
+        def publish(path, *args, **kwargs):
+            if self.case.closed:
+                writes.append(("replace", path))
+            return replace(path, *args, **kwargs)
+        with patch.object(bench, "bounded_write", side_effect=bounded), \
+                patch.object(Path, "mkdir", directory), patch.object(Path, "replace", publish), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke()
+        self.assertFalse(caught.exception.record["finalization"])
+        self.assertTrue(self.case.closed)
+        return caught.exception.record, writes
+
+    def assert_foreign_artifacts(self, target, contents, writes):
+        self.assertNotIn("server", self.case.events)
+        self.assertEqual(writes, [])
+        self.assertEqual({path.name: path.read_bytes() for path in target.iterdir()}, contents)
+
+    def test_final_idle_foreign_artifacts_are_never_adopted_by_controller(self):
+        checks, contents = [], {}
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                contents.update(self.foreign_artifacts(self.case.output))
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(checks, [8081, 8081])
+        self.assert_foreign_artifacts(self.case.output, contents, writes)
+        self.assertEqual(result["worker_exit"], 1)
+
+    def test_final_idle_foreign_symlink_and_target_artifacts_survive_controller(self):
+        target = self.root / "foreign-target"
+        contents = self.foreign_artifacts(target)
+        checks, links = [], []
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                self.case.output.symlink_to(target, target_is_directory=True)
+                links.append(self.case.output.readlink())
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            _, writes = self.failed_with_controller_writes()
+        self.assertEqual(checks, [8081, 8081])
+        self.assertTrue(self.case.output.is_symlink())
+        self.assertEqual([self.case.output.readlink()], links)
+        self.assertEqual(self.case.output.resolve(), target)
+        self.assert_foreign_artifacts(target, contents, writes)
+
+    def test_foreign_output_at_final_deadline_sample_refuses_before_server(self):
+        checks, contents, timeline = [], {}, []
+        def idle(port):
+            checks.append(port)
+        def clock():
+            if (threading.current_thread() is self.case.worker_thread
+                    and len(checks) == 2 and not contents):
+                contents.update(self.foreign_artifacts(self.case.output))
+                timeline.append("foreign-created-at-deadline-sample")
+            return self.case.clock()
+        with patch.object(bench, "assert_idle", side_effect=idle), \
+                patch.object(bench.time, "monotonic", side_effect=clock):
+            _, writes = self.failed_with_controller_writes()
+        self.assertEqual(timeline, ["foreign-created-at-deadline-sample"])
+        self.assert_foreign_artifacts(self.case.output, contents, writes)
+
+    def test_foreign_output_after_last_absence_check_loses_exclusive_claim_before_server(self):
+        checks, contents = [], {}
+        output_check = bench.acceptance_output
+        def idle(port):
+            checks.append(port)
+        def checked(args, manifest):
+            result = output_check(args, manifest)
+            if len(checks) == 2 and not contents:
+                contents.update(self.foreign_artifacts(self.case.output))
+            return result
+        with patch.object(bench, "assert_idle", side_effect=idle), \
+                patch.object(bench, "acceptance_output", side_effect=checked):
+            _, writes = self.failed_with_controller_writes()
+        self.assertEqual(checks, [8081, 8081])
+        self.assertTrue(contents)
+        self.assert_foreign_artifacts(self.case.output, contents, writes)
+
+    def test_private_output_authority_overrides_public_args_and_is_proved_before_server(self):
+        self.args._output_authority = "f" * 64
+        spawn, native_open = self.case.spawn, self.directory_api.open
+        claimed, server = [], []
+        def directory(path, **kwargs):
+            result = native_open(path, **kwargs)
+            if path == self.case.output and kwargs.get("create"):
+                claimed.append(True)
+            return result
+        def popen(argv, **kwargs):
+            if "--engine" in argv:
+                server.append(True)
+                self.assertEqual(claimed, [True])
+                data = (self.case.output / "provisional.json").read_bytes()
+                first = json.loads(data)
+                settings = json.loads(self.case.bootstrap_settings)
+                authority = settings["output_authority"]
+                self.assertRegex(authority, r"^[0-9a-f]{64}$")
+                self.assertNotEqual(authority, self.args._output_authority)
+                self.assertEqual(self.worker_args._output_authority, authority)
+                owner = self.worker_args._output_owner
+                self.assertIsNotNone(owner.handle)
+                self.assertTrue((self.case.output / "controller-ack.json").is_file())
+                identity = hashlib.sha256(json.dumps([
+                    "strata-acceptance-output/2", authority, self.manifest["output"], *owner.identity
+                ], separators=(",", ":")).encode()).hexdigest()
+                unsigned = {"status": "provisional_starting", "output_claim": {
+                    "path": self.manifest["output"], "identity_sha256": identity}}
+                mac = hmac.new(bytes.fromhex(authority), json.dumps(unsigned, sort_keys=True, separators=(",", ":"))
+                               .encode(), hashlib.sha256).hexdigest()
+                self.assertEqual(first, dict(unsigned, receipt_hmac_sha256=mac))
+                # The receipt's keys are sorted; the token keeps the claim's own field order.
+                acquired = hashlib.sha256(json.dumps([
+                    "strata-acceptance-acquired/1", authority, unsigned["output_claim"]
+                ], separators=(",", ":")).encode()).hexdigest()
+                ack = (self.case.output / "controller-ack.json").read_bytes()
+                self.assertEqual(json.loads(ack), {"acquired_sha256": acquired})
+                self.assertFalse((self.case.output / "controller-ack.json.tmp").exists())
+                self.assertNotIn(authority.encode(), data)
+                self.assertNotIn(b"synthetic-key", data)
+            return spawn(argv, **kwargs)
+        with patch.object(self.directory_api, "open", side_effect=directory), \
+                patch.object(bench.subprocess, "Popen", side_effect=popen):
+            result = self.case.invoke_selected()
+        self.assertEqual(server, [True])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        authority = json.loads(self.case.bootstrap_settings)["output_authority"]
+        for path in self.case.output.iterdir():
+            self.assertNotIn(authority.encode(), path.read_bytes())
+
+    def output_authority_refused(self, value, *, missing=False):
+        self.args._output_authority = "f" * 64
+        bootstrap = bench.worker_bootstrap
+        def changed(stream, worker, **kwargs):
+            settings = json.loads(kwargs["settings"])
+            if missing:
+                settings.pop("output_authority", None)
+            else:
+                settings["output_authority"] = value
+            kwargs["settings"] = json.dumps(settings)
+            return bootstrap(stream, worker, **kwargs)
+        with patch.object(bench, "worker_bootstrap", side_effect=changed):
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(writes, [])
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        if missing or value is None or type(value) is not str or bench.re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            self.assertNotIn("server", self.case.events)
+            self.assertFalse(self.case.output.exists())
+        return result
+
+    def test_missing_private_output_authority_cannot_use_public_private_argument(self):
+        self.output_authority_refused(None, missing=True)
+
+    def test_malformed_private_output_authority_cannot_use_public_private_argument(self):
+        self.output_authority_refused(False)
+
+    def test_wrong_private_output_authority_prevents_controller_artifact_writes(self):
+        self.output_authority_refused("e" * 64)
+
+    def changed_claim_refused(self, change):
+        close = self.case.native.close_process
+        contents = {}
+        def release(proc):
+            change()
+            contents.update({path.name: path.read_bytes() for path in self.case.output.iterdir()})
+            close(proc)
+        with patch.object(self.case.native, "close_process", side_effect=release):
+            result, writes = self.failed_with_controller_writes()
+        self.assertIn("server", self.case.events)
+        self.assertEqual(writes, [])
+        self.assertEqual({path.name: path.read_bytes() for path in self.case.output.iterdir()}, contents)
+        self.assertEqual(result["normal_comparison"]["exclusions"], [{"reason": "worker-classification-unavailable"}])
+        return result
+
+    def test_worker_output_claim_cannot_go_missing_while_controller_receipt_is_held(self):
+        # The former post-exit unlink now executes and is denied by the controller handle.
+        close, attempts = self.case.native.close_process, []
+        provisional = self.case.output / "provisional.json"
+        def release(proc):
+            close(proc)
+            self.assertIsNone(self.worker_args._provisional_file.handle)
+            before = provisional.read_bytes()
+            with self.assertRaises(PermissionError):
+                provisional.unlink()
+            attempts.append(before)
+        with patch.object(self.case.native, "close_process", side_effect=release):
+            result = self.case.invoke_selected()
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(provisional.read_bytes(), attempts[0])
+        self.assertEqual(result["artifact_sha256"]["provisional.json"], hashlib.sha256(attempts[0]).hexdigest())
+        self.assertTrue(bench.acceptance_final_predicate(result))
+
+    def test_malformed_worker_output_claim_refuses_controller_without_writes(self):
+        self.changed_claim_refused(lambda: (self.case.output / "provisional.json").write_bytes(b'{"output_claim":false}'))
+
+    def test_duplicate_worker_output_claim_refuses_controller_without_writes(self):
+        def change():
+            path = self.case.output / "provisional.json"
+            record = json.loads(path.read_bytes())
+            path.write_text(json.dumps(record)[:-1] + ', "output_claim":' + json.dumps(record["output_claim"]) + '}')
+        self.changed_claim_refused(change)
+
+    def test_oversized_worker_output_claim_refuses_controller_without_writes(self):
+        self.changed_claim_refused(lambda: (self.case.output / "provisional.json").write_bytes(
+            b" " * (bench.ACCEPTANCE_LOG_LIMIT + 1)))
+
+    def test_mismatched_worker_output_claim_refuses_controller_without_writes(self):
+        def change():
+            path = self.case.output / "provisional.json"
+            record = json.loads(path.read_bytes())
+            record["output_claim"]["identity_sha256"] = "0" * 64
+            path.write_text(json.dumps(record))
+        self.changed_claim_refused(change)
+
+    def test_changed_claim_path_refuses_controller_without_writes(self):
+        def change():
+            path = self.case.output / "provisional.json"
+            record = json.loads(path.read_bytes())
+            record["output_claim"]["path"] = str(self.root / "other-output")
+            path.write_text(json.dumps(record))
+        self.changed_claim_refused(change)
+
+    def test_foreign_directory_with_copied_valid_claim_cannot_be_adopted(self):
+        # A copied valid claim on a different object still fails, independently of
+        # Windows denying replacement while the acquired controller handle lives.
+        retained = self.root / "foreign-output"
+        contents = self.foreign_artifacts(retained)
+        result = self.case.invoke_selected()
+        data = (self.case.output / "provisional.json").read_bytes()
+        (retained / "provisional.json").write_bytes(data)
+        contents["provisional.json"] = data
+        authority = json.loads(self.case.bootstrap_settings)["output_authority"]
+        owner = bench.AcceptanceOutputOwner(retained, str(retained))
+        try:
+            owner.open_receipt()
+            # The copied bytes still authenticate; the claim binds the other directory.
+            with self.assertRaisesRegex(ValueError, "Worker output claim differs"):
+                bench.acceptance_claimed_output(retained, str(retained), authority, owner=owner)
+            self.assertEqual(owner.receipt_bytes, data)
+        finally:
+            owner.close()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual({path.name: path.read_bytes() for path in retained.iterdir()}, contents)
+
+    def test_controller_refuses_output_ancestor_symlink_before_reading_claim(self):
+        parent = self.root / "container"
+        parent.mkdir()
+        self.args.output = self.case.output = parent / "output"
+        self.changed_manifest(lambda value: value.update(output=str(self.case.output)))
+        retained = self.root / "retained-container"
+        def change():
+            parent.rename(retained)
+            parent.symlink_to(retained, target_is_directory=True)
+        close = self.case.native.close_process
+        attempts = []
+        def release(proc):
+            with self.assertRaises(PermissionError):
+                change()
+            attempts.append(True)
+            close(proc)
+        with patch.object(self.case.native, "close_process", side_effect=release):
+            result = self.case.invoke_selected()
+        self.assertEqual(attempts, [True])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertFalse(parent.is_symlink())
+        self.assertFalse(retained.exists())
+
+    def test_inaccessible_worker_output_claim_refuses_controller_without_writes(self):
+        read = self.receipt_api.read
+        def inaccessible(handle, limit):
+            if self.case.closed:
+                raise PermissionError("synthetic inaccessible claim")
+            return read(handle, limit)
+        with patch.object(self.receipt_api, "read", side_effect=inaccessible):
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(writes, [])
+        self.assertIn("synthetic inaccessible claim", result["finalization_error"])
+        self.assertFalse((self.case.output / "controller.log").exists())
+        self.assertFalse((self.case.output / "lifecycle.json").exists())
+
+    def test_legitimate_server_spawn_failure_after_claim_keeps_bounded_failure_receipt(self):
+        spawn = self.case.spawn
+        def fail(argv, **kwargs):
+            if "--engine" in argv:
+                self.assertEqual(json.loads((self.case.output / "provisional.json").read_bytes())["status"],
+                                 "provisional_starting")
+                raise OSError("synthetic spawn failure")
+            return spawn(argv, **kwargs)
+        with patch.object(bench.subprocess, "Popen", side_effect=fail), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke()
+        result = caught.exception.record
+        self.assertEqual(result["worker_exit"], 1)
+        self.assertTrue(result["finalization"])
+        self.assertEqual(json.loads((self.case.output / "lifecycle.json").read_bytes())["status"], "held")
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(worker["status"], "provisional_failed")
+        self.assertEqual(worker["error"], "synthetic spawn failure")
+        self.assertIn("output_claim", worker)
+        self.assertLess(sum(path.stat().st_size for path in self.case.output.iterdir()), bench.ACCEPTANCE_ARTIFACT_LIMIT)
+
+    def test_late_resolved_output_alias_refuses_before_server_without_creating_target(self):
+        checks = []
+        target = self.root / "other-output"
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                self.worker_args.output = self.root / "absent/../other-output"
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            self.worker_refused("Manifest output differs.")
+        self.assertEqual(checks, [8081, 8081])
+        self.assertFalse(target.exists())
+        self.assertFalse((self.root / "absent").exists())
+
+    def test_late_output_symlink_refuses_before_server_and_preserves_foreign_target(self):
+        checks = []
+        target = self.root / "foreign"
+        target.mkdir()
+        marker = target / "foreign.txt"
+        marker.write_bytes(b"foreign target must survive")
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                self.case.output.symlink_to(target, target_is_directory=True)
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            self.worker_refused("Output directory already exists; choose a new directory.")
+        self.assertEqual(checks, [8081, 8081])
+        self.assertTrue(self.case.output.is_symlink())
+        self.assertEqual(marker.read_bytes(), b"foreign target must survive")
+        self.assertFalse((target / "provisional.json").exists())
+
+    def test_late_parent_symlink_to_same_admitted_output_refuses_before_server(self):
+        checks = []
+        alias = self.root / "alias"
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                alias.symlink_to(self.root, target_is_directory=True)
+                self.worker_args.output = alias / "output"
+                self.assertEqual(str(self.worker_args.output.resolve()), self.manifest["output"])
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            self.worker_refused("Manifest output path is linked.")
+        self.assertEqual(checks, [8081, 8081])
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(alias.resolve(), self.root)
+
+    def test_reordered_config_and_executable_rows_preserve_order_and_reach_workload(self):
+        self.changed_manifest(lambda value: value["inputs"].insert(1, value["inputs"].pop(0)))
+        self.assertEqual([row["role"] for row in self.manifest["inputs"][:2]], ["saved-exe", "config"])
+        result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertIn("server", self.case.events)
+        worker = json.loads((self.case.output / "provisional.json").read_text())
+        self.assertEqual(worker["admission"], {"status": "admitted", "manifest_sha256": self.digest})
+        self.assertEqual([row["path"] for row in worker["protection"]["before"]],
+                         [row["path"] for row in self.manifest["inputs"]])
+        self.assertTrue(worker["acceptance_workload_passed"])
+
+    def alternate_protected_config(self):
+        alternate = self.root / "alternate.json"
+        executable = self.root / "unmanifested.exe"
+        executable.write_bytes(b"foreign executable, never executed")
+        cfg = json.loads(self.args.config.read_text())
+        cfg["exe"] = str(executable)
+        alternate.write_text(json.dumps(cfg))
+        self.args.protect_input.append(str(alternate))
+        def change(manifest):
+            manifest["inputs"].insert(1, manifest["inputs"].pop(0))
+            manifest["inputs"].append(dict(role="protect-input", **bench.file_identity(alternate)))
+            manifest["protect_input"].append(str(alternate))
+        self.changed_manifest(change)
+        self.assertEqual(self.manifest["inputs"][1]["role"], "config")
+        self.assertNotIn(str(executable), [row["path"] for row in self.manifest["inputs"]])
+        return alternate, executable
+
+    def test_alternate_protect_input_config_refuses_controller_before_worker(self):
+        alternate, executable = self.alternate_protected_config()
+        before = {path: path.read_bytes() for path in (self.args.config, alternate, executable)}
+        self.args.config = alternate
+        self.controller_refused("Manifest config differs.")
+        self.assertFalse(self.case.output.exists())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_alternate_protect_input_config_refuses_worker_before_server(self):
+        alternate, executable = self.alternate_protected_config()
+        before = {path: path.read_bytes() for path in (self.args.config, alternate, executable)}
+        self.before_preflight = lambda args: setattr(args, "config", alternate)
+        self.worker_refused("Manifest config differs.")
+        self.assertEqual(self.preflight_samples, 0)
+        self.assertEqual(self.git_calls, [])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_config_role_cardinality_types_and_canonical_path_refuse_both_admissions(self):
+        mutations = [
+            (lambda rows: rows.pop(0), "Manifest requires exactly one config input."),
+            (lambda rows: rows[1].update(role="config"), "Manifest requires exactly one config input."),
+            (lambda rows: rows[0].update(role="protect-input"), "Manifest requires exactly one config input."),
+            (lambda rows: rows[0].update(role=True), "Invalid manifest input role."),
+            (lambda rows: rows[0].update(role=["config"]), "Invalid manifest input role."),
+            (lambda rows: rows[0].update(path=True), "Manifest paths must be absolute strings."),
+            (lambda rows: rows[0].update(path=[str(self.args.config)]), "Manifest paths must be absolute strings."),
+            (lambda rows: rows[0].pop("path"), "Invalid manifest input keys."),
+            (lambda rows: rows[0].update(path=str(self.root / "absent/../synthetic.json")),
+             "Manifest config differs."),
+        ]
+        for change, reason in mutations:
+            manifest = bench.copy.deepcopy(self.manifest)
+            change(manifest["inputs"])
+            with self.subTest(inputs=manifest["inputs"][:2]):
+                with self.assertRaises(ValueError) as controller:
+                    bench.acceptance_admission(self.args, manifest, 1800000100.0)
+                self.assertEqual(str(controller.exception), reason)
+                args = argparse.Namespace(**vars(self.args), _acceptance_deadline=990,
+                                          _admitted_manifest_sha256=self.digest)
+                with patch.object(bench, "load_acceptance_manifest", return_value=(manifest, self.digest)), \
+                        patch.object(bench, "file_identity", side_effect=AssertionError("input read before admission")), \
+                        self.assertRaises(ValueError) as worker:
+                    self.real_preflight(args)
+                self.assertEqual(str(worker.exception), reason)
+                self.assertEqual(args._acceptance_admission["status"], "refused")
+                self.assertEqual(args._acceptance_admission["reason"], reason)
+                self.assertEqual(self.git_calls, [])
+                self.assertEqual(self.case.samples, 0)
+                self.assertEqual(self.case.events, [])
+                self.assertFalse(self.case.output.exists())
+
+    def test_invalid_selected_config_types_cannot_alias_the_role_path(self):
+        for config in (None, True, 1, 1.0, [str(self.args.config)]):
+            args = argparse.Namespace(**vars(self.args))
+            args.config = config
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "^Invalid manifest config argument\\.$"):
+                bench.acceptance_admission(args, self.manifest, 1800000100.0)
+        self.assertEqual(self.case.events, [])
+        self.assertFalse(self.case.output.exists())
+
+    def worker_artifact_collision(self, name, kind, *, save_number=1):
+        target = self.case.output / name
+        foreign = self.root / "foreign-artifact"
+        original = b"external foreign artifact bytes must survive"
+        foreign.write_bytes(original)
+        original_open, attempts, injected = Path.open, [], []
+        native_open, publish = self.provisional_api.open, bench.AcceptanceProvisionalFile.publish
+
+        def insert():
+            attempts.append("xb")
+            if len(attempts) != save_number:
+                return
+            if kind == "hardlink":
+                bench.os.link(foreign, target)
+            elif kind == "symlink":
+                target.symlink_to(foreign)
+            elif kind == "directory":
+                target.mkdir()
+                (target / "keep").write_bytes(original)
+            elif kind == "junction":
+                import _winapi
+                directory = self.root / "foreign-directory"
+                directory.mkdir()
+                (directory / "keep").write_bytes(original)
+                _winapi.CreateJunction(str(directory), str(target))
+            else:
+                with original_open(target, "xb") as stream:
+                    stream.write(original)
+            injected.append(True)
+
+        def open_stream(path, mode="r", *args, **kwargs):
+            if path == target and mode in ("wb", "xb"):
+                self.assertNotEqual(name, "provisional.json.tmp", "Manifest staging must never be opened")
+                self.assertEqual(mode, "xb")
+                insert()
+            return original_open(path, mode, *args, **kwargs)
+
+        def claim(path):
+            if path == target:
+                insert()
+            return native_open(path)
+
+        def prepared(file, data):
+            if name == "provisional.json.tmp" and "requests" in json.loads(data):
+                insert()
+            return publish(file, data)
+
+        with patch.object(Path, "open", open_stream), \
+                patch.object(self.provisional_api, "open", side_effect=claim), \
+                patch.object(bench.AcceptanceProvisionalFile, "publish", prepared), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.case.code, 0 if name == "provisional.json.tmp" else 1)
+        self.assertEqual(foreign.read_bytes(), original)
+        if kind in ("directory", "junction"):
+            self.assertEqual((target / "keep").read_bytes(), original)
+            if kind == "junction":
+                self.assertTrue(target.is_junction())
+        else:
+            self.assertEqual(target.read_bytes(), original)
+            if kind == "hardlink":
+                self.assertTrue(bench.os.path.samefile(target, foreign))
+            elif kind == "symlink":
+                self.assertTrue(target.is_symlink())
+        self.assertEqual(set(attempts), {"xb"})
+        if name == "provisional.json":
+            self.assertNotIn("server", self.case.events)
+            self.assertFalse(caught.exception.record["finalization"])
+        else:
+            self.assertIn("server", self.case.events)
+            receipt = json.loads((self.case.output / "provisional.json").read_bytes())
+            if name == "provisional.json.tmp":
+                self.assertEqual(receipt["status"], "provisional_complete")
+                self.assertIn("unexpected", caught.exception.record["finalization_error"])
+            else:
+                self.assertNotEqual(receipt["status"], "provisional_complete")
+            if name in ("server.log", "engine.log"):
+                self.assertEqual(receipt["status"], "provisional_failed")
+                self.assertIn("artifact_error", receipt)
+        self.assertEqual(self.directory_handles, set())
+
+    def test_worker_server_log_hardlink_collision_preserves_external_bytes(self):
+        self.worker_artifact_collision("server.log", "hardlink")
+
+    def test_worker_engine_log_hardlink_collision_preserves_external_bytes(self):
+        self.worker_artifact_collision("engine.log", "hardlink")
+
+    def test_worker_provisional_staging_hardlink_collision_preserves_external_bytes(self):
+        self.worker_artifact_collision("provisional.json.tmp", "hardlink")
+
+    def test_worker_server_log_file_collision_preserves_bytes(self):
+        self.worker_artifact_collision("server.log", "file")
+
+    def test_worker_server_log_symlink_collision_preserves_bytes(self):
+        self.worker_artifact_collision("server.log", "symlink")
+
+    def test_worker_server_log_directory_collision_preserves_bytes(self):
+        self.worker_artifact_collision("server.log", "directory")
+
+    def test_worker_server_log_junction_collision_preserves_bytes(self):
+        self.worker_artifact_collision("server.log", "junction")
+
+    def test_worker_engine_log_file_collision_preserves_bytes(self):
+        self.worker_artifact_collision("engine.log", "file")
+
+    def test_worker_engine_log_symlink_collision_preserves_bytes(self):
+        self.worker_artifact_collision("engine.log", "symlink")
+
+    def test_worker_engine_log_directory_collision_preserves_bytes(self):
+        self.worker_artifact_collision("engine.log", "directory")
+
+    def test_worker_engine_log_junction_collision_preserves_bytes(self):
+        self.worker_artifact_collision("engine.log", "junction")
+
+    def test_worker_provisional_staging_file_collision_preserves_bytes(self):
+        self.worker_artifact_collision("provisional.json.tmp", "file")
+
+    def test_worker_provisional_staging_symlink_collision_preserves_bytes(self):
+        self.worker_artifact_collision("provisional.json.tmp", "symlink")
+
+    def test_worker_provisional_staging_directory_collision_preserves_bytes(self):
+        self.worker_artifact_collision("provisional.json.tmp", "directory")
+
+    def test_worker_provisional_staging_junction_collision_preserves_bytes(self):
+        self.worker_artifact_collision("provisional.json.tmp", "junction")
+
+    def test_worker_initial_provisional_file_collision_never_acquires_replacement_rights(self):
+        self.worker_artifact_collision("provisional.json", "file")
+
+    def test_worker_initial_provisional_hardlink_collision_never_acquires_replacement_rights(self):
+        self.worker_artifact_collision("provisional.json", "hardlink")
+
+    def test_worker_initial_provisional_symlink_collision_never_acquires_replacement_rights(self):
+        self.worker_artifact_collision("provisional.json", "symlink")
+
+    def test_worker_initial_provisional_directory_collision_never_acquires_replacement_rights(self):
+        self.worker_artifact_collision("provisional.json", "directory")
+
+    def test_worker_initial_provisional_junction_collision_never_acquires_replacement_rights(self):
+        self.worker_artifact_collision("provisional.json", "junction")
+
+    def test_worker_repeated_provisional_staging_hardlink_collision_preserves_bytes(self):
+        self.worker_artifact_collision("provisional.json.tmp", "hardlink", save_number=4)
+
+    def worker_write_failure(self, name, failure, *, save_number=1, primary=False):
+        original_open = Path.open
+        publish = bench.AcceptanceProvisionalFile.publish
+        attempts, injected, snapshots = [], [], []
+        provisional = self.case.output / "provisional.json"
+        target = self.case.output / name
+        message = "synthetic exclusive " + failure + " failure"
+
+        def observed(file, data):
+            snapshots.append(json.loads(data))
+            return publish(file, data)
+
+        def open_stream(path, mode="r", *args, **kwargs):
+            if path != target or mode not in ("wb", "xb"):
+                return original_open(path, mode, *args, **kwargs)
+            self.assertEqual(mode, "xb")
+            attempts.append(True)
+            if len(attempts) != save_number:
+                return original_open(path, mode, *args, **kwargs)
+            injected.append(True)
+            if failure == "create":
+                raise OSError(message)
+            stream = original_open(path, mode, *args, **kwargs)
+            class FailedStream:
+                def __enter__(inner): return inner
+                def __exit__(inner, *exc):
+                    stream.close()
+                    self.assertTrue(stream.closed)
+                    if failure == "close":
+                        raise OSError(message)
+                def write(inner, data):
+                    if failure == "write":
+                        raise OSError(message)
+                    return stream.write(data[:-1] if failure == "short-write" else data)
+                def flush(inner):
+                    if failure == "flush":
+                        raise OSError(message)
+                    stream.flush()
+            return FailedStream()
+
+        stderr = io.StringIO()
+        workload = (patch.object(bench, "acceptance_workload_tests", side_effect=ValueError("primary request failure"))
+                    if primary else contextlib.nullcontext())
+        with patch.object(Path, "open", open_stream), patch.object(bench.AcceptanceProvisionalFile, "publish", observed), \
+                workload, contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.directory_handles, set())
+        self.assertIn("server-stop", self.case.events)
+        receipt = json.loads(provisional.read_bytes())
+        self.assertEqual(receipt["status"], "provisional_failed")
+        final = snapshots[-1]
+        self.assertEqual(final["status"], "provisional_failed")
+        if primary:
+            self.assertEqual(final["error_type"], "ValueError")
+            self.assertEqual(final["error"], "primary request failure")
+            self.assertIn("Contained worker stopped (ValueError).", stderr.getvalue())
+            self.assertEqual(final["artifact_error"], "OSError: " + message)
+        else:
+            expected = "OSError: Short artifact write." if failure == "short-write" else "OSError: " + message
+            self.assertEqual(final["artifact_error"], expected)
+
+    def retained_provisional_failure(self, operation, *, publish_number=1, primary=False):
+        publish, snapshots, injected = bench.AcceptanceProvisionalFile.publish, [], []
+        active = False
+        native_name = "path" if operation == "final-path" else operation
+        native_name = "write" if operation == "short-write" else native_name
+        native_name = "open" if operation == "create" else native_name
+        native = getattr(self.provisional_api, native_name)
+        message = "synthetic retained " + operation + " failure"
+        paths = []
+
+        def prepared(file, data):
+            nonlocal active
+            snapshots.append(json.loads(data))
+            active = len(snapshots) == publish_number
+            try:
+                return publish(file, data)
+            finally:
+                active = False
+
+        def failed(*args):
+            if not injected and (active or operation in ("create", "close")):
+                if operation == "final-path":
+                    paths.append(True)
+                    if len(paths) == 1:
+                        return native(*args)
+                injected.append(True)
+                if operation == "short-write":
+                    return native(args[0], args[1][:-1])
+                if operation == "close":
+                    native(*args)  # Returning close error still cannot qualify a complete receipt.
+                    raise OSError(message)
+                raise OSError(message)
+            return native(*args)
+
+        stderr = io.StringIO()
+        workload = (patch.object(bench, "acceptance_workload_tests", side_effect=ValueError("primary request failure"))
+                    if primary else contextlib.nullcontext())
+        with patch.object(bench.AcceptanceProvisionalFile, "publish", prepared), \
+                patch.object(self.provisional_api, native_name, side_effect=failed), workload, \
+                contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True], "The claimed native failure must actually execute")
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.provisional_handles, set())
+        self.assertEqual(self.directory_handles, set())
+        if operation == "create" or (publish_number == 1 and operation != "close"):
+            self.assertNotIn("server", self.case.events)
+        else:
+            self.assertIn("server-stop", self.case.events)
+        if primary:
+            self.assertEqual(snapshots[-1]["error_type"], "ValueError")
+            self.assertEqual(snapshots[-1]["error"], "primary request failure")
+            self.assertIn("Contained worker stopped (ValueError).", stderr.getvalue())
+        self.assertFalse((self.case.output / "provisional.json.tmp").exists())
+
+    def test_initial_claim_exclusive_create_failure_never_starts_server(self):
+        self.retained_provisional_failure("create")
+
+    def test_initial_claim_write_failure_never_starts_server(self):
+        self.retained_provisional_failure("write")
+
+    def test_initial_claim_short_write_never_starts_server(self):
+        self.retained_provisional_failure("short-write")
+
+    def test_initial_claim_flush_failure_never_starts_server(self):
+        self.retained_provisional_failure("flush")
+
+    def test_retained_claim_final_close_failure_cannot_pass(self):
+        self.retained_provisional_failure("close")
+
+    def test_provisional_update_path_validation_failure_cannot_pass(self):
+        self.retained_provisional_failure("path", publish_number=2)
+
+    def test_provisional_update_write_failure_cannot_pass(self):
+        self.retained_provisional_failure("write", publish_number=2)
+
+    def test_provisional_update_short_write_cannot_pass(self):
+        self.retained_provisional_failure("short-write", publish_number=2)
+
+    def test_provisional_update_flush_failure_cannot_pass(self):
+        self.retained_provisional_failure("flush", publish_number=2)
+
+    def test_provisional_update_final_validation_failure_cannot_pass(self):
+        self.retained_provisional_failure("final-path", publish_number=2)
+
+    def test_server_artifact_create_failure_is_not_pass(self):
+        self.worker_write_failure("server.log", "create")
+
+    def test_server_artifact_write_failure_is_not_pass(self):
+        self.worker_write_failure("server.log", "write")
+
+    def test_server_artifact_short_write_is_not_pass(self):
+        self.worker_write_failure("server.log", "short-write")
+
+    def test_server_artifact_flush_failure_is_not_pass(self):
+        self.worker_write_failure("server.log", "flush")
+
+    def test_server_artifact_close_failure_is_not_pass(self):
+        self.worker_write_failure("server.log", "close")
+
+    def test_engine_artifact_create_failure_is_not_pass(self):
+        self.worker_write_failure("engine.log", "create")
+
+    def test_engine_artifact_write_failure_is_not_pass(self):
+        self.worker_write_failure("engine.log", "write")
+
+    def test_engine_artifact_short_write_is_not_pass(self):
+        self.worker_write_failure("engine.log", "short-write")
+
+    def test_engine_artifact_flush_failure_is_not_pass(self):
+        self.worker_write_failure("engine.log", "flush")
+
+    def test_engine_artifact_close_failure_is_not_pass(self):
+        self.worker_write_failure("engine.log", "close")
+
+    def test_primary_request_error_survives_separate_worker_artifact_error(self):
+        self.worker_write_failure("server.log", "flush", primary=True)
+
+    def test_late_provisional_final_validation_failure_cannot_pass(self):
+        self.retained_provisional_failure("final-path", publish_number=5)
+
+    def provisional_truncate_failure(self, save_number, *, primary=False):
+        # Replacement publication is gone; its first/later/primary-error boundaries
+        # now fail the retained object's explicit exact-length truncation instead.
+        self.retained_provisional_failure("truncate", publish_number=save_number + 1, primary=primary)
+
+    def test_first_provisional_update_truncate_failure_cannot_pass(self):
+        self.provisional_truncate_failure(1)
+
+    def test_repeated_provisional_update_truncate_failure_cannot_pass(self):
+        self.provisional_truncate_failure(4)
+
+    def test_primary_request_error_survives_failure_receipt_truncate_failure(self):
+        self.provisional_truncate_failure(3, primary=True)
+
+    def test_primary_request_error_cleanup_and_artifact_errors_remain_separate(self):
+        spawn, create = self.case.spawn, bench.bounded_create
+        def spawning(argv, **kwargs):
+            proc = spawn(argv, **kwargs)
+            if "--engine" in argv:
+                def terminate():
+                    self.case.events.append("server-stop")
+                    raise OSError("synthetic cleanup failure")
+                proc.terminate = terminate
+            return proc
+        def creating(path, *args, **kwargs):
+            if path == self.case.output / "server.log":
+                raise OSError("synthetic artifact failure")
+            return create(path, *args, **kwargs)
+        stderr = io.StringIO()
+        with patch.object(bench.subprocess, "Popen", side_effect=spawning), \
+                patch.object(bench, "bounded_create", side_effect=creating), \
+                patch.object(bench, "acceptance_workload_tests", side_effect=ValueError("primary request failure")), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        receipt = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(receipt["status"], "provisional_failed")
+        self.assertEqual(receipt["error_type"], "ValueError")
+        self.assertEqual(receipt["error"], "primary request failure")
+        self.assertEqual(receipt["cleanup_error"], "Process cleanup failed: synthetic cleanup failure")
+        self.assertEqual(receipt["artifact_error"], "OSError: synthetic artifact failure")
+        self.assertIn("Contained worker stopped (ValueError).", stderr.getvalue())
+        self.assertIn("server-stop", self.case.events)
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.directory_handles, set())
+
+    def test_manifest_artifact_size_and_expired_deadline_refuse_before_create(self):
+        path = self.root / "bounded-artifact"
+        for data, deadline in ((b"12345", 990), (b"1234", 0)):
+            with self.subTest(data=data, deadline=deadline), patch.object(Path, "open") as opened, \
+                    self.assertRaisesRegex(RuntimeError, "Artifact exceeds its size or absolute time budget"):
+                bench.bounded_create(path, data, deadline, limit=4)
+            opened.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_manifest_artifact_post_close_deadline_refuses_and_leaves_closed_created_bytes(self):
+        path = self.root / "bounded-artifact"
+        with patch.object(bench.time, "monotonic", side_effect=[0, 1]), \
+                self.assertRaisesRegex(TimeoutError, "Artifact finalization exceeded the absolute deadline"):
+            bench.bounded_create(path, b"1234", deadline=1, limit=4)
+        self.assertEqual(path.read_bytes(), b"1234")
+        path.rename(self.root / "closed-artifact")
+
+    def test_provisional_publication_returning_at_deadline_cannot_pass(self):
+        flush, injected, calls = self.provisional_api.flush, [], []
+        def publish(handle):
+            result = flush(handle)
+            calls.append(True)
+            if len(calls) == 2:
+                injected.append(True)
+                self.case.now = self.worker_args._acceptance_deadline
+            return result
+        with patch.object(self.provisional_api, "flush", side_effect=publish), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.directory_handles, set())
+
+    def test_repeated_provisional_publication_retains_one_exclusive_handle_until_final_save(self):
+        claim, close = self.provisional_api.open, self.provisional_api.close
+        publish, original_open, replace = bench.AcceptanceProvisionalFile.publish, Path.open, Path.replace
+        pending = self.case.output / "provisional.json.tmp"
+        provisional = self.case.output / "provisional.json"
+        claimed, closed, published = [], [], []
+        def created(path):
+            handle = claim(path)
+            claimed.append(handle)
+            self.assertEqual(len(claimed), 1)
+            return handle
+        def saved(file, data):
+            self.assertEqual(closed, [])
+            self.assertEqual(file.handle, claimed[0])
+            identity = file.api.identity(file.handle)
+            result = publish(file, data)
+            self.assertEqual(file.api.identity(file.handle), identity)
+            published.append(data)
+            self.assertEqual(provisional.read_bytes(), data)
+            self.assertFalse(pending.exists())
+            return result
+        def closing(handle):
+            self.assertEqual(json.loads(published[-1])["status"], "provisional_complete")
+            closed.append(handle)
+            return close(handle)
+        def open_file(path, mode="r", *args, **kwargs):
+            if path in (provisional, pending):
+                self.assertEqual(mode, "rb", "Receipt writes must use only the retained handle")
+            return original_open(path, mode, *args, **kwargs)
+        def replacing(path, destination):
+            self.assertNotIn(path, (provisional, pending))
+            self.assertNotEqual(Path(destination), provisional)
+            return replace(path, destination)
+        with patch.object(self.provisional_api, "open", side_effect=created), \
+                patch.object(self.provisional_api, "close", side_effect=closing), \
+                patch.object(bench.AcceptanceProvisionalFile, "publish", saved), \
+                patch.object(Path, "open", open_file), patch.object(Path, "replace", replacing):
+            result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertGreater(len(published), 4)
+        self.assertEqual(closed, claimed)
+        self.assertEqual(json.loads(published[-1])["status"], "provisional_complete")
+        self.assertFalse(pending.exists())
+
+    def test_final_worker_artifact_read_failure_cannot_pass(self):
+        read, injected = self.receipt_api.read, []
+        def failed(handle, limit):
+            if self.case.code == 0:
+                injected.append(True)
+                raise OSError("synthetic final artifact read failure")
+            return read(handle, limit)
+        with patch.object(self.receipt_api, "read", side_effect=failed),                 self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertEqual(caught.exception.record["finalization_error"], "OSError: synthetic final artifact read failure")
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.directory_handles, set())
+
+    def test_retained_provisional_allows_reads_denies_writes_and_delete_until_close(self):
+        output = self.root / "retained-file"
+        owner = bench.AcceptanceOutputOwner(output, str(output), create=True)
+        receipt = bench.AcceptanceProvisionalFile(owner, 990)
+        try:
+            receipt.create()
+            handle, identity = receipt.handle, receipt.identity
+            receipt.publish(b'{"snapshot":"long first value"}')
+            receipt.publish(b'{"snapshot":2}')
+            self.assertEqual(receipt.path.read_bytes(), b'{"snapshot":2}')
+            self.assertEqual(receipt.path.stat().st_size, 14)
+            self.assertEqual(receipt.handle, handle)
+            self.assertEqual(receipt.api.identity(handle), identity)
+            with self.assertRaisesRegex(RuntimeError, "already claimed"):
+                receipt.create()
+            with self.assertRaises(PermissionError):
+                receipt.path.unlink()
+            with self.assertRaises(PermissionError):
+                receipt.path.rename(output / "renamed.json")
+            for mode in ("wb", "r+b"):
+                with self.subTest(mode=mode), self.assertRaises(PermissionError):
+                    with receipt.path.open(mode):
+                        self.fail("A competing writer acquired the live receipt")
+            self.assertEqual(receipt.path.read_bytes(), b'{"snapshot":2}')
+        finally:
+            receipt.close()
+            owner.close()
+        receipt.path.rename(output / "renamed.json")
+        self.assertEqual((output / "renamed.json").read_bytes(), b'{"snapshot":2}')
+        with self.assertRaisesRegex(RuntimeError, "already claimed"):
+            receipt.create()
+
+    def provisional_replacement_attempts(self, kind):
+        publish, snapshots = bench.AcceptanceProvisionalFile.publish, []
+        foreign = self.root / "replacement-source"
+        original = b"external replacement bytes must survive"
+        if kind in ("directory", "junction"):
+            foreign.mkdir()
+            (foreign / "keep").write_bytes(original)
+        else:
+            foreign.write_bytes(original)
+        attempts, identities = [], []
+
+        def prepared(file, data):
+            # The serialized snapshot is ready, at the former closed-stage /
+            # Path.replace edge. Both attack operations must actually execute.
+            before = file.path.read_bytes()
+            identities.append(file.api.identity(file.handle))
+            attempts.append("unlink")
+            with self.assertRaises(PermissionError):
+                file.path.unlink()
+            attempts.append("insert")
+            with self.assertRaises(OSError):
+                if kind == "hardlink":
+                    bench.os.link(foreign, file.path)
+                elif kind == "file":
+                    foreign.replace(file.path)
+                elif kind == "symlink":
+                    file.path.symlink_to(foreign)
+                elif kind == "directory":
+                    file.path.mkdir()
+                else:
+                    import _winapi
+                    _winapi.CreateJunction(str(foreign), str(file.path))
+            self.assertEqual(file.path.read_bytes(), before)
+            self.assertEqual(file.api.identity(file.handle), identities[-1])
+            self.assertEqual((foreign / "keep" if foreign.is_dir() else foreign).read_bytes(), original)
+            result = publish(file, data)
+            self.assertEqual(file.path.read_bytes(), data)
+            snapshots.append(json.loads(data))
+            return result
+
+        with patch.object(bench.AcceptanceProvisionalFile, "publish", prepared):
+            result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertGreater(len(snapshots), 4)
+        self.assertEqual(attempts, ["unlink", "insert"] * len(snapshots))
+        self.assertEqual(snapshots[0]["status"], "provisional_starting")
+        self.assertEqual(snapshots[-1]["status"], "provisional_complete")
+        self.assertEqual(set(identities), {identities[0]})
+        self.assertIsNone(self.worker_args._provisional_file.handle)
+        self.assertEqual(self.provisional_handles, set())
+        self.assertFalse((self.case.output / "provisional.json.tmp").exists())
+
+    def test_r5b_hardlink_swap_attempt_executes_and_is_denied_at_every_publication(self):
+        self.provisional_replacement_attempts("hardlink")
+
+    def test_provisional_file_swap_attempt_is_denied_at_initial_repeated_and_final_publication(self):
+        self.provisional_replacement_attempts("file")
+
+    def test_provisional_symlink_insertion_is_denied_at_initial_repeated_and_final_publication(self):
+        self.provisional_replacement_attempts("symlink")
+
+    def test_provisional_directory_insertion_is_denied_at_initial_repeated_and_final_publication(self):
+        self.provisional_replacement_attempts("directory")
+
+    def test_provisional_junction_insertion_is_denied_at_initial_repeated_and_final_publication(self):
+        self.provisional_replacement_attempts("junction")
+
+    def test_initial_retained_seek_failure_never_starts_server(self):
+        self.retained_provisional_failure("seek")
+
+    def test_repeated_retained_seek_failure_cannot_pass(self):
+        self.retained_provisional_failure("seek", publish_number=4)
+
+    def test_initial_retained_truncate_failure_never_starts_server(self):
+        self.retained_provisional_failure("truncate")
+
+    def test_initial_retained_identity_failure_never_starts_server(self):
+        self.retained_provisional_failure("identity")
+
+    def test_repeated_retained_identity_failure_cannot_pass(self):
+        self.retained_provisional_failure("identity", publish_number=4)
+
+    def test_initial_retained_path_failure_never_starts_server(self):
+        self.retained_provisional_failure("path")
+
+    def test_primary_request_error_survives_retained_write_failure(self):
+        self.retained_provisional_failure("write", publish_number=4, primary=True)
+
+    def test_primary_request_error_survives_retained_close_failure(self):
+        self.retained_provisional_failure("close", primary=True)
+
+    def retained_deadline_failure(self, boundary, edge, offset):
+        publish, step = bench.AcceptanceProvisionalFile.publish, bench.AcceptanceProvisionalFile.step
+        calls, executed, crossed, snapshots = [], [], [], []
+        active = False
+
+        def clock():
+            if crossed and threading.current_thread() is self.case.worker_thread:
+                return self.worker_args._acceptance_deadline + offset
+            return self.case.clock()
+
+        def prepared(file, data):
+            nonlocal active
+            snapshots.append(json.loads(data))
+            active = len(snapshots) == 2
+            try:
+                return publish(file, data)
+            finally:
+                active = False
+
+        def stepping(file, operation, *args):
+            if not active:
+                return step(file, operation, *args)
+            calls.append(True)
+            if len(calls) != boundary:
+                return step(file, operation, *args)
+            if edge == "before":
+                crossed.append(offset)
+            def performed(*values):
+                executed.append(True)
+                result = operation(*values)
+                if edge == "after":
+                    crossed.append(offset)
+                return result
+            return step(file, performed, *args)
+
+        with patch.object(bench.time, "monotonic", side_effect=clock), \
+                patch.object(bench.AcceptanceProvisionalFile, "publish", prepared), \
+                patch.object(bench.AcceptanceProvisionalFile, "step", stepping), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(crossed, [offset])
+        self.assertEqual(len(calls), boundary)
+        self.assertEqual(executed, [True] if edge == "after" else [])
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.provisional_handles, set())
+        self.assertIsNone(self.worker_args._provisional_file.handle)
+        self.assertEqual(snapshots[-1]["status"], "provisional_failed")
+
+    def retained_create_or_close_deadline_failure(self, phase, edge, offset):
+        create, close = bench.AcceptanceProvisionalFile.create, bench.AcceptanceProvisionalFile.close
+        check = bench.AcceptanceProvisionalFile.check_deadline
+        native_open, native_close = self.provisional_api.open, self.provisional_api.close
+        active, crossed, checks, opened, closed = [], [], [], [], []
+
+        def clock():
+            if crossed and threading.current_thread() is self.case.worker_thread:
+                return self.worker_args._acceptance_deadline + offset
+            return self.case.clock()
+
+        def creating(file):
+            active.append(True)
+            try:
+                return create(file)
+            finally:
+                active.clear()
+
+        def checked(file):
+            if phase == "create" and active:
+                checks.append(True)
+                if len(checks) == (3 if edge == "before" else 4):
+                    crossed.append(offset)
+            return check(file)
+
+        def opening(path):
+            opened.append(True)
+            return native_open(path)
+
+        def closing(file):
+            if phase == "close" and edge == "before":
+                crossed.append(offset)
+            return close(file)
+
+        def native_closing(handle):
+            result = native_close(handle)
+            closed.append(True)
+            if phase == "close" and edge == "after":
+                crossed.append(offset)
+            return result
+
+        with patch.object(bench.time, "monotonic", side_effect=clock), \
+                patch.object(bench.AcceptanceProvisionalFile, "create", creating), \
+                patch.object(bench.AcceptanceProvisionalFile, "check_deadline", checked), \
+                patch.object(bench.AcceptanceProvisionalFile, "close", closing), \
+                patch.object(self.provisional_api, "open", side_effect=opening), \
+                patch.object(self.provisional_api, "close", side_effect=native_closing), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(crossed, [offset])
+        self.assertEqual(opened, [] if phase == "create" and edge == "before" else [True])
+        self.assertEqual(closed, opened, "Expired cleanup must still release its handle")
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.provisional_handles, set())
+        if phase == "create":
+            self.assertNotIn("server", self.case.events)
+
+    def test_real_provisional_close_failure_retains_handle_and_cannot_pass(self):
+        close, failures = self.provisional_api.close, []
+        def failed(handle):
+            failures.append(handle)
+            raise OSError("synthetic native provisional close failure")
+        stderr = io.StringIO()
+        with patch.object(self.provisional_api, "close", side_effect=failed), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        try:
+            self.assertEqual(failures, [self.worker_args._provisional_file.handle])
+            self.assertEqual(self.provisional_handles, set(failures))
+            self.assertEqual(self.case.code, 1)
+            self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+            self.assertIn("Worker provisional close failed (OSError).", stderr.getvalue())
+        finally:
+            receipt = self.worker_args._provisional_file
+            receipt.deadline = 0  # Caller cleanup is still required after expiration.
+            with self.assertRaisesRegex(TimeoutError, "Provisional close reached the absolute deadline"):
+                receipt.close()
+        self.assertEqual(self.provisional_handles, set())
+
+    def provisional_identity_mismatch(self, *, path=False, initial=False):
+        native = self.provisional_api.path if path else self.provisional_api.identity
+        publish = bench.AcceptanceProvisionalFile.publish
+        snapshots, injected, identities = [], [], []
+
+        def prepared(file, data):
+            snapshots.append(json.loads(data))
+            return publish(file, data)
+
+        def changed(handle):
+            actual = native(handle)
+            if not injected and (initial or len(snapshots) == 2):
+                if not path:
+                    identities.append(actual)
+                    if initial and len(identities) == 1:
+                        return actual  # Capture the true birth identity, then contradict it.
+                injected.append(True)
+                return str(self.root / "different.json") if path else (actual[0] + 1, actual[1])
+            return actual
+
+        with patch.object(bench.AcceptanceProvisionalFile, "publish", prepared), \
+                patch.object(self.provisional_api, "path" if path else "identity", side_effect=changed), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.case.code, 1)
+        self.assertEqual(self.provisional_handles, set())
+        if initial:
+            self.assertNotIn("server", self.case.events)
+        else:
+            self.assertEqual(snapshots[-1]["error"], "Provisional file identity differs.")
+
+    def test_initial_provisional_handle_identity_mismatch_never_starts_server(self):
+        self.provisional_identity_mismatch(initial=True)
+
+    def test_initial_provisional_handle_path_mismatch_never_starts_server(self):
+        self.provisional_identity_mismatch(path=True, initial=True)
+
+    def test_repeated_provisional_handle_identity_mismatch_cannot_pass(self):
+        self.provisional_identity_mismatch()
+
+    def test_repeated_provisional_handle_path_mismatch_cannot_pass(self):
+        self.provisional_identity_mismatch(path=True)
+
+    def test_final_partial_provisional_write_is_never_accepted_and_releases_handle(self):
+        write, injected = self.provisional_api.write, []
+        def partial(handle, data):
+            if json.loads(data).get("status") == "provisional_complete":
+                injected.append(True)
+                return write(handle, b'{"status":')
+            return write(handle, data)
+        with patch.object(self.provisional_api, "write", side_effect=partial), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertEqual(self.case.code, 1)
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertFalse(caught.exception.record["finalization"])
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(self.provisional_handles, set())
+
+    def test_retained_snapshot_size_refusal_is_latched_and_releases_handle(self):
+        owner = bench.AcceptanceOutputOwner(self.root / "size-refusal", str(self.root / "size-refusal"), create=True)
+        receipt = bench.AcceptanceProvisionalFile(owner, 990)
+        try:
+            receipt.create()
+            receipt.publish(b'{"status":"provisional_starting"}')
+            before = receipt.path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "exceeds its size budget"):
+                receipt.publish(b"x" * (bench.ACCEPTANCE_LOG_LIMIT + 1))
+            with self.assertRaisesRegex(RuntimeError, "previously failed"):
+                receipt.publish(b'{"status":"provisional_complete"}')
+            self.assertEqual(receipt.path.read_bytes(), before)
+        finally:
+            receipt.close()
+            owner.close()
+        self.assertEqual(self.provisional_handles, set())
+
+    def selected_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertTrue(self.case.closed)
+        return caught.exception.record
+
+    def receipt_mac(self, record):
+        authority = json.loads(self.case.bootstrap_settings)["output_authority"]
+        unsigned = {key: value for key, value in record.items() if key != "receipt_hmac_sha256"}
+        message = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hmac.new(bytes.fromhex(authority), message, hashlib.sha256).hexdigest()
+
+    def assert_retained_receipt_is_last_opened(self, final_reads):
+        # Acquisition may legitimately retry while the claim is incomplete, so the
+        # count of opens is timing-dependent; the order and closure are not.
+        self.assertTrue(final_reads)
+        self.assertEqual(set(final_reads), {self.receipt_opens[-1]})
+        self.assertEqual(self.receipt_events, [(kind, handle) for handle in self.receipt_opens
+                                               for kind in ("open", "close")])
+
+    def test_lifecycle_records_digests_of_every_authenticated_retained_artifact(self):
+        read, final_reads = self.receipt_api.read, []
+        def reading(handle, limit):
+            if self.case.closed:
+                final_reads.append(handle)
+            return read(handle, limit)
+        with patch.object(self.receipt_api, "read", side_effect=reading):
+            result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        output = self.case.output
+        expected = {name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+                    for name in ("provisional.json", "server.log", "engine.log", "controller.log")}
+        self.assertEqual(result["artifact_sha256"], expected)
+        self.assertEqual(json.loads((output / "lifecycle.json").read_bytes())["artifact_sha256"], expected)
+        worker = json.loads((output / "provisional.json").read_bytes())
+        self.assertEqual(worker["status"], "provisional_complete")
+        self.assertEqual(worker["artifact_sha256"], {name: expected[name] for name in ("server.log", "engine.log")})
+        self.assertEqual(worker["receipt_hmac_sha256"], self.receipt_mac(worker))
+        authority = json.loads(self.case.bootstrap_settings)["output_authority"]
+        for path in output.iterdir():
+            self.assertNotIn(authority.encode(), path.read_bytes())
+        self.assertEqual(len(final_reads), 2)
+        self.assert_retained_receipt_is_last_opened(final_reads)
+
+    def post_close_receipt_swap(self, kind):
+        # Parent probe r6 sequence: the worker's final close has returned and the
+        # controller has not yet made its first finalization read.
+        close, publish = bench.AcceptanceProvisionalFile.close, bench.AcceptanceProvisionalFile.publish
+        claimed = bench.acceptance_claimed_output
+        foreign = self.root / "post-close-source"
+        original = b"external post-close bytes must survive"
+        if kind == "junction":
+            foreign.mkdir()
+            (foreign / "keep").write_bytes(original)
+        else:
+            foreign.write_bytes(original)
+        published, attempts, identities = [], [], []
+
+        def observed(file, data):
+            result = publish(file, data)
+            published.append(data)
+            return result
+
+        def closing(file):
+            identity = file.identity if file.handle is not None else None
+            close(file)
+            if identity is None or attempts:
+                return
+            self.assertIsNone(file.handle)
+            self.assertEqual(len(self.receipt_handles), 1, "The controller receipt handle must be live")
+            identities.extend([identity, self.receipt_api.identity(next(iter(self.receipt_handles)))])
+            before = file.path.read_bytes()
+            attempts.append("unlink")
+            with self.assertRaises(PermissionError):
+                file.path.unlink()
+            attempts.append(kind)
+            with self.assertRaises(OSError):
+                if kind == "file":
+                    with open(file.path, "xb") as stream:
+                        stream.write(original)
+                elif kind == "hardlink":
+                    bench.os.link(foreign, file.path)
+                elif kind == "rename":
+                    foreign.replace(file.path)
+                elif kind == "symlink":
+                    file.path.symlink_to(foreign)
+                else:
+                    import _winapi
+                    _winapi.CreateJunction(str(foreign), str(file.path))
+            self.assertEqual(file.path.read_bytes(), before)
+
+        def first_final_read(*args, **kwargs):
+            if self.case.closed:
+                self.assertEqual(attempts, ["unlink", kind], "The attack must precede the first final read")
+            return claimed(*args, **kwargs)
+
+        with patch.object(bench.AcceptanceProvisionalFile, "close", closing), \
+                patch.object(bench.AcceptanceProvisionalFile, "publish", observed), \
+                patch.object(bench, "acceptance_claimed_output", side_effect=first_final_read):
+            result = self.case.invoke_selected()
+        self.assertEqual(attempts, ["unlink", kind])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(identities[0], identities[1])
+        provisional = self.case.output / "provisional.json"
+        self.assertFalse(provisional.is_symlink())
+        self.assertEqual(provisional.read_bytes(), published[-1])
+        self.assertEqual(json.loads(published[-1])["status"], "provisional_complete")
+        self.assertEqual(result["artifact_sha256"]["provisional.json"], hashlib.sha256(published[-1]).hexdigest())
+        self.assertEqual((foreign / "keep" if kind == "junction" else foreign).read_bytes(), original)
+        self.assertEqual(self.receipt_handles, set())
+
+    def test_post_close_unlink_and_new_file_cannot_replace_worker_receipt(self):
+        self.post_close_receipt_swap("file")
+
+    def test_post_close_hardlink_cannot_replace_worker_receipt(self):
+        self.post_close_receipt_swap("hardlink")
+
+    def test_post_close_rename_over_cannot_replace_worker_receipt(self):
+        self.post_close_receipt_swap("rename")
+
+    def test_post_close_symlink_cannot_replace_worker_receipt(self):
+        self.post_close_receipt_swap("symlink")
+
+    def test_post_close_junction_cannot_replace_worker_receipt(self):
+        self.post_close_receipt_swap("junction")
+
+    def post_close_receipt_rewrite(self, change, error=None):
+        close, publish = bench.AcceptanceProvisionalFile.close, bench.AcceptanceProvisionalFile.publish
+        published, rewritten = [], []
+
+        def observed(file, data):
+            result = publish(file, data)
+            published.append(data)
+            return result
+
+        def closing(file):
+            active = file.handle is not None
+            close(file)
+            if active and not rewritten:
+                data = change(published)
+                # The worker writer is gone; the controller handle shares writes by necessity.
+                with open(file.path, "r+b") as stream:
+                    stream.write(data)
+                    stream.truncate()
+                rewritten.append(data)
+                self.assertEqual(file.path.read_bytes(), data)
+
+        with patch.object(bench.AcceptanceProvisionalFile, "close", closing), \
+                patch.object(bench.AcceptanceProvisionalFile, "publish", observed), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        record = caught.exception.record
+        self.assertEqual(len(rewritten), 1)
+        self.assertEqual(record["worker_exit"], 0)
+        self.assertFalse(record["finalization"])
+        if error is not None:
+            self.assertEqual(record["finalization_error"], error)
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        self.assertEqual((self.case.output / "provisional.json").read_bytes(), rewritten[0])
+        self.assertFalse((self.case.output / "lifecycle.json").exists())
+        return published, record
+
+    def test_post_close_in_place_different_record_refuses(self):
+        def different(published):
+            record = json.loads(published[-1])
+            record["foreign_marker"] = True
+            return json.dumps(record).encode()
+        self.post_close_receipt_rewrite(different, "ValueError: Worker receipt authentication differs.")
+
+    def test_post_close_in_place_replay_of_earlier_worker_snapshot_refuses(self):
+        def replay(published):
+            earlier = json.loads(published[-2])
+            self.assertEqual(earlier["receipt_hmac_sha256"], self.receipt_mac(earlier))
+            self.assertNotIn("artifact_sha256", earlier)
+            return published[-2]
+        self.post_close_receipt_rewrite(replay, "ValueError: Worker server.log differs from its authenticated digest.")
+
+    def test_post_close_in_place_truncation_refuses(self):
+        published, record = self.post_close_receipt_rewrite(lambda published: published[-1][:len(published[-1]) // 2])
+        self.assertGreater(len(published[-1]), 2)
+        self.assertTrue(record["finalization_error"].startswith("JSONDecodeError: "))
+
+    def test_in_place_replay_between_controller_final_reads_refuses(self):
+        publish, claimed = bench.AcceptanceProvisionalFile.publish, bench.acceptance_claimed_output
+        published, reads = [], []
+
+        def observed(file, data):
+            result = publish(file, data)
+            published.append(data)
+            return result
+
+        def read(*args, **kwargs):
+            record = claimed(*args, **kwargs)
+            if self.case.closed:
+                reads.append(record)
+                if len(reads) == 1:
+                    # A valid earlier worker snapshot still authenticates and carries the claim.
+                    with open(self.case.output / "provisional.json", "r+b") as stream:
+                        stream.write(published[-2])
+                        stream.truncate()
+            return record
+
+        with patch.object(bench.AcceptanceProvisionalFile, "publish", observed), \
+                patch.object(bench, "acceptance_claimed_output", side_effect=read):
+            record = self.selected_refused()
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(reads[0]["status"], "provisional_complete")
+        self.assertNotEqual(reads[1]["status"], "provisional_complete")
+        self.assertFalse(record["finalization"])
+        self.assertEqual(record["finalization_error"], "ValueError: Worker receipt changed after controller consumption.")
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        self.assertEqual((self.case.output / "provisional.json").read_bytes(), published[-2])
+
+    def worker_log_changed_after_close(self, name, mode):
+        create, changed = bench.bounded_create, []
+        target = self.case.output / name
+
+        def creating(path, data, *args, **kwargs):
+            result = create(path, data, *args, **kwargs)
+            if path == target:
+                if mode == "rewritten":
+                    with open(path, "r+b") as stream:
+                        stream.write(b"X")
+                else:
+                    path.unlink()
+                    path.write_bytes(data if mode == "identical" else data + b"foreign suffix\n")
+                changed.append(data)
+            return result
+
+        if mode == "identical":
+            with patch.object(bench, "bounded_create", side_effect=creating):
+                result = self.case.invoke_selected()
+        else:
+            with patch.object(bench, "bounded_create", side_effect=creating), \
+                    self.assertRaises(bench.AcceptanceFailure) as caught:
+                self.case.invoke_selected()
+            result = caught.exception.record
+        self.assertEqual(len(changed), 1)
+        digest = hashlib.sha256(changed[0]).hexdigest()
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(worker["artifact_sha256"][name], digest)
+        self.assertEqual(result["worker_exit"], 0)
+        if mode == "identical":
+            self.assertTrue(bench.acceptance_final_predicate(result))
+            self.assertEqual(target.read_bytes(), changed[0])
+            self.assertEqual(result["artifact_sha256"][name], digest)
+            lifecycle = json.loads((self.case.output / "lifecycle.json").read_bytes())
+            self.assertEqual(lifecycle["artifact_sha256"][name], digest)
+        else:
+            self.assertNotEqual(hashlib.sha256(target.read_bytes()).hexdigest(), digest)
+            self.assertFalse(result["finalization"])
+            self.assertEqual(result["finalization_error"],
+                             "ValueError: Worker " + name + " differs from its authenticated digest.")
+            self.assertFalse(bench.acceptance_final_predicate(result))
+            self.assertNotIn(name, result["artifact_sha256"])
+
+    def test_byte_identical_server_log_replacement_passes_with_recorded_digest(self):
+        self.worker_log_changed_after_close("server.log", "identical")
+
+    def test_byte_identical_engine_log_replacement_passes_with_recorded_digest(self):
+        self.worker_log_changed_after_close("engine.log", "identical")
+
+    def test_modified_server_log_replacement_refuses(self):
+        self.worker_log_changed_after_close("server.log", "replaced")
+
+    def test_modified_engine_log_replacement_refuses(self):
+        self.worker_log_changed_after_close("engine.log", "replaced")
+
+    def test_in_place_server_log_rewrite_refuses(self):
+        self.worker_log_changed_after_close("server.log", "rewritten")
+
+    def test_in_place_engine_log_rewrite_refuses(self):
+        self.worker_log_changed_after_close("engine.log", "rewritten")
+
+    def receipt_mac_refused(self, change, error, *, claim=False):
+        receipt, injected = bench.acceptance_receipt, []
+        status = "provisional_starting" if claim else "provisional_complete"
+
+        def signed(snapshot, authority):
+            data = receipt(snapshot, authority)
+            if snapshot.get("status") == status:
+                record = json.loads(data)
+                change(record)
+                injected.append(record)
+                data = (json.dumps(record, indent=2) + "\n").encode("utf-8")
+            return data
+
+        with patch.object(bench, "acceptance_receipt", side_effect=signed):
+            result = self.failed_with_controller_writes()[0] if claim else self.selected_refused()
+        self.assertEqual(len(injected), 1)
+        self.assertFalse(result["finalization"])
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        if claim:
+            self.assertIn(error, result["error"])
+            self.assertNotIn("server", self.case.events)
+            self.assertFalse((self.case.output / "controller-ack.json").exists())
+        else:
+            self.assertEqual(result["worker_exit"], 0)
+            self.assertEqual(result["finalization_error"], "ValueError: " + error)
+            self.assertFalse((self.case.output / "lifecycle.json").exists())
+
+    def test_missing_final_receipt_mac_refuses(self):
+        self.receipt_mac_refused(lambda record: record.pop("receipt_hmac_sha256"),
+                                 "Worker receipt authentication is missing or malformed.")
+
+    def test_malformed_final_receipt_mac_refuses(self):
+        for value in ("Z" * 64, "A" * 64, "0" * 63, 1, None):
+            with self.subTest(value=value):
+                record = {"status": "provisional_complete", "receipt_hmac_sha256": value}
+                with self.assertRaisesRegex(ValueError, "^Worker receipt authentication is missing or malformed\\.$"):
+                    bench.acceptance_receipt_verify(record, "f" * 64)
+        self.receipt_mac_refused(lambda record: record.update(receipt_hmac_sha256="not-a-mac"),
+                                 "Worker receipt authentication is missing or malformed.")
+
+    def test_mismatched_final_receipt_mac_refuses(self):
+        def foreign_key(record):
+            unsigned = {key: value for key, value in record.items() if key != "receipt_hmac_sha256"}
+            record["receipt_hmac_sha256"] = hmac.new(b"\xee" * 32, json.dumps(
+                unsigned, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+        self.receipt_mac_refused(foreign_key, "Worker receipt authentication differs.")
+
+    def test_mismatched_claim_mac_is_never_acknowledged(self):
+        self.receipt_mac_refused(lambda record: record.update(receipt_hmac_sha256="0" * 64),
+                                 "Worker receipt authentication differs.", claim=True)
+
+    def test_claim_read_before_controller_receipt_handle_refuses_without_path_read(self):
+        output = self.root / "unheld-receipt"
+        output.mkdir()
+        (output / "provisional.json").write_bytes(b'{"status":"provisional_starting"}')
+        owner = bench.AcceptanceOutputOwner(output, str(output))
+        try:
+            with patch.object(Path, "open", side_effect=AssertionError("receipt reopened by path")), \
+                    self.assertRaisesRegex(RuntimeError, "^Controller receipt handle is not open\\.$"):
+                bench.acceptance_claimed_output(output, str(output), "f" * 64, owner=owner)
+        finally:
+            owner.close()
+        self.assertEqual(self.receipt_opens, [])
+        with patch.object(bench.AcceptanceOutputOwner, "open_receipt", autospec=True) as skipped:
+            result, writes = self.failed_with_controller_writes()
+        self.assertTrue(skipped.called)
+        self.assertEqual(writes, [])
+        self.assertIn("Controller receipt handle is not open.", result["error"])
+        self.assertNotIn("server", self.case.events)
+        self.assertFalse((self.case.output / "controller-ack.json").exists())
+        self.assertEqual(self.receipt_opens, [])
+
+    def controller_receipt_failure(self, operation, *, final):
+        native, injected = getattr(self.receipt_api, operation), []
+        message = "synthetic controller receipt " + operation + " failure"
+
+        def failed(*args):
+            if not injected and (self.case.closed or not final):
+                injected.append(True)
+                if operation == "path":
+                    return str(self.root / "different.json")
+                if operation == "identity":
+                    actual = native(*args)
+                    return actual[0] + 1, actual[1]
+                if operation == "attributes":
+                    return native(*args) | 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+                raise OSError(message)
+            return native(*args)
+
+        with patch.object(self.receipt_api, operation, side_effect=failed):
+            result = self.selected_refused() if final else self.failed_with_controller_writes()[0]
+        self.assertEqual(injected, [True], "The controller receipt failure must actually execute")
+        self.assertFalse(result["finalization"])
+        expected = message if operation in ("open", "read") else "Worker receipt identity differs."
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        if final:
+            self.assertIn("server", self.case.events)
+            self.assertEqual(result["worker_exit"], 0)
+            self.assertIn(expected, result["finalization_error"])
+            self.assertFalse((self.case.output / "controller.log").exists())
+        else:
+            self.assertIn(expected, result["error"])
+            self.assertNotIn("server", self.case.events)
+            self.assertFalse((self.case.output / "controller-ack.json").exists())
+        self.assertEqual(self.receipt_handles, set())
+
+    def test_controller_receipt_open_failure_never_acknowledges(self):
+        self.controller_receipt_failure("open", final=False)
+
+    def test_controller_receipt_acquisition_read_failure_never_acknowledges(self):
+        self.controller_receipt_failure("read", final=False)
+
+    def test_controller_receipt_final_read_failure_cannot_pass(self):
+        self.controller_receipt_failure("read", final=True)
+
+    def test_controller_receipt_acquisition_path_mismatch_never_acknowledges(self):
+        self.controller_receipt_failure("path", final=False)
+
+    def test_controller_receipt_final_path_mismatch_cannot_pass(self):
+        self.controller_receipt_failure("path", final=True)
+
+    def test_controller_receipt_final_identity_mismatch_cannot_pass(self):
+        self.controller_receipt_failure("identity", final=True)
+
+    def test_controller_receipt_final_reparse_attribute_cannot_pass(self):
+        self.controller_receipt_failure("attributes", final=True)
+
+    def test_controller_receipt_close_failure_cannot_pass_and_keeps_errors_separate(self):
+        close, failures = self.receipt_api.close, []
+
+        def failed(handle):
+            if self.case.closed and not failures:
+                failures.append(handle)
+                raise OSError("synthetic controller receipt close failure")
+            return close(handle)
+
+        with patch.object(self.receipt_api, "close", side_effect=failed), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        record, owner = caught.exception.record, caught.exception.output_owner
+        try:
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(self.receipt_handles, set(failures))
+            self.assertEqual(owner.receipt, failures[0])
+            self.assertIsNone(owner.handle, "The directory authority still closes")
+            self.assertFalse(record["finalization"])
+            self.assertNotIn("finalization_error", record)
+            self.assertEqual(record["cleanup_error"],
+                             "Controller output authority close failed: synthetic controller receipt close failure")
+            self.assertFalse(bench.acceptance_final_predicate(record))
+            self.assertTrue((self.case.output / "lifecycle.json").is_file())
+        finally:
+            owner.close()
+        self.assertEqual(self.receipt_handles, set())
+
+    def test_real_controller_receipt_follows_live_writer_and_denies_replacement_until_close(self):
+        output = self.root / "controller-receipt"
+        worker = bench.AcceptanceOutputOwner(output, str(output), create=True)
+        receipt = bench.AcceptanceProvisionalFile(worker, 990)
+        controller, moved, other = None, output / "moved.json", output / "other.json"
+        try:
+            receipt.create()
+            receipt.publish(b'{"snapshot":"long first value"}')
+            controller = bench.AcceptanceOutputOwner(output, str(output))
+            controller.open_receipt()
+            self.assertEqual(controller.read_receipt(), b'{"snapshot":"long first value"}')
+            for data in (b'{"snapshot":2}', b'{"snapshot":"third"}'):
+                receipt.publish(data)
+                self.assertEqual(controller.read_receipt(), data)
+            with self.assertRaises(PermissionError):
+                receipt.path.open("r+b")  # The live worker writer still denies other writers.
+            receipt.close()
+            self.assertIsNone(receipt.handle)
+            other.write_bytes(b"other bytes must survive")
+            for attempt in (receipt.path.unlink, lambda: receipt.path.rename(moved), lambda: other.replace(receipt.path)):
+                with self.assertRaises(PermissionError):
+                    attempt()
+            self.assertEqual(other.read_bytes(), b"other bytes must survive")
+            self.assertFalse(moved.exists())
+            self.assertEqual(controller.read_receipt(), b'{"snapshot":"third"}')
+            self.assertEqual(controller.receipt_api.identity(controller.receipt), receipt.identity)
+        finally:
+            receipt.close()
+            if controller is not None:
+                controller.close()
+            worker.close()
+        self.assertIsNone(controller.receipt)
+        receipt.path.rename(moved)
+        self.assertEqual(moved.read_bytes(), b'{"snapshot":"third"}')
+        self.assertEqual(self.receipt_handles, set())
+
+    def server_under_held_receipt(self):
+        # At each server start: does the controller hold exactly one receipt, on the live worker object?
+        spawn, held = self.case.spawn, []
+        def popen(argv, **kwargs):
+            if "--engine" in argv:
+                worker, handles = self.worker_args._provisional_file, list(self.receipt_handles)
+                held.append(len(handles) == 1 and worker.handle is not None
+                            and self.receipt_api.identity(handles[0]) == worker.identity)
+            return spawn(argv, **kwargs)
+        self.enterContext(patch.object(bench.subprocess, "Popen", side_effect=popen))
+        return held
+
+    def acquisitions(self):
+        acquire, outcomes = bench.acceptance_acquire_output, []
+        def acquiring(*args):
+            try:
+                owner = acquire(*args)
+            except BaseException as exc:
+                outcomes.append(type(exc).__name__)
+                raise
+            outcomes.append("held")
+            return owner
+        self.enterContext(patch.object(bench, "acceptance_acquire_output", side_effect=acquiring))
+        return outcomes
+
+    def assert_one_held_acquisition(self, outcomes):
+        self.assertEqual(outcomes.count("held"), 1)
+        self.assertEqual(outcomes[-1], "held", "No acquisition may follow acknowledgment publication")
+        self.assertLessEqual(set(outcomes[:-1]), {"FileNotFoundError", "JSONDecodeError"})
+
+    def test_acknowledgment_is_one_exclusive_create_after_the_receipt_is_held(self):
+        held, outcomes = self.server_under_held_receipt(), self.acquisitions()
+        create, created = bench.bounded_create, []
+        def creating(path, *args, **kwargs):
+            if threading.current_thread() is not self.case.worker_thread:
+                created.append((path.name, len(self.receipt_handles)))
+            return create(path, *args, **kwargs)
+        with patch.object(bench, "bounded_create", side_effect=creating):
+            result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(created, [("controller-ack.json", 1), ("controller.log", 1), ("lifecycle.json", 1)])
+        self.assertEqual(held, [True])
+        self.assert_one_held_acquisition(outcomes)
+        self.assertEqual(sorted(p.name for p in self.case.output.iterdir()), [
+            "controller-ack.json", "controller.log", "engine.log", "lifecycle.json", "provisional.json", "server.log"])
+
+    def acknowledgment_planted_before_create(self, content):
+        # A foreign process creates controller-ack.json immediately before the controller's create.
+        held, outcomes = self.server_under_held_receipt(), self.acquisitions()
+        create, planted = bench.bounded_create, []
+        def publish(path, data, *args, **kwargs):
+            if path.name == "controller-ack.json" and not planted:
+                planted.append(data if content is None else content)
+                path.write_bytes(planted[0])
+            return create(path, data, *args, **kwargs)
+        with patch.object(bench, "bounded_create", side_effect=publish):
+            result, writes = self.failed_with_controller_writes()
+        self.assertEqual(len(planted), 1, "The foreign create must actually execute")
+        self.assertTrue(result["error"].startswith("FileExistsError: "))
+        self.assertEqual(result["finalization_error"], "ValueError: Controller output authority was not acquired.")
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertEqual((self.case.output / "controller-ack.json").read_bytes(), planted[0])
+        self.assertEqual(writes, [])
+        self.assert_one_held_acquisition(outcomes)
+        return held
+
+    def test_preexisting_garbage_acknowledgment_is_terminal_and_never_starts_server(self):
+        self.assertEqual(self.acknowledgment_planted_before_create(b"not json"), [])
+        self.assertNotIn("server", self.case.events)
+
+    def test_preexisting_wrong_acknowledgment_is_terminal_and_never_starts_server(self):
+        self.assertEqual(self.acknowledgment_planted_before_create(b'{"acquired_sha256":"' + b"0" * 64 + b'"}'), [])
+        self.assertNotIn("server", self.case.events)
+
+    def test_preexisting_copied_acknowledgment_cannot_start_server_without_held_receipt(self):
+        # Worst case beyond the boundary: the exact token, which no artifact exposes before this create.
+        held = self.acknowledgment_planted_before_create(None)
+        self.assertNotIn(False, held)
+
+    def test_acknowledgment_cannot_be_replaced_or_unlinked_while_the_controller_writes_it(self):
+        held, outcomes = self.server_under_held_receipt(), self.acquisitions()
+        real_open, gate, attempts = Path.open, threading.Event(), []
+        target, other = self.case.output / "acknowledgment-other", self.root / "acknowledgment-other"
+        wrong = b'{"acquired_sha256":"' + b"0" * 64 + b'"}'
+        other.write_bytes(b"other bytes must survive")
+
+        def attack(path, point):
+            for name, operation, error in (
+                    ("unlink", path.unlink, PermissionError),
+                    ("replace", lambda: other.replace(path), PermissionError),
+                    ("rename", lambda: path.rename(target), PermissionError),
+                    ("link", lambda: bench.os.link(other, path), FileExistsError)):
+                with self.assertRaises(error):
+                    operation()
+                attempts.append((point, name))
+            if point == "flushed":
+                with open(path, "r+b") as stream:  # The controller's create shares writes.
+                    stream.write(wrong)
+                    stream.truncate()
+                attempts.append((point, "overwrite"))
+                gate.set()
+
+        class Stream:
+            def __init__(stream, path, inner):
+                stream.path, stream.inner = path, inner
+            def __enter__(stream):
+                return stream
+            def __exit__(stream, *exc):
+                return stream.inner.__exit__(*exc)
+            def write(stream, data):
+                attack(stream.path, "opened")
+                return stream.inner.write(data)
+            def flush(stream):
+                stream.inner.flush()
+                attack(stream.path, "flushed")
+
+        def opening(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if path == self.case.output / "controller-ack.json":
+                if threading.current_thread() is self.case.worker_thread:
+                    gate.wait(10)  # Scheduling only: the worker reads after the foreign overwrite.
+                elif mode == "xb":
+                    return Stream(path, real_open(path, *args, **kwargs))
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", opening), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        record = caught.exception.record
+        self.assertEqual(attempts, [(point, name) for point in ("opened", "flushed")
+                                    for name in ("unlink", "replace", "rename", "link")] + [("flushed", "overwrite")])
+        self.assertEqual(other.read_bytes(), b"other bytes must survive")
+        self.assertFalse(target.exists())
+        self.assertEqual(record["worker_exit"], 1)
+        self.assertEqual(self.worker_args._acceptance_admission["reason"], "Controller acknowledgment differs.")
+        self.assertNotIn("server", self.case.events)
+        self.assertEqual(held, [])
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        self.assert_one_held_acquisition(outcomes)
+
+    def acknowledgment_failure_after_publication(self, foreign=None, *, swap=False):
+        # Review r7 P3/P5 adapted: the token is published and reaches the worker, a foreign
+        # process optionally copies it ("left") or removes it ("cleared"), then the
+        # controller's publication step fails.
+        held, outcomes = self.server_under_held_receipt(), self.acquisitions()
+        create, close, seen = bench.bounded_create, bench.AcceptanceProvisionalFile.close, {}
+
+        def publish(path, data, *args, **kwargs):
+            result = create(path, data, *args, **kwargs)
+            if path.name == "controller-ack.json" and "copied" not in seen:
+                seen["copied"] = path.read_bytes()
+                for _ in range(2000):
+                    if "server" in self.case.events:
+                        break
+                    threading.Event().wait(0.005)
+                if foreign is not None:
+                    path.unlink()  # The controller's create has closed; its name is now free.
+                if foreign == "left":
+                    path.write_bytes(seen["copied"])  # A foreign copy of the token stays.
+                seen["outcomes"] = len(outcomes)
+                raise OSError("synthetic acknowledgment failure after publication")
+            return result
+
+        def closing(file):
+            active = file.handle is not None
+            try:
+                close(file)  # After the stop this close also reports the passed deadline.
+            finally:
+                if active and swap:
+                    # The worker writer is gone; the controller still holds its receipt.
+                    self.assertIsNone(file.handle)
+                    seen["opens_at_worker_close"] = len(self.receipt_opens)
+                    data = file.path.read_bytes()
+                    with self.assertRaises(PermissionError):
+                        file.path.unlink()
+                    with self.assertRaises(FileExistsError):
+                        with open(file.path, "xb") as stream:
+                            stream.write(data)
+                    seen["swap_denied"] = True
+
+        with patch.object(bench, "bounded_create", side_effect=publish), \
+                patch.object(bench.AcceptanceProvisionalFile, "close", closing):
+            record, writes = self.failed_with_controller_writes()
+        authority = json.loads(self.case.bootstrap_settings)["output_authority"]
+        claim = json.loads((self.case.output / "provisional.json").read_bytes())["output_claim"]
+        claim = {"path": claim["path"], "identity_sha256": claim["identity_sha256"]}  # Token field order.
+        acquired = hashlib.sha256(json.dumps(["strata-acceptance-acquired/1", authority, claim],
+                                             separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(json.loads(seen["copied"]), {"acquired_sha256": acquired})
+        self.assertIn("server", self.case.events, "The copied token must actually reach the worker")
+        self.assertEqual(held, [True])
+        self.assertEqual(len(outcomes), seen["outcomes"], "Publication failure is never retried")
+        self.assert_one_held_acquisition(outcomes)
+        self.assertIn("OSError: synthetic acknowledgment failure after publication", record["error"])
+        self.assertEqual(record["finalization_error"], "ValueError: Controller output authority was not acquired.")
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        self.assertEqual(writes, [])
+        self.assertEqual((self.case.output / "controller-ack.json").exists(), foreign != "cleared")
+        if swap:
+            self.assertTrue(seen["swap_denied"])
+            self.assertEqual(len(self.receipt_opens), seen["opens_at_worker_close"])
+        return record
+
+    def test_copied_acknowledgment_left_after_publication_failure_cannot_pass(self):
+        self.acknowledgment_failure_after_publication("left")
+
+    def test_copied_acknowledgment_cleared_after_publication_failure_is_never_reacquired(self):
+        self.acknowledgment_failure_after_publication("cleared")
+
+    def test_publication_failure_keeps_receipt_on_worker_object_after_worker_close(self):
+        # Review r7 P5 adapted: no reacquisition after the worker closes, and no swap while held.
+        self.acknowledgment_failure_after_publication("cleared", swap=True)
+
+    def receipt_reencoded(self, encode):
+        # Review r7 P2: after the worker closes, rewrite the same record with different bytes.
+        read_receipt, seen = bench.AcceptanceOutputOwner.read_receipt, {}
+        def reading(owner):
+            if self.case.closed and "data" not in seen:
+                path = owner.path / "provisional.json"
+                original = path.read_bytes()
+                data = encode(original)
+                self.assertNotEqual(data, original)
+                self.assertEqual(json.loads(data), json.loads(original))
+                with open(path, "r+b") as stream:  # The controller handle shares writes by necessity.
+                    stream.write(data)
+                    stream.truncate()
+                seen.update(original=original, data=data)
+            return read_receipt(owner)
+        with patch.object(bench.AcceptanceOutputOwner, "read_receipt", reading):
+            record = self.selected_refused()
+        self.assertIn("data", seen, "The rewrite must actually execute")
+        self.assertEqual(record["worker_exit"], 0)
+        self.assertFalse(record["finalization"])
+        self.assertEqual(record["finalization_error"], "ValueError: Worker receipt encoding differs.")
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        self.assertNotIn("artifact_sha256", record)
+        self.assertFalse((self.case.output / "lifecycle.json").exists())
+        self.assertEqual((self.case.output / "provisional.json").read_bytes(), seen["data"])
+
+    def test_compact_reencoded_receipt_refuses(self):
+        self.receipt_reencoded(lambda data: json.dumps(json.loads(data), separators=(",", ":")).encode())
+
+    def test_reordered_key_reencoded_receipt_refuses(self):
+        # The worker's encoding sorts keys; any other order with the same layout must refuse.
+        self.receipt_reencoded(lambda data: (json.dumps(dict(reversed(json.loads(data).items())), indent=2)
+                                             + "\n").encode())
+
+    def test_worker_receipt_bytes_are_the_sorted_indented_encoding_of_their_value(self):
+        result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        data = (self.case.output / "provisional.json").read_bytes()
+        self.assertEqual(data, (json.dumps(json.loads(data), indent=2, sort_keys=True) + "\n").encode())
+
+    def test_escaped_character_reencoded_receipt_refuses(self):
+        self.receipt_reencoded(lambda data: data.replace(b'"provisional_complete"', b'"provisional\\u005fcomplete"'))
+
+    def test_trailing_whitespace_reencoded_receipt_refuses(self):
+        self.receipt_reencoded(lambda data: data + b" \n")
+
+    def lifecycle_foreign_entry(self, kind):
+        # Review r7 P1 adapted: a foreign entry appears right after the controller's lifecycle create.
+        create, removals, planted = bench.bounded_create, [], []
+        external, foreign = self.root / "external-lifecycle.bin", self.case.output / "lifecycle.json.tmp"
+        external_bytes = b"external foreign bytes, must survive"
+
+        def publish(path, *args, **kwargs):
+            result = create(path, *args, **kwargs)
+            if path.name == "lifecycle.json" and kind is not None:
+                if kind == "hardlink":
+                    external.write_bytes(external_bytes)
+                    bench.os.link(external, foreign)
+                else:
+                    foreign.write_bytes(b"attacker-created sole-link foreign file")
+                planted.append(foreign.read_bytes())
+            return result
+
+        def removal(name):
+            original = getattr(bench.os, name)
+            def removing(*args, **kwargs):
+                if threading.current_thread() is not self.case.worker_thread and any(
+                        isinstance(path, (str, bench.os.PathLike)) and Path(path).parent == self.case.output
+                        for path in args[:2]):
+                    removals.append((name, *(Path(path).name for path in args[:2])))
+                return original(*args, **kwargs)
+            return patch.object(bench.os, name, side_effect=removing)
+
+        with patch.object(bench, "bounded_create", side_effect=publish), \
+                removal("unlink"), removal("remove"), removal("replace"), removal("rename"):
+            if kind is None:
+                result = self.case.invoke_selected()
+            else:
+                with self.assertRaises(bench.AcceptanceFailure) as caught:
+                    self.case.invoke_selected()
+                result = caught.exception.record
+        self.assertEqual(removals, [], "The controller never deletes or replaces an output entry")
+        lifecycle = json.loads((self.case.output / "lifecycle.json").read_bytes())
+        self.assertEqual(lifecycle["artifact_sha256"], result["artifact_sha256"])
+        if kind is None:
+            self.assertTrue(bench.acceptance_final_predicate(result))
+            self.assertFalse(foreign.exists())
+            return
+        self.assertEqual(len(planted), 1, "The foreign entry must actually be created")
+        self.assertFalse(result["finalization"])
+        self.assertEqual(result["finalization_error"], "RuntimeError: Unexpected or oversized retained artifacts.")
+        self.assertFalse(bench.acceptance_final_predicate(result))
+        self.assertEqual(foreign.read_bytes(), planted[0])
+        if kind == "hardlink":
+            self.assertEqual(external.read_bytes(), external_bytes)
+            self.assertEqual(bench.os.stat(external).st_ino, bench.os.stat(foreign).st_ino)
+
+    def test_passing_run_never_deletes_or_replaces_an_output_entry(self):
+        self.lifecycle_foreign_entry(None)
+
+    def test_foreign_file_after_lifecycle_create_survives_and_refuses(self):
+        self.lifecycle_foreign_entry("file")
+
+    def test_foreign_hard_link_after_lifecycle_create_survives_and_refuses(self):
+        self.lifecycle_foreign_entry("hardlink")
+
+    def test_final_worker_artifact_accounting_failure_cannot_pass(self):
+        original_stat, injected = Path.stat, []
+        def stat(path, *args, **kwargs):
+            if path == self.case.output / "server.log" and self.case.code == 0:
+                injected.append(True)
+                raise OSError("synthetic final artifact accounting failure")
+            return original_stat(path, *args, **kwargs)
+        with patch.object(Path, "stat", stat), self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        self.assertEqual(injected, [True])
+        self.assertEqual(caught.exception.record["finalization_error"],
+                         "OSError: synthetic final artifact accounting failure")
+        self.assertFalse(bench.acceptance_final_predicate(caught.exception.record))
+        self.assertEqual(self.directory_handles, set())
+
+    def test_missing_or_changed_consumed_config_identity_still_refuses_before_server(self):
+        self.args.acceptance_telemetry = False
+        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = None
+        self.args._acceptance_deadline = 990
+        self.args._acceptance_manifest = self.manifest
+        snapshot = bench.protection_snapshot
+        def changed(paths):
+            rows = snapshot(paths)
+            if missing:
+                return [row for row in rows if row["path"] != str(self.args.config.resolve())]
+            next(row for row in rows if row["path"] == str(self.args.config.resolve()))["sha256"] = "f" * 64
+            return rows
+        for missing in (False, True):
+            with self.subTest(missing=missing), patch.object(bench, "protection_snapshot", side_effect=changed), \
+                    self.assertRaisesRegex(ValueError, "^Configuration changed while binding the consumed inputs\\.$"):
+                bench._run_workload(self.args)
+            self.assertNotIn("server", self.case.events)
+            self.assertFalse(self.case.output.exists())
+
+    def test_controller_output_mismatch_refuses_before_any_host_sample_or_child(self):
+        self.args.output = self.root / "different-output"
+        self.controller_refused("Manifest output differs.")
+        self.assertFalse(self.args.output.exists())
+
+    def test_controller_existing_output_is_preserved_without_child_or_evidence_writes(self):
+        self.case.output.mkdir()
+        marker = self.case.output / "keep.txt"
+        marker.write_bytes(b"foreign output")
+        self.controller_refused("Output directory already exists; choose a new directory.")
+        self.assertEqual(list(self.case.output.iterdir()), [marker])
+        self.assertEqual(marker.read_bytes(), b"foreign output")
+
+    def test_controller_existing_resolved_output_alias_refuses_without_worker(self):
+        self.case.output.mkdir()
+        self.args.output = self.root / "absent/../output"
+        self.controller_refused("Output directory already exists; choose a new directory.")
+        self.assertEqual(list(self.case.output.iterdir()), [])
+        self.assertFalse((self.root / "absent").exists())
+
+    def test_controller_late_window_refuses_without_worker(self):
+        self.changed_manifest(lambda value: value.update(not_after_unix=1800001000.0))
+        self.case.now = 100.001
+        self.controller_refused("Manifest window is too short.")
+
+    def test_exact_expiry_equality_is_admitted_but_next_float_is_refused(self):
+        self.changed_manifest(lambda value: value.update(not_after_unix=1800001000.0))
+        self.assertIsNone(bench.acceptance_admission(self.args, self.manifest, 1800000100.0))
+        with self.assertRaisesRegex(ValueError, "^Manifest window is too short\\.$"):
+            bench.acceptance_admission(self.args, self.manifest, 1800000100.0000002)
+
+    def test_controller_floor_mismatch_refuses_without_worker(self):
+        self.args.acceptance_commit_gib = 8
+        self.controller_refused("Manifest commit floor differs.")
+
+    def test_controller_frozen_control_refuses_without_worker(self):
+        self.args.cohort = "frozen-control"
+        self.controller_refused("Frozen control cannot use an acceptance manifest.")
+
+    def test_resolved_output_candidate_and_protect_aliases_match_writer_values(self):
+        self.args.output = self.root / "missing/../output"
+        self.args.protect_input = [str(self.root / "missing/.." / path.name) for path in self.extra]
+        self.assertIsNone(bench.acceptance_admission(self.args, self.manifest, 1800000100.0))
+        self.manifest["candidate_exe"] = str(self.saved)
+        self.args.candidate_exe = self.root / "missing/../saved.exe"
+        self.assertIsNone(bench.acceptance_admission(self.args, self.manifest, 1800000100.0))
+
+    def test_noncanonical_manifest_output_alias_cannot_equal_resolved_argument(self):
+        self.changed_manifest(lambda value: value.update(output=str(self.root / "missing/../output")))
+        self.controller_refused("Manifest output differs.")
+
+    def test_controller_exact_scalar_and_order_comparisons(self):
+        cases = [("acceptance_workload", "near-full", "workload"),
+                 ("cohort", "automatic", "cohort"), ("expected_context", 65536, "expected_context"),
+                 ("port", 18081, "port"), ("acceptance_total_seconds", 1200, "total_seconds"),
+                 ("acceptance_physical_gib", 4.0, "physical floor"),
+                 ("acceptance_commit_gib", 4.0, "commit floor"),
+                 ("candidate_exe", self.saved, "candidate_exe"),
+                 ("protect_input", list(reversed(self.args.protect_input)), "protect_input")]
+        for name, value, reason in cases:
+            with self.subTest(name=name):
+                original = getattr(self.args, name)
+                setattr(self.args, name, value)
+                try:
+                    # Near-full requires automatic; test its workload equality directly.
+                    if name == "acceptance_workload":
+                        self.args.cohort = "automatic"
+                    self.controller_refused("Manifest " + reason + " differs.")
+                finally:
+                    setattr(self.args, name, original)
+                    self.args.cohort = "saved-static"
+
+    def test_boolean_and_numeric_aliases_never_establish_boundary_equality(self):
+        cases = [("port", 8081.0), ("expected_context", 131072.0),
+                 ("acceptance_total_seconds", 900.0), ("acceptance_physical_gib", True),
+                 ("acceptance_commit_gib", True), ("candidate_exe", False),
+                 ("protect_input", tuple(self.args.protect_input))]
+        for name, value in cases:
+            with self.subTest(name=name):
+                args = argparse.Namespace(**vars(self.args))
+                setattr(args, name, value)
+                with self.assertRaises(ValueError):
+                    bench.acceptance_admission(args, self.manifest, 1800000100.0)
+        for key, value in (("port", 8081.0), ("total_seconds", 900.0), ("expected_context", 131072.0)):
+            manifest = bench.copy.deepcopy(self.manifest)
+            manifest[key] = value
+            with self.subTest(manifest=key), self.assertRaises(ValueError):
+                bench.acceptance_admission(self.args, manifest, 1800000100.0)
+
+    def test_first_controller_physical_sample_one_byte_below_floor_refuses_worker(self):
+        self.first_sample_refused("available_gib", "physical")
+
+    def test_first_controller_commit_sample_one_byte_below_floor_refuses_worker(self):
+        self.first_sample_refused("commit_available_gib", "commit")
+
+    def first_sample_refused(self, key, name):
+        from tools import prepare_unsloth_q2 as prep
+        snapshot = {"available_gib": 4, "commit_available_gib": 4}
+        snapshot[key] -= 1 / 1024**3
+        with patch.object(prep, "memory_snapshot", return_value=snapshot), \
+                self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke()
+        self.assertEqual(caught.exception.record["admission"], {
+            "manifest_sha256": self.digest, "status": "refused",
+            "reason": "Fresh " + name + " memory is below the manifest floor."})
+        self.assertNotIn("create", self.case.events)
+        self.assertFalse(self.case.output.exists())
+
+    def test_worker_rejects_input_hash_changed_after_manifest_creation(self):
+        self.extra[0].write_bytes(b"changed input, same reviewed path")
+        self.worker_refused("Manifest inputs identity changed.")
+
+    def test_worker_rejects_shard_mtime_changed_after_manifest_creation(self):
+        stat = self.shard.stat()
+        bench.os.utime(self.shard, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000))
+        self.worker_refused("Manifest size_bound identity changed.")
+
+    def test_worker_rejects_pack_data_size_changed_after_manifest_creation(self):
+        self.pack_data.write_bytes(b"different size")
+        self.worker_refused("Manifest size_bound identity changed.")
+
+    def test_worker_rejects_source_head_change(self):
+        self.head = "f" * 40
+        self.worker_refused("Manifest source HEAD differs.")
+
+    def test_worker_fresh_physical_sample_one_byte_below_floor_refuses_server(self):
+        self.worker_sample_refused("available_gib", "physical")
+
+    def test_worker_fresh_commit_sample_one_byte_below_floor_refuses_server(self):
+        self.worker_sample_refused("commit_available_gib", "commit")
+
+    def worker_sample_refused(self, key, name):
+        from tools import prepare_unsloth_q2 as prep
+        def snapshot():
+            self.case.samples += 1
+            result = {"available_gib": 4, "commit_available_gib": 4}
+            if threading.current_thread() is self.case.worker_thread:
+                result[key] -= 1 / 1024**3
+            return result
+        with patch.object(prep, "memory_snapshot", side_effect=snapshot):
+            self.worker_refused("Fresh " + name + " memory is below the manifest floor.")
+
+    def test_worker_repeats_output_identity_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "output", self.root / "other-output")
+        self.worker_refused("Manifest output differs.")
+        self.assertFalse((self.root / "other-output").exists())
+
+    def test_worker_repeats_existing_output_check_independently(self):
+        self.before_preflight = lambda args: args.output.mkdir()
+        self.worker_refused("Output directory already exists; choose a new directory.")
+
+    def test_worker_repeats_frozen_control_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "cohort", "frozen-control")
+        self.worker_refused("Frozen control cannot use an acceptance manifest.")
+
+    def test_worker_repeats_window_check_independently(self):
+        self.changed_manifest(lambda value: value.update(not_after_unix=1800001001.0))
+        self.before_preflight = lambda args: setattr(self.case, "now", 101.001)
+        self.worker_refused("Manifest window is too short.")
+
+    def test_worker_repeats_port_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "port", 18081)
+        self.worker_refused("Manifest port differs.")
+
+    def test_worker_repeats_cohort_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "cohort", "automatic")
+        self.worker_refused("Manifest cohort differs.")
+
+    def test_worker_repeats_workload_check_independently(self):
+        def change(args):
+            args.acceptance_workload, args.cohort = "near-full", "automatic"
+        self.before_preflight = change
+        self.worker_refused("Manifest workload differs.")
+
+    def test_worker_repeats_context_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "expected_context", 65536)
+        self.worker_refused("Manifest expected_context differs.")
+
+    def test_worker_repeats_total_seconds_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "acceptance_total_seconds", 1200)
+        self.worker_refused("Manifest total_seconds differs.")
+
+    def test_worker_repeats_candidate_check_independently(self):
+        self.before_preflight = lambda args: setattr(args, "candidate_exe", str(self.saved))
+        self.worker_refused("Manifest candidate_exe differs.")
+
+    def test_worker_repeats_protect_order_check_independently(self):
+        self.before_preflight = lambda args: args.protect_input.reverse()
+        self.worker_refused("Manifest protect_input differs.")
+
+    def test_worker_refuses_numeric_port_alias_even_when_value_matches(self):
+        self.before_preflight = lambda args: setattr(args, "port", 8081.0)
+        self.worker_refused("Manifest port differs.")
+
+    def test_worker_refuses_numeric_duration_alias_even_when_value_matches(self):
+        self.before_preflight = lambda args: setattr(args, "acceptance_total_seconds", 900.0)
+        self.worker_refused("Manifest total_seconds differs.")
+
+    def test_worker_refuses_numeric_input_size_alias_even_when_value_matches(self):
+        real_identity = bench.file_identity
+        def identity(path):
+            result = real_identity(path)
+            if path == self.extra[0] and self.case.started:
+                result["bytes"] = float(result["bytes"])
+            return result
+        with patch.object(bench, "file_identity", side_effect=identity):
+            self.worker_refused("Manifest inputs identity changed.")
+
+    def test_worker_missing_memory_telemetry_refuses_server(self):
+        from tools import prepare_unsloth_q2 as prep
+        original = self.case.sample
+        def snapshot():
+            result = original()
+            if threading.current_thread() is self.case.worker_thread:
+                result.pop("commit_available_gib")
+            return result
+        with patch.object(prep, "memory_snapshot", side_effect=snapshot):
+            self.worker_refused("Fresh commit memory is below the manifest floor.")
+
+    def test_worker_expired_git_budget_never_starts_git_or_server(self):
+        self.before_preflight = lambda args: setattr(args, "_acceptance_deadline", self.case.now)
+        self.worker_refused("Absolute worker deadline reached during admission.")
+        self.assertEqual(self.git_calls, [])
+
+    def test_worker_git_timeout_refuses_before_server_start(self):
+        with patch.object(bench.subprocess, "run", side_effect=bench.subprocess.TimeoutExpired(
+                ["git", "rev-parse", "HEAD"], 0.5)):
+            self.worker_refused("Command '['git', 'rev-parse', 'HEAD']' timed out after 0.5 seconds")
+
+    def test_worker_git_timeout_uses_remaining_deadline(self):
+        def shorten(args):
+            args._acceptance_deadline = self.case.now + 0.5
+        self.before_preflight = shorten
+        # Reach the server seam only after the real preflight returns.
+        with patch.object(bench, "assert_idle", side_effect=RuntimeError("stop after preflight")):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure):
+                self.case.invoke()
+        call = next(call for call in self.git_calls if call[0] == ["git", "rev-parse", "HEAD"])
+        self.assertGreater(call[1]["timeout"], 0)
+        self.assertLess(call[1]["timeout"], 0.5)
+        self.assertNotIn("server", self.case.events)
+
+    def test_deadline_crossing_after_preflight_refuses_immediately_before_server_popen(self):
+        self.server_deadline_refused(0.001)
+
+    def test_exact_deadline_after_preflight_refuses_immediately_before_server_popen(self):
+        self.server_deadline_refused(0)
+
+    def server_deadline_refused(self, offset):
+        checks = []
+        def idle(port):
+            checks.append(port)
+            if len(checks) == 2:
+                deadline = self.worker_args._acceptance_deadline + offset
+                self.case.now = deadline
+                self.enterContext(patch.object(bench.time, "monotonic", return_value=deadline))
+        with patch.object(bench, "assert_idle", side_effect=idle):
+            self.worker_refused("Absolute worker deadline reached before server start.")
+        self.assertEqual(checks, [8081, 8081])
+
+    def test_missing_manifest_fails_worker_before_workload_or_output(self):
+        self.before_preflight = lambda args: setattr(args, "acceptance_manifest", None)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(bench.AcceptanceFailure):
+            self.case.invoke()
+        self.assertEqual(self.worker_args._acceptance_admission, {
+            "status": "refused", "reason": "Acceptance manifest is required."})
+        self.assertIn("Acceptance admission refused: Acceptance manifest is required.", stderr.getvalue())
+        self.assertNotIn("server", self.case.events)
+
+    def test_manifest_cli_requires_telemetry_and_selected_workload(self):
+        for telemetry, workload in ((False, None), (True, None), (False, "short")):
+            with self.subTest(telemetry=telemetry, workload=workload):
+                args = argparse.Namespace(**vars(self.args))
+                args.acceptance_telemetry, args.acceptance_workload = telemetry, workload
+                with self.assertRaises(ValueError):
+                    bench.run(args)
+        with patch.object(bench, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bench.main(["--config", str(self.args.config), "--output", str(self.args.output),
+                "--acceptance-telemetry", "--acceptance-workload", "short", "--cohort", "saved-static",
+                "--acceptance-physical-gib", "4", "--acceptance-commit-gib", "4",
+                "--acceptance-manifest", str(self.args.acceptance_manifest)]), 0)
+        self.assertEqual(run.call_args.args[0].acceptance_manifest, self.args.acceptance_manifest)
+        self.assertNotIn("create", self.case.events)
+
+    def test_real_ready_hold_with_manifest_still_avoids_all_host_and_process_work(self):
+        with patch.object(bench, "acceptance_ready", return_value=False), \
+                self.assertRaisesRegex(RuntimeError, "Acceptance telemetry preparation held"):
+            self.case.invoke()
+        self.assertEqual(self.case.events, [])
+        self.assertEqual(self.case.samples, 0)
+        self.assertEqual(json.loads((self.case.output / "results.json").read_text())["status"], "held")
 
 
 class StageCRepairTests(unittest.TestCase):
@@ -4227,7 +7439,7 @@ class NormalComparisonTests(unittest.TestCase):
                 case.doCleanups()
         self.assertFalse(bench.acceptance_ready())
         self.assertFalse(bench.acceptance_protection(None))
-        with self.assertRaisesRegex(RuntimeError, "not implemented"):
+        with self.assertRaisesRegex(RuntimeError, "^Acceptance manifest is required\\.$"):
             bench.acceptance_preflight(None)
 
 
@@ -4611,6 +7823,35 @@ class DesktopComparisonConsumerTests(unittest.TestCase):
         self.assertEqual([event[1] for event in self.events if event[0] == "run"], ["compact-before", "desktop"])
         self.assertEqual(len(self.writes), 1)
         self.assertIn("| compact-before | 23.50 | 160 | 1/1 |", self.writes[0][1])
+
+
+def retained_publication_deadline_test(boundary, edge, offset):
+    def test(self):
+        self.retained_deadline_failure(boundary, edge, offset)
+    return test
+
+
+def retained_lifetime_deadline_test(phase, edge, offset):
+    def test(self):
+        self.retained_create_or_close_deadline_failure(phase, edge, offset)
+    return test
+
+
+# Each method gets fresh real Windows files and the complete controller/worker
+# composition. Equality and late return are independent cases at both edges.
+for _boundary, _step in enumerate((
+        "owner_before", "symlink_before", "junction_before", "resolve_before", "path_before", "identity_before",
+        "seek_start", "write", "seek_length", "truncate", "flush",
+        "owner_after", "symlink_after", "junction_after", "resolve_after", "path_after", "identity_after"), 1):
+    for _edge in ("before", "after"):
+        for _time, _offset in (("equality", 0.0), ("late", 0.001)):
+            setattr(AcceptanceAdmissionTests, "test_retained_deadline_" + _step + "_" + _edge + "_" + _time,
+                    retained_publication_deadline_test(_boundary, _edge, _offset))
+for _phase in ("create", "close"):
+    for _edge in ("before", "after"):
+        for _time, _offset in (("equality", 0.0), ("late", 0.001)):
+            setattr(AcceptanceAdmissionTests, "test_retained_deadline_" + _phase + "_" + _edge + "_" + _time,
+                    retained_lifetime_deadline_test(_phase, _edge, _offset))
 
 
 if __name__ == "__main__":

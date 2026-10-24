@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import copy
 import hashlib
+import hmac
 import importlib.util
 import json
 import math
@@ -72,7 +73,9 @@ def worker_bootstrap(stream, worker, *, pid=None, settings=None):
         raise ValueError("Invalid bootstrap settings.")
     settings = json.loads(settings)
     envelope.update(args=settings["args"], python_path=settings["python_path"],
-                    work_deadline=settings["work_deadline"])
+                    work_deadline=settings["work_deadline"],
+                    admitted_manifest_sha256=settings.get("admitted_manifest_sha256"),
+                    output_authority=settings.get("output_authority"))
     return worker(envelope)
 
 
@@ -440,8 +443,12 @@ def consume_normal_comparison(record, cfg, inherited, *, server_log=False):
     return expected
 
 
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def json_digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
 def message_identity(message):
@@ -1656,7 +1663,591 @@ def acceptance_ready():
 
 
 def acceptance_preflight(args):
-    raise RuntimeError("Stage C current admission and protection binding are not implemented.")
+    admission = {"status": "refused"}
+    if args is not None:
+        args._acceptance_admission = admission
+    if getattr(args, "acceptance_manifest", None) is None:
+        admission["reason"] = "Acceptance manifest is required."
+        raise RuntimeError("Acceptance manifest is required.")
+    try:
+        if os.name != "nt":
+            raise ValueError("Manifest containment requires Windows directory authority.")
+        manifest, admission["manifest_sha256"] = load_acceptance_manifest(args.acceptance_manifest, with_digest=True)
+        expected_digest = getattr(args, "_admitted_manifest_sha256", None)
+        if expected_digest is None:
+            raise ValueError("Controller manifest digest is required.")
+        if type(expected_digest) is not str or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+            raise ValueError("Invalid controller manifest digest.")
+        if admission["manifest_sha256"] != expected_digest:
+            raise ValueError("Controller manifest digest differs.")
+        acceptance_admission(args, manifest, time.time())
+        for key in ("inputs", "size_bound"):
+            for row in manifest[key]:
+                path = Path(row["path"])
+                if (any(part.is_symlink() for part in (path, *path.parents)) or not path.is_file()
+                        or str(path.resolve()) != row["path"]):
+                    raise ValueError("Manifest input path changed.")
+                if key == "inputs":
+                    current = file_identity(path)
+                    expected = {name: row[name] for name in ("path", "bytes", "sha256")}
+                else:
+                    stat = path.stat()
+                    current = {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+                    expected = {name: row[name] for name in ("bytes", "mtime_ns")}
+                if any(type(current[name]) is not type(value) or current[name] != value
+                       for name, value in expected.items()):
+                    raise ValueError("Manifest " + key + " identity changed.")
+        remaining = args._acceptance_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Absolute worker deadline reached during admission.")
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
+                              timeout=min(30, remaining), check=True).stdout
+        if len(head) > 128 or head.decode("ascii").strip() != manifest["source_head"]:
+            raise ValueError("Manifest source HEAD differs.")
+        from tools.prepare_unsloth_q2 import memory_snapshot
+        acceptance_floor_check(memory_snapshot(), manifest)
+        if time.monotonic() >= args._acceptance_deadline:
+            raise TimeoutError("Absolute worker deadline reached during admission.")
+    except BaseException as exc:
+        admission["reason"] = str(exc)
+        raise
+    admission["status"] = "admitted"
+    args._acceptance_manifest = manifest
+    return admission
+
+
+def acceptance_admission(args, manifest, now_unix):
+    """Match the requested run exactly; path arguments use the writer's resolution."""
+    validate_acceptance_manifest(manifest)
+    configs = [row for row in manifest["inputs"] if row["role"] == "config"]
+    if len(configs) != 1:
+        raise ValueError("Manifest requires exactly one config input.")
+    try:
+        config = str(Path(args.config).resolve())
+    except (TypeError, OSError, RuntimeError) as exc:
+        raise ValueError("Invalid manifest config argument.") from exc
+    if configs[0]["path"] != config:
+        raise ValueError("Manifest config differs.")
+    if getattr(args, "cohort", None) == "frozen-control":
+        raise ValueError("Frozen control cannot use an acceptance manifest.")
+    selection, context = acceptance_selection(args)
+    acceptance_output(args, manifest)
+
+    def equal(name, current, expected):
+        if type(current) is not type(expected) or current != expected:
+            raise ValueError("Manifest " + name + " differs.")
+
+    equal("workload", selection, manifest["workload"])
+    equal("cohort", args.cohort, manifest["cohort"])
+    equal("expected_context", context, manifest["expected_context"])
+    equal("port", getattr(args, "port", PORT), manifest["port"])
+    total = getattr(args, "acceptance_total_seconds", None)
+    total = ACCEPTANCE_SECONDS if total is None else total
+    equal("total_seconds", total, manifest["total_seconds"])
+    for name in ("physical", "commit"):
+        value = getattr(args, "acceptance_" + name + "_gib", None)
+        # The contained worker deliberately clears the public floor arguments.
+        if value is not None or getattr(args, "_acceptance_deadline", None) is None:
+            equal(name + " floor", value, manifest["floors_gib"][name])
+    candidate = getattr(args, "candidate_exe", None)
+    protect = getattr(args, "protect_input", [])
+    try:
+        candidate = str(Path(candidate).resolve()) if candidate is not None else None
+        if type(protect) is not list:
+            raise ValueError("Manifest protect_input differs.")
+        protect = [str(Path(path).resolve()) for path in protect]
+    except (TypeError, OSError, RuntimeError) as exc:
+        raise ValueError("Invalid manifest path argument.") from exc
+    equal("candidate_exe", candidate, manifest["candidate_exe"])
+    equal("protect_input", protect, manifest["protect_input"])
+    if not valid_number(now_unix) or now_unix + total > manifest["not_after_unix"]:
+        raise ValueError("Manifest window is too short.")
+
+
+def acceptance_output(args, manifest):
+    output = Path(args.output)
+    resolved_output = output.resolve()
+    if resolved_output.exists() or output.is_symlink():
+        raise ValueError("Output directory already exists; choose a new directory.")
+    if any(parent.is_symlink() for parent in output.parents):
+        raise ValueError("Manifest output path is linked.")
+    if str(resolved_output) != manifest["output"]:
+        raise ValueError("Manifest output differs.")
+
+
+def validate_output_authority(authority):
+    if type(authority) is not str or re.fullmatch(r"[0-9a-f]{64}", authority) is None:
+        raise ValueError("Invalid controller output authority.")
+
+
+class WindowsDirectoryAPI:
+    """Create-only NtCreateFile returns birth authority in the creation operation."""
+
+    def __init__(self):
+        if os.name != "nt":
+            raise RuntimeError("Manifest containment requires Windows directory authority.")
+        import ctypes as c
+
+        class UnicodeString(c.Structure):
+            _fields_ = [("length", c.c_uint16), ("maximum", c.c_uint16), ("buffer", c.c_void_p)]
+
+        class ObjectAttributes(c.Structure):
+            _fields_ = [("length", c.c_uint32), ("root", c.c_void_p),
+                        ("name", c.POINTER(UnicodeString)), ("attributes", c.c_uint32),
+                        ("security", c.c_void_p), ("quality", c.c_void_p)]
+
+        class IOStatus(c.Structure):
+            _fields_ = [("status", c.c_void_p), ("information", c.c_size_t)]
+
+        class FileIdentity(c.Structure):
+            _fields_ = [("volume", c.c_uint64), ("file_id", c.c_ubyte * 16)]
+
+        self.c, self.UnicodeString, self.ObjectAttributes = c, UnicodeString, ObjectAttributes
+        self.IOStatus, self.FileIdentity = IOStatus, FileIdentity
+        self.nt = c.WinDLL("ntdll", use_last_error=True)
+        self.kernel = c.WinDLL("kernel32", use_last_error=True)
+        self.nt.NtCreateFile.argtypes = [c.POINTER(c.c_void_p), c.c_uint32, c.POINTER(ObjectAttributes),
+            c.POINTER(IOStatus), c.c_void_p, c.c_uint32, c.c_uint32, c.c_uint32, c.c_uint32,
+            c.c_void_p, c.c_uint32]
+        self.nt.NtCreateFile.restype = c.c_int32
+        self.nt.RtlNtStatusToDosError.argtypes, self.nt.RtlNtStatusToDosError.restype = [c.c_int32], c.c_uint32
+        self.kernel.GetFileInformationByHandleEx.argtypes = [c.c_void_p, c.c_int32, c.c_void_p, c.c_uint32]
+        self.kernel.GetFileInformationByHandleEx.restype = c.c_int32
+        self.kernel.GetFinalPathNameByHandleW.argtypes = [c.c_void_p, c.c_wchar_p, c.c_uint32, c.c_uint32]
+        self.kernel.GetFinalPathNameByHandleW.restype = c.c_uint32
+        self.kernel.CloseHandle.argtypes, self.kernel.CloseHandle.restype = [c.c_void_p], c.c_int32
+
+    def open(self, path, *, create=False):
+        c = self.c
+        name = str(path)
+        name = "\\??\\UNC\\" + name[2:] if name.startswith("\\\\") else "\\??\\" + name
+        buffer = c.create_unicode_buffer(name)
+        size = len(name.encode("utf-16-le"))
+        if size > 65532:
+            raise ValueError("Directory authority path exceeds its native bound.")
+        string = self.UnicodeString(size, size + 2, c.cast(buffer, c.c_void_p))
+        attributes = self.ObjectAttributes(c.sizeof(self.ObjectAttributes), None, c.pointer(string), 0x40, None, None)
+        handle, status = c.c_void_p(), self.IOStatus()
+        result = self.nt.NtCreateFile(c.byref(handle), 0x100081, c.byref(attributes), c.byref(status),
+            None, 0x10, 3, 2 if create else 1, 0x200021, None, 0)
+        # FILE_CREATE/FILE_OPEN, DIRECTORY|SYNCHRONOUS_IO_NONALERT|OPEN_REPARSE_POINT;
+        # READ|WRITE sharing deliberately omits DELETE, including for the second owner.
+        if result < 0:
+            raise c.WinError(self.nt.RtlNtStatusToDosError(result))
+        return handle.value
+
+    def identity(self, handle):
+        value = self.FileIdentity()
+        if not self.kernel.GetFileInformationByHandleEx(handle, 18, self.c.byref(value), self.c.sizeof(value)):
+            raise self.c.WinError(self.c.get_last_error())
+        return int(value.volume), bytes(value.file_id).hex()
+
+    def close(self, handle):
+        if not self.kernel.CloseHandle(handle):
+            raise self.c.WinError(self.c.get_last_error())
+
+    def path(self, handle):
+        buffer = self.c.create_unicode_buffer(32768)
+        size = self.kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not size:
+            raise self.c.WinError(self.c.get_last_error())
+        if size >= len(buffer):
+            raise ValueError("Directory authority path exceeds its native bound.")
+        name = buffer.value
+        if name.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + name[8:]
+        return name[4:] if name.startswith("\\\\?\\") else name
+
+
+class AcceptanceOutputOwner:
+    """Retain no-delete-share authority through every path operation and final proof."""
+
+    def __init__(self, output, expected_output, *, create=False):
+        self.path, self.expected_output = Path(output), expected_output
+        self.api, self.handle = WindowsDirectoryAPI(), None
+        self.receipt = self.receipt_bytes = None
+        self.acknowledged = False
+        self.check_path()
+        self.path = Path(expected_output)
+        self.handle = self.api.open(self.path, create=create)
+        try:
+            self.identity = self.api.identity(self.handle)
+            self.validate()
+        except BaseException as exc:
+            self.close_after_failure(exc)
+            raise
+
+    def check_path(self):
+        if any(path.is_symlink() or path.is_junction() for path in (self.path, *self.path.parents)):
+            raise ValueError("Worker output path is linked.")
+        if str(self.path.resolve()) != self.expected_output:
+            raise ValueError("Worker output identity differs.")
+
+    def validate(self):
+        if self.handle is None:
+            raise RuntimeError("Output authority is closed.")
+        self.check_path()
+        if (Path(self.api.path(self.handle)) != Path(self.expected_output)
+                or self.api.identity(self.handle) != self.identity):
+            raise ValueError("Worker output identity differs.")
+
+    def close_after_failure(self, primary):
+        try:
+            self.close()
+        except Exception as cleanup:
+            # Preserve the first failure and the still-retained cleanup authority.
+            primary.output_owner = self
+            primary.output_cleanup_error = type(cleanup).__name__ + ": " + str(cleanup)
+
+    def open_receipt(self):
+        """Hold the worker's receipt object while its live writer still denies replacement.
+
+        In scope: another same-credential local process creating, deleting, renaming,
+        linking or rewriting output entries and contents at any instant. Out of scope:
+        changing Python sources, interpreter or venv; debuggers or process memory;
+        duplicating owned handles; the private bootstrap pipe; and tampering after the
+        controller returns, which relies on the digests in the lifecycle receipt.
+        This handle denies deletion and renaming; the receipt MAC and the worker's exact
+        encoding refuse rewrites.
+        """
+        if self.receipt is not None:
+            raise RuntimeError("Controller receipt handle is already open.")
+        provisional = self.path / "provisional.json"
+        if provisional.is_symlink():
+            raise ValueError("Worker output claim is missing or linked.")
+        if not provisional.is_file():
+            raise FileNotFoundError("Worker output claim is missing.")
+        self.receipt_api = WindowsReceiptAPI()
+        self.receipt = self.receipt_api.open(provisional)
+        self.receipt_identity = self.receipt_api.identity(self.receipt)
+
+    def read_receipt(self):
+        if self.receipt is None:
+            raise RuntimeError("Controller receipt handle is not open.")
+        api = self.receipt_api
+        if (Path(api.path(self.receipt)) != self.path / "provisional.json"
+                or api.identity(self.receipt) != self.receipt_identity or api.attributes(self.receipt) & 0x410):
+            raise ValueError("Worker receipt identity differs.")  # Reparse point or directory.
+        api.seek(self.receipt, 0)
+        self.receipt_bytes = api.read(self.receipt, ACCEPTANCE_LOG_LIMIT + 1)
+        return self.receipt_bytes
+
+    def close(self):
+        try:
+            if self.receipt is not None:
+                self.receipt_api.close(self.receipt)
+                self.receipt = None
+        finally:
+            if self.handle is not None:
+                self.api.close(self.handle)
+                self.handle = None
+
+
+class WindowsProvisionalAPI(WindowsDirectoryAPI):
+    """One create-only file handle shares reads, never writes or deletion."""
+
+    def __init__(self):
+        super().__init__()
+        c = self.c
+        self.kernel.CreateFileW.argtypes = [c.c_wchar_p, c.c_uint32, c.c_uint32, c.c_void_p,
+                                            c.c_uint32, c.c_uint32, c.c_void_p]
+        self.kernel.CreateFileW.restype = c.c_void_p
+        self.kernel.SetFilePointerEx.argtypes = [c.c_void_p, c.c_int64, c.POINTER(c.c_int64), c.c_uint32]
+        self.kernel.SetFilePointerEx.restype = c.c_int32
+        self.kernel.WriteFile.argtypes = [c.c_void_p, c.c_void_p, c.c_uint32,
+                                         c.POINTER(c.c_uint32), c.c_void_p]
+        self.kernel.WriteFile.restype = c.c_int32
+        for name in ("SetEndOfFile", "FlushFileBuffers"):
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = [c.c_void_p], c.c_int32
+
+    def open(self, path):
+        handle = self.kernel.CreateFileW(str(path), 0xC0000000, 1, None, 1, 0x200080, None)
+        # GENERIC_READ|WRITE, FILE_SHARE_READ, CREATE_NEW, OPEN_REPARSE_POINT|NORMAL.
+        if handle == self.c.c_void_p(-1).value:
+            raise self.c.WinError(self.c.get_last_error())
+        return handle
+
+    def seek(self, handle, offset):
+        position = self.c.c_int64()
+        if not self.kernel.SetFilePointerEx(handle, offset, self.c.byref(position), 0):
+            raise self.c.WinError(self.c.get_last_error())
+        if position.value != offset:
+            raise OSError("Provisional file seek differs.")
+
+    def write(self, handle, data):
+        size = self.c.c_uint32()
+        buffer = self.c.create_string_buffer(data)
+        if not self.kernel.WriteFile(handle, buffer, len(data), self.c.byref(size), None):
+            raise self.c.WinError(self.c.get_last_error())
+        return size.value
+
+    def truncate(self, handle):
+        if not self.kernel.SetEndOfFile(handle):
+            raise self.c.WinError(self.c.get_last_error())
+
+    def flush(self, handle):
+        if not self.kernel.FlushFileBuffers(handle):
+            raise self.c.WinError(self.c.get_last_error())
+
+
+class WindowsReceiptAPI(WindowsProvisionalAPI):
+    """The controller's read handle shares the live writer's access, never deletion."""
+
+    def __init__(self):
+        super().__init__()
+        c = self.c
+        self.kernel.ReadFile.argtypes = [c.c_void_p, c.c_void_p, c.c_uint32, c.POINTER(c.c_uint32), c.c_void_p]
+        self.kernel.ReadFile.restype = c.c_int32
+
+    def open(self, path):
+        handle = self.kernel.CreateFileW(str(path), 0x80000000, 3, None, 3, 0x200000, None)
+        # GENERIC_READ, FILE_SHARE_READ|WRITE (required beside the worker's writer),
+        # no FILE_SHARE_DELETE, OPEN_EXISTING, OPEN_REPARSE_POINT.
+        if handle == self.c.c_void_p(-1).value:
+            raise self.c.WinError(self.c.get_last_error())
+        return handle
+
+    def attributes(self, handle):
+        value = (self.c.c_uint32 * 2)()  # FILE_ATTRIBUTE_TAG_INFO
+        if not self.kernel.GetFileInformationByHandleEx(handle, 9, self.c.byref(value), self.c.sizeof(value)):
+            raise self.c.WinError(self.c.get_last_error())
+        return value[0]
+
+    def read(self, handle, limit):
+        buffer, size, data = self.c.create_string_buffer(65536), self.c.c_uint32(), b""
+        while len(data) < limit:
+            if not self.kernel.ReadFile(handle, buffer, min(len(buffer), limit - len(data)),
+                                        self.c.byref(size), None):
+                raise self.c.WinError(self.c.get_last_error())
+            if not size.value:
+                break
+            data += buffer.raw[:size.value]
+        return data
+
+
+class AcceptanceProvisionalFile:
+    """Retain the original receipt object from claim through the last worker save."""
+
+    def __init__(self, owner, deadline):
+        self.owner, self.deadline = owner, deadline
+        self.path = owner.path / "provisional.json"
+        self.api, self.handle = WindowsProvisionalAPI(), None
+        self.failed = self.claimed = False
+
+    def check_deadline(self):
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("Provisional publication reached the absolute deadline.")
+
+    def step(self, operation, *args):
+        self.check_deadline()
+        result = operation(*args)
+        self.check_deadline()
+        return result
+
+    def create(self):
+        if self.claimed:
+            raise RuntimeError("Provisional file is already claimed.")
+        self.claimed = True
+        self.step(self.owner.validate)
+        self.check_deadline()
+        self.handle = self.api.open(self.path)
+        self.check_deadline()
+        self.identity = self.step(self.api.identity, self.handle)
+        self.validate()
+
+    def validate(self):
+        if self.handle is None:
+            raise RuntimeError("Provisional file is closed.")
+        self.step(self.owner.validate)
+        if (self.step(self.path.is_symlink) or self.step(self.path.is_junction)
+                or str(self.step(self.path.resolve)) != str(self.path)
+                or Path(self.step(self.api.path, self.handle)) != self.path
+                or self.step(self.api.identity, self.handle) != self.identity):
+            raise ValueError("Provisional file identity differs.")
+
+    def publish(self, data):
+        try:
+            if self.failed:
+                raise RuntimeError("Provisional publication previously failed.")
+            if len(data) > ACCEPTANCE_LOG_LIMIT:
+                raise ValueError("Provisional snapshot exceeds its size budget.")
+            self.validate()
+            self.step(self.api.seek, self.handle, 0)
+            if self.step(self.api.write, self.handle, data) != len(data):
+                raise OSError("Short provisional write.")
+            self.step(self.api.seek, self.handle, len(data))
+            self.step(self.api.truncate, self.handle)
+            self.step(self.api.flush, self.handle)
+            self.validate()
+        except BaseException:
+            self.failed = True
+            raise
+
+    def close(self):
+        if self.handle is not None:
+            expired = time.monotonic() >= self.deadline
+            self.api.close(self.handle)
+            self.handle = None
+            if expired or time.monotonic() >= self.deadline:
+                raise TimeoutError("Provisional close reached the absolute deadline.")
+
+
+def acceptance_output_claim(output, authority, *, owner=None):
+    """Bind the private run authority to this exact directory without publishing it."""
+    validate_output_authority(authority)
+    path = str(output.resolve())
+    if owner is None:
+        stat = output.stat()  # Legacy contained CPU route; manifest workers always supply birth authority.
+        domain, identity = "strata-acceptance-output/1", (stat.st_dev, stat.st_ino)
+    else:
+        owner.validate()
+        domain, identity = "strata-acceptance-output/2", owner.identity
+    identity = json.dumps([domain, authority, path, *identity],
+                          separators=(",", ":")).encode("utf-8")
+    return {"path": path, "identity_sha256": hashlib.sha256(identity).hexdigest()}
+
+
+def acceptance_claimed_output(output, expected_output, authority, *, owner=None):
+    """Read only the bounded claim until the controller proves output ownership."""
+    validate_output_authority(authority)
+    if owner is not None:
+        owner.validate()
+    if any(path.is_symlink() for path in (output, *output.parents)):
+        raise ValueError("Worker output path is linked.")
+    if str(output.resolve()) != expected_output or not output.is_dir():
+        raise ValueError("Worker output identity differs.")
+    provisional = output / "provisional.json"
+    if owner is not None:
+        data = owner.read_receipt()  # Never reopen the worker receipt by path.
+    else:
+        if provisional.is_symlink():
+            raise ValueError("Worker output claim is missing or linked.")
+        if not provisional.is_file():
+            raise FileNotFoundError("Worker output claim is missing.")
+        with provisional.open("rb") as stream:
+            data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+    if len(data) > ACCEPTANCE_LOG_LIMIT:
+        raise ValueError("Worker output claim exceeds its read budget.")
+    worker_record = json.loads(data, object_pairs_hook=unique_json_object)
+    if type(worker_record) is not dict:
+        raise ValueError("Worker output claim differs.")
+    if owner is not None:
+        acceptance_receipt_verify(worker_record, authority)
+        # The MAC binds decoded values; only the worker's own encoding binds the retained bytes.
+        if data != acceptance_receipt_encode(worker_record):
+            raise ValueError("Worker receipt encoding differs.")
+    if worker_record.get("output_claim") != acceptance_output_claim(output, authority, owner=owner):
+        raise ValueError("Worker output claim differs.")
+    return worker_record
+
+
+def acceptance_receipt_mac(record, authority):
+    return hmac.new(bytes.fromhex(authority), canonical_json(record), hashlib.sha256).hexdigest()
+
+
+def acceptance_receipt_encode(record):
+    """The one receipt serializer, shared by the worker's writes and the controller's byte check.
+
+    Sorted keys make the bytes a function of the decoded value: parsing preserves key
+    order, so an order-preserving serializer would accept any permuted re-encoding.
+    """
+    return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def acceptance_receipt(snapshot, authority):
+    """Authenticate every manifest-worker snapshot with the private output authority."""
+    validate_output_authority(authority)
+    return acceptance_receipt_encode(dict(snapshot, receipt_hmac_sha256=acceptance_receipt_mac(snapshot, authority)))
+
+
+def acceptance_receipt_verify(record, authority):
+    """Refuse a missing, malformed or mismatched MAC before consuming any receipt field."""
+    mac = record.get("receipt_hmac_sha256")
+    if type(mac) is not str or re.fullmatch(r"[0-9a-f]{64}", mac) is None:
+        raise ValueError("Worker receipt authentication is missing or malformed.")
+    unsigned = {key: value for key, value in record.items() if key != "receipt_hmac_sha256"}
+    if not hmac.compare_digest(mac, acceptance_receipt_mac(unsigned, authority)):
+        raise ValueError("Worker receipt authentication differs.")
+
+
+def acceptance_acknowledgment(owner, authority):
+    claim = acceptance_output_claim(owner.path, authority, owner=owner)
+    digest = json.dumps(["strata-acceptance-acquired/1", authority, claim], separators=(",", ":")).encode()
+    return {"acquired_sha256": hashlib.sha256(digest).hexdigest()}
+
+
+def bounded_create(path, data, deadline, limit=ACCEPTANCE_LOG_LIMIT):
+    if time.monotonic() >= deadline or len(data) > limit:
+        raise RuntimeError("Artifact exceeds its size or absolute time budget.")
+    with path.open("xb") as stream:
+        if stream.write(data) != len(data):
+            raise OSError("Short artifact write.")
+        stream.flush()
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Artifact finalization exceeded the absolute deadline.")
+
+
+def acceptance_acquire_output(output, expected_output, authority):
+    """Hold the worker's receipt object; only a not-yet-complete claim may be retried."""
+    owner = AcceptanceOutputOwner(output, expected_output)
+    try:
+        owner.open_receipt()
+        acceptance_claimed_output(output, expected_output, authority, owner=owner)
+        return owner
+    except BaseException as exc:
+        owner.close_after_failure(exc)
+        raise
+
+
+def acceptance_publish_acknowledgment(owner, authority, deadline):
+    """Publish the one acknowledgment for a held acquisition; the caller never retries it.
+
+    Every acknowledgment the worker can accept comes from a receipt handle opened
+    while the worker's provisional writer was live: no valid token exists before that
+    handle is open, and no acquisition follows publication. A late acquisition after a
+    failed worker may hold a foreign receipt, but that run is already refused. The token
+    goes straight into an exclusive create (the worker retries missing or partial JSON),
+    so no staged copy exists, and a failure from here on is terminal while the caller
+    keeps the handle.
+    """
+    data = json.dumps(acceptance_acknowledgment(owner, authority), separators=(",", ":")).encode()
+    bounded_create(owner.path / "controller-ack.json", data, deadline, 4096)
+    owner.acknowledged = True
+
+
+def acceptance_wait_for_controller(owner, authority, deadline):
+    expected = acceptance_acknowledgment(owner, authority)
+    path = owner.path / "controller-ack.json"
+    while time.monotonic() < deadline:
+        owner.validate()
+        try:
+            if path.is_symlink() or path.is_junction():
+                raise ValueError("Controller acknowledgment is linked.")
+            with path.open("rb") as stream:
+                data = stream.read(4097)
+            if len(data) > 4096:
+                raise ValueError("Controller acknowledgment exceeds its read budget.")
+            acknowledgment = json.loads(data, object_pairs_hook=unique_json_object)
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+            continue
+        if acknowledgment != expected:
+            raise ValueError("Controller acknowledgment differs.")
+        owner.validate()
+        if time.monotonic() >= deadline:
+            break
+        return
+    raise TimeoutError("Absolute worker deadline reached before controller acquisition.")
+
+
+def acceptance_floor_check(snapshot, manifest, *, in_bytes=False):
+    for name, key in (("physical", "available_gib"), ("commit", "commit_available_gib")):
+        value = snapshot.get(name + "_available_bytes" if in_bytes else key)
+        scale = 1 if in_bytes else 1024**3
+        if (not valid_number(value) or not valid_number(value * scale)
+                or value * scale < manifest["floors_gib"][name] * 1024**3):
+            raise ValueError("Fresh " + name + " memory is below the manifest floor.")
 
 
 def acceptance_protection(args):
@@ -1772,14 +2363,15 @@ def validate_acceptance_manifest(manifest):
     return manifest
 
 
-def load_acceptance_manifest(path):
+def load_acceptance_manifest(path, *, with_digest=False):
     try:
         with Path(path).open("rb") as stream:
             data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
         if len(data) > ACCEPTANCE_LOG_LIMIT:
             raise ValueError("Manifest exceeds its evidence budget.")
         manifest = json.loads(data.decode("utf-8"), object_pairs_hook=unique_json_object)
-        return validate_acceptance_manifest(manifest)
+        validate_acceptance_manifest(manifest)
+        return (manifest, hashlib.sha256(data).hexdigest()) if with_digest else manifest
     except (OSError, UnicodeError, RuntimeError, TypeError, ValueError) as exc:
         if type(exc) is ValueError:
             raise
@@ -1960,26 +2552,52 @@ def acceptance_worker(envelope):
     args.acceptance_telemetry = False
     args.acceptance_physical_gib = args.acceptance_commit_gib = None
     args._acceptance_deadline = envelope["work_deadline"]
+    args._admitted_manifest_sha256 = envelope.get("admitted_manifest_sha256")
+    args._output_authority = envelope.get("output_authority")
+    args._output_owner = None
+    args._provisional_file = None
     if not valid_number(args._acceptance_deadline) or time.monotonic() >= args._acceptance_deadline:
         raise TimeoutError("START arrived after the worker deadline.")
     # The existing smoke helper owns an unrestricted file writer; retain its hold.
     if args.smoke or getattr(args, "smoke_only", False):
         raise RuntimeError("Contained smoke artifacts require the Stage C bounded writer.")
+    code = 1
     try:
-        acceptance_preflight(args)  # Heavy admission belongs INSIDE the supervised child.
+        args._acceptance_admission = acceptance_preflight(args)  # Heavy admission stays inside containment.
         _run_workload(args)
-        return 0
+        code = 0
     except (Exception, KeyboardInterrupt) as exc:
+        if args._output_owner is None:
+            args._output_owner = getattr(exc, "output_owner", None)
         # The external capture does not read private config to learn its secret.
         # Preserve redacted workload details in provisional artifacts, never a traceback.
         print("Contained worker stopped (" + type(exc).__name__ + ").", file=sys.stderr)
-        return 1
+        admission = getattr(args, "_acceptance_admission", {})
+        if admission.get("status") == "refused":
+            print("Acceptance admission refused: " + admission["reason"], file=sys.stderr)
+        if getattr(exc, "output_cleanup_error", None):
+            print("Worker output authority cleanup failed (acquisition).", file=sys.stderr)
+    finally:
+        if args._provisional_file is not None:
+            try:
+                args._provisional_file.close()
+            except Exception as cleanup:
+                print("Worker provisional close failed (" + type(cleanup).__name__ + ").", file=sys.stderr)
+                code = 1
+        if args._output_owner is not None:
+            try:
+                args._output_owner.close()
+            except Exception as cleanup:
+                print("Worker output authority close failed (" + type(cleanup).__name__ + ").", file=sys.stderr)
+                code = 1
+    return code
 
 
 class AcceptanceFailure(RuntimeError):
-    def __init__(self, record, owner):
+    def __init__(self, record, owner, output_owner=None):
         super().__init__(record.get("error") or "Contained lifecycle evidence refused.")
         self.record, self.owner = record, owner
+        self.output_owner = output_owner
 
 
 def acceptance_final_predicate(record):
@@ -2007,11 +2625,16 @@ def acceptance_controller(args, started):
     floors = tuple(4 if value is None else value for value in (
         getattr(args, "acceptance_physical_gib", None), getattr(args, "acceptance_commit_gib", None)))
     guard = MemoryGuard(None, None, acceptance_floors=floors, sample_limit=4 * total_seconds + 256)
+    manifest_path = getattr(args, "acceptance_manifest", None)
+    if manifest_path is not None and os.name != "nt":
+        reason = "Manifest containment requires Windows directory authority."
+        raise AcceptanceFailure({"status": "held", "lifecycle_evidence": "refused",
+                                 "admission": {"status": "refused", "reason": reason}, "error": reason}, None)
     if not acceptance_ready():
         return _run_workload(args)  # Existing held receipt, with no native/resource entry.
-    if args.output.exists():
+    if manifest_path is None and args.output.exists():
         raise RuntimeError("Output directory already exists; choose a new directory.")
-    native, owner, proc = None, None, None
+    native, owner, proc, output_owner = None, None, None, None
     capture = BoundedCapture(ACCEPTANCE_LOG_LIMIT - 64)
     worker_environment = dict(os.environ)
     worker_environment.pop("STRATA_BENCHMARK_BOOTSTRAP", None)  # Consumed by bootstrap, never passed to the engine.
@@ -2023,18 +2646,42 @@ def acceptance_controller(args, started):
     coverage_start = coverage_end = None
     eof = False
 
+    if manifest_path is not None:
+        admission = record["admission"] = {"status": "refused"}
+        try:
+            if os.name != "nt":
+                raise ValueError("Manifest containment requires Windows directory authority.")
+            manifest, admission["manifest_sha256"] = load_acceptance_manifest(manifest_path, with_digest=True)
+            acceptance_admission(args, manifest, time.time())
+            args.output = Path(manifest["output"])
+            guard.monitor(once=True)
+            guard.check()
+            acceptance_floor_check(guard.host_samples[0], manifest, in_bytes=True)
+        except Exception as exc:
+            admission["reason"] = str(exc)
+            record["error"] = type(exc).__name__ + ": " + str(exc)
+            record["memory"] = guard.acceptance_summary()
+            raise AcceptanceFailure(record, None) from exc
+        admission["status"] = "admitted"
+
+    output_authority = os.urandom(32).hex()
+    admitted_output = manifest["output"] if manifest_path is not None else str(args.output.resolve())
+
     def cleanup_failure(error):
         previous = record.get("cleanup_error")
         record["cleanup_error"] = (previous + "; " if previous else "") + str(error)
 
     try:
         # Host coverage starts before any owned process/native startup work.
-        guard.monitor(once=True)
+        if manifest_path is None:
+            guard.monitor(once=True)
         guard.check()
         coverage_start = time.monotonic()
         interpreter = direct_interpreter()
         native = WindowsProcessAPI()
         settings = json.dumps({"work_deadline": work_deadline, "python_path": [str(ROOT), *sys.path],
+                               "admitted_manifest_sha256": record.get("admission", {}).get("manifest_sha256"),
+                               "output_authority": output_authority,
                                "args": {key: str(value) if isinstance(value, Path) else value
                                         for key, value in vars(args).items()}})
         if len(settings) > 16384:
@@ -2070,6 +2717,16 @@ def acceptance_controller(args, started):
             if capture.total > ACCEPTANCE_LOG_LIMIT:
                 raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
             code = owner.poll()
+            if manifest_path is not None and output_owner is None and code is None:
+                try:
+                    output_owner = acceptance_acquire_output(args.output, admitted_output, output_authority)
+                except (FileNotFoundError, json.JSONDecodeError) as incomplete:
+                    if getattr(incomplete, "output_owner", None) is not None:
+                        raise
+                    pass  # Birth/partial claim may complete only within the original deadline.
+                else:
+                    # One shot: a failure stops the owned job while output_owner stays held.
+                    acceptance_publish_acknowledgment(output_owner, output_authority, work_deadline)
             guard.monitor(once=True)
             guard.check()
             if code is not None:
@@ -2090,6 +2747,9 @@ def acceptance_controller(args, started):
         record["capture_complete"] = eof
     except BaseException as exc:
         record["error"] = type(exc).__name__ + ": " + str(exc)
+        if getattr(exc, "output_owner", None) is not None:
+            output_owner = exc.output_owner
+            cleanup_failure(exc.output_cleanup_error)
         if owner is not None:
             try:
                 owner.stop()
@@ -2123,14 +2783,32 @@ def acceptance_controller(args, started):
         if guard.cleanup_error:
             cleanup_failure(guard.cleanup_error)
     try:
+        if manifest_path is not None and (output_owner is None or not output_owner.acknowledged):
+            raise ValueError("Controller output authority was not acquired.")
+        worker_record = acceptance_claimed_output(args.output, admitted_output, output_authority, owner=output_owner)
+        if output_owner is not None:
+            consumed = output_owner.receipt_bytes
+            record["artifact_sha256"] = {"provisional.json": hashlib.sha256(consumed).hexdigest()}
         if not record.get("error") and not record.get("cleanup_error"):
             paths = list(args.output.iterdir())
-            if ({path.name for path in paths} != {"provisional.json", "server.log", "engine.log"}
+            expected_artifacts = {"provisional.json", "server.log", "engine.log"}
+            if output_owner is not None:
+                expected_artifacts.add("controller-ack.json")
+            if ({path.name for path in paths} != expected_artifacts
                     or any(path.is_symlink() or not path.is_file()
                            or path.stat().st_size > ACCEPTANCE_LOG_LIMIT for path in paths)):
                 raise RuntimeError("Missing, unexpected or oversized worker artifacts.")
-            provisional = args.output / "provisional.json"
-            worker_record = json.loads(provisional.read_bytes())
+            if output_owner is not None:
+                # One bounded read of each closed log, bound to the authenticated receipt.
+                digests = worker_record.get("artifact_sha256")
+                for name in ("server.log", "engine.log"):
+                    with (args.output / name).open("rb") as stream:
+                        data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+                    digest = hashlib.sha256(data).hexdigest()
+                    if (len(data) > ACCEPTANCE_LOG_LIMIT or type(digests) is not dict
+                            or type(digests.get(name)) is not str or not hmac.compare_digest(digests[name], digest)):
+                        raise ValueError("Worker " + name + " differs from its authenticated digest.")
+                    record["artifact_sha256"][name] = digest
             record["worker_complete"] = worker_record.get("status") == "provisional_complete"
             selection = getattr(args, "acceptance_workload", None)
             if selection:
@@ -2164,24 +2842,57 @@ def acceptance_controller(args, started):
             record["protection"] = acceptance_protection(args) is True
             guard.monitor(once=True)
             guard.check()
-        args.output.mkdir(parents=True, exist_ok=True)
-        bounded_write(args.output / "controller.log", capture.text().encode("utf-8"), total_deadline)
+        # Protection and host probes may have returned after the first claim read.
+        acceptance_claimed_output(args.output, admitted_output, output_authority, owner=output_owner)
+        if output_owner is not None:
+            if output_owner.receipt_bytes != consumed:
+                raise ValueError("Worker receipt changed after controller consumption.")
+            if any(os.path.lexists(args.output / name) for name in ("controller.log", "lifecycle.json")):
+                raise FileExistsError("Controller artifact already exists.")
+        write = bounded_create if output_owner is not None else bounded_write
+        controller_log = capture.text().encode("utf-8")
+        write(args.output / "controller.log", controller_log, total_deadline)
+        if output_owner is not None:
+            record["artifact_sha256"]["controller.log"] = hashlib.sha256(controller_log).hexdigest()
         # A saved receipt always remains HELD. Only the caller can observe this function's
         # post-close result, and must also observe its external exit before qualifying it.
         record["memory_finalization"] = "provisional until post-artifact host edge in returned result"
         payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
-        pending = args.output / "lifecycle.json.tmp"
-        bounded_write(pending, payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
-        pending.replace(args.output / "lifecycle.json")
-        if (args.output / "lifecycle.json").read_bytes() != payload:
+        if output_owner is not None:
+            # Exclusive direct create: no staging name, and nothing is unlinked or replaced.
+            bounded_create(args.output / "lifecycle.json", payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
+            with (args.output / "lifecycle.json").open("rb") as stream:
+                readback = stream.read(ACCEPTANCE_RECEIPT_LIMIT + 1)
+        else:
+            pending = args.output / "lifecycle.json.tmp"
+            write(pending, payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
+            pending.replace(args.output / "lifecycle.json")
+            readback = (args.output / "lifecycle.json").read_bytes()
+        if readback != payload:
             raise OSError("Final receipt readback mismatch.")
         if sum(path.stat().st_size for path in args.output.iterdir()) > ACCEPTANCE_ARTIFACT_LIMIT:
             raise RuntimeError("Total retained artifact budget exceeded.")
+        if output_owner is not None:
+            paths = list(args.output.iterdir())
+            allowed = {"provisional.json", "server.log", "engine.log", "controller-ack.json",
+                       "controller.log", "lifecycle.json"}
+            if any(path.name not in allowed or path.is_symlink() or not path.is_file()
+                   or path.stat().st_size > (ACCEPTANCE_RECEIPT_LIMIT if path.name == "lifecycle.json"
+                       else 4096 if path.name == "controller-ack.json"
+                       else ACCEPTANCE_LOG_LIMIT) for path in paths):
+                raise RuntimeError("Unexpected or oversized retained artifacts.")
+            output_owner.validate()
         record["finalization"] = True
     except Exception as exc:
         record["finalization_error"] = type(exc).__name__ + ": " + str(exc)
         record["finalization"] = False
     finally:
+        if output_owner is not None:
+            try:
+                output_owner.close()
+            except Exception as cleanup:
+                cleanup_failure("Controller output authority close failed: " + str(cleanup))
+                record["finalization"] = False
         # No filesystem/native finalization follows this edge. A slow returning
         # operation is refused by the observed gap; this is not syscall preemption.
         coverage_end = time.monotonic()
@@ -2195,7 +2906,7 @@ def acceptance_controller(args, started):
             for name in ("physical", "commit"))
         record["within_deadline"] = time.monotonic() < total_deadline
     if not acceptance_final_predicate(record):
-        raise AcceptanceFailure(record, owner)
+        raise AcceptanceFailure(record, owner, output_owner)
     record["lifecycle_evidence"] = "satisfied"
     return record
 
@@ -2211,6 +2922,9 @@ def run(args):
         if type(total_seconds) is not int or not 900 <= total_seconds <= 5400:
             raise ValueError("Acceptance total seconds must be between 900 and 5400.")
     acceptance_selection(args)
+    if getattr(args, "acceptance_manifest", None) is not None and (
+            not getattr(args, "acceptance_telemetry", False) or not getattr(args, "acceptance_workload", None)):
+        raise ValueError("Acceptance manifest requires acceptance telemetry and a selected workload.")
     writer = getattr(args, "write_acceptance_manifest", None)
     not_after = getattr(args, "manifest_not_after_unix", None)
     if writer is not None or not_after is not None:
@@ -2224,6 +2938,7 @@ def run(args):
 
 def _run_workload(args):
     worker_deadline = getattr(args, "_acceptance_deadline", None)
+    defer_output = worker_deadline is not None and getattr(args, "acceptance_manifest", None) is not None
     selection, expected_context = acceptance_selection(args)
     idle_seconds = getattr(args, "idle_seconds", 0)
     held_out = getattr(args, "held_out", False)
@@ -2303,12 +3018,21 @@ def _run_workload(args):
                 "vocab.json", "merges.txt", "token_type.json", "chat_template.jinja")]
         paths += [Path(path).resolve() for path in getattr(args, "protect_input", [])]
         protected = list(dict.fromkeys(paths))
+        if getattr(args, "acceptance_manifest", None) is not None:
+            protected = [Path(row["path"]) for row in args._acceptance_manifest["inputs"]]
         protection_before = protection_snapshot(protected)
-        if protection_before[0]["sha256"] != hashlib.sha256(config_bytes).hexdigest():
+        config_path = str(args.config.resolve())
+        config_identity = next((row for row in protection_before if row["path"] == config_path), None)
+        if config_identity is None or config_identity["sha256"] != hashlib.sha256(config_bytes).hexdigest():
             raise ValueError("Configuration changed while binding the consumed inputs.")
     with exe.open("rb") as binary:
         executable_hash = hashlib.file_digest(binary, "sha256").hexdigest()
-    args.output.mkdir(parents=True, exist_ok=False)
+    output_authority = getattr(args, "_output_authority", None)
+    if defer_output or hasattr(args, "_output_authority"):
+        validate_output_authority(output_authority)
+    if not defer_output:
+        args.output.mkdir(parents=True, exist_ok=False)
+    output_ready = not defer_output
     record = {"status": "starting", "config": str(args.config.resolve()), "exe": str(exe.resolve()),
               "exe_sha256": executable_hash, "timing_diagnostic": args.timing or fetch_timing,
               "decode_timing": args.timing, "fetch_timing": fetch_timing,
@@ -2316,6 +3040,10 @@ def _run_workload(args):
               "validation_only": validation_only,
               "rows": [], "requests": [],
               "normal_comparison": normal_comparison_excluded("environment-not-classified")}
+    if getattr(args, "_acceptance_admission", None) is not None:
+        record["admission"] = dict(args._acceptance_admission)
+    if output_authority is not None and output_ready:
+        record["output_claim"] = acceptance_output_claim(args.output, output_authority)
     if selection:
         record.update(acceptance_workload=selection, cohort=args.cohort,
                       executable_provenance=provenance, harness=file_identity(Path(__file__).resolve()),
@@ -2332,11 +3060,28 @@ def _run_workload(args):
         if guard:
             record["memory"] = guard.summary()
         if worker_deadline is not None:
-            snapshot = dict(record, status="provisional_" + record["status"])
-            pending = args.output / "provisional.json.tmp"
-            bounded_write(pending, (json.dumps(redact(snapshot, secret), indent=2) + "\n").encode("utf-8"),
-                          worker_deadline)
-            pending.replace(args.output / "provisional.json")
+            if not output_ready:
+                return  # A refused server start leaves no workload output.
+            primary_error = sys.exc_info()[1]
+            try:
+                snapshot = redact(dict(record, status="provisional_" + record["status"]), secret)
+                if defer_output:
+                    args._provisional_file.publish(acceptance_receipt(snapshot, output_authority))
+                else:
+                    data = (json.dumps(snapshot, indent=2) + "\n").encode("utf-8")
+                    pending = args.output / "provisional.json.tmp"
+                    bounded_write(pending, data, worker_deadline)
+                    pending.replace(args.output / "provisional.json")
+            except Exception as exc:
+                if not defer_output:
+                    raise
+                record["status"] = "failed"
+                record.setdefault("artifact_error", redact(type(exc).__name__ + ": " + str(exc), secret))
+                if primary_error is None:
+                    raise
+                # Request and workload finally blocks also save. Keep their primary
+                # exception when a safe failure receipt cannot be published.
+                print("Worker artifact publication failed (" + type(exc).__name__ + ").", file=sys.stderr)
             return
         pending = args.output / "results.json.tmp"
         pending.write_text(json.dumps(redact(record, secret), indent=2) + "\n", encoding="utf-8")
@@ -2369,7 +3114,8 @@ def _run_workload(args):
         record["effective_settings"]["env"] = safe_engine_environment(cfg, environment, acceptance=bool(selection))
         config_path = temp / "config.json"
         if worker_deadline is not None:
-            bounded_write(config_path, json.dumps(cfg).encode("utf-8"), worker_deadline)
+            write = bounded_create if defer_output else bounded_write
+            write(config_path, json.dumps(cfg).encode("utf-8"), worker_deadline)
         else:
             config_path.write_text(json.dumps(cfg), encoding="utf-8")
         owner, capture, pump, proc = None, BoundedCapture(
@@ -2377,11 +3123,30 @@ def _run_workload(args):
         try:
             # Recheck immediately before spawning: never attach to an existing service.
             assert_idle(getattr(args, "port", PORT))
+            if worker_deadline is not None and time.monotonic() >= worker_deadline:
+                raise TimeoutError("Absolute worker deadline reached before server start.")
+            if defer_output:
+                acceptance_output(args, args._acceptance_manifest)
+                args.output = Path(args._acceptance_manifest["output"])
+                args._output_owner = AcceptanceOutputOwner(args.output, args._acceptance_manifest["output"], create=True)
+                record["output_claim"] = acceptance_output_claim(args.output, output_authority, owner=args._output_owner)
+                claim = acceptance_receipt({"status": "provisional_starting",
+                                            "output_claim": record["output_claim"]}, output_authority)
+                args._provisional_file = AcceptanceProvisionalFile(args._output_owner, worker_deadline)
+                args._provisional_file.create()
+                args._provisional_file.publish(claim)
+                # The same no-write/no-delete-share handle owns every later snapshot.
+                output_ready = True
+                acceptance_wait_for_controller(args._output_owner, output_authority, worker_deadline)
+                if time.monotonic() >= worker_deadline:
+                    raise TimeoutError("Absolute worker deadline reached before server start.")
             proc = subprocess.Popen([sys.executable, str(ROOT / "serve/server.py"), "--engine", "strata",
                                      "--config", str(config_path), "--host", "127.0.0.1", "--port",
                                      str(getattr(args, "port", PORT))],
                                     cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            if defer_output:
+                save()
             owner = OwnedProcess(proc) if worker_deadline is None else None
             pump = threading.Thread(target=capture.drain, args=(proc.stdout,), daemon=True)
             pump.start()
@@ -2482,8 +3247,12 @@ def _run_workload(args):
             record["status"] = "failed"
             record["error_type"] = type(exc).__name__
             record["error"] = redact(str(exc) or type(exc).__name__, secret)
+            if proc is None and getattr(args, "_acceptance_admission", None) is not None:
+                args._acceptance_admission.update(status="refused", reason=record["error"])
+                record["admission"] = dict(args._acceptance_admission)
             raise
         finally:
+            primary_error = sys.exc_info()[1]
             if guard and worker_deadline is None:
                 guard.done.set()
                 guard.thread.join(timeout=10)
@@ -2500,32 +3269,46 @@ def _run_workload(args):
                 record["status"] = "failed"
                 record["cleanup_error" if worker_deadline is not None else "error"] = redact(
                     "Process cleanup failed: " + str(exc), secret)
-                raise
+                if not defer_output or primary_error is None:
+                    raise
             finally:
                 if guard and guard.reason:
                     record["status"] = "failed"
-                    record["error"] = guard.reason
+                    if defer_output:
+                        record.setdefault("error", guard.reason)
+                    else:
+                        record["error"] = guard.reason
                 if pump:
                     pump.join(timeout=5 if worker_deadline is None else max(0, worker_deadline - time.monotonic()))
                 try:
-                    if worker_deadline is not None:
+                    if worker_deadline is not None and output_ready:
                         if pump and pump.is_alive():
                             raise RuntimeError("Worker inherited server capture did not close.")
-                        if not capture.complete or capture.error:
+                        if proc is not None and (not capture.complete or capture.error):
                             raise RuntimeError("Worker server capture failed to drain and close.")
                         if capture.total > ACCEPTANCE_LOG_LIMIT:
                             raise RuntimeError("Worker server capture exceeded the output budget.")
-                        bounded_write(args.output / "server.log", redact(capture.text(), secret).encode("utf-8"),
-                                      worker_deadline)
-                        bounded_write(args.output / "engine.log", b"Engine file logging held for bounded Stage C collection.\n",
-                                      worker_deadline)
-                    else:
+                        if defer_output:
+                            args._output_owner.validate()
+                        write = bounded_create if defer_output else bounded_write
+                        logs = {"server.log": redact(capture.text(), secret).encode("utf-8"),
+                                "engine.log": b"Engine file logging held for bounded Stage C collection.\n"}
+                        for name, data in logs.items():
+                            write(args.output / name, data, worker_deadline)
+                        if defer_output:
+                            # The authenticated final receipt binds the exact closed log bytes.
+                            record["artifact_sha256"] = {name: hashlib.sha256(data).hexdigest()
+                                                         for name, data in logs.items()}
+                    elif worker_deadline is None:
                         (args.output / "server.log").write_text(redact(capture.text(), secret), encoding="utf-8")
                         (args.output / "engine.log").write_text(redact(bounded_file(engine_log), secret), encoding="utf-8")
-                except OSError as exc:
+                except Exception as exc:
+                    if not defer_output and not isinstance(exc, OSError):
+                        raise
                     record["status"] = "failed"
                     record["artifact_error"] = redact(type(exc).__name__ + ": " + str(exc), secret)
-                    raise
+                    if not defer_output or not record.get("error"):
+                        raise
                 finally:
                     if protected:
                         try:
@@ -2576,6 +3359,8 @@ def main(argv=None):
                         help="Opt-in total acceptance budget, 900-5400 seconds (default 900)")
     parser.add_argument("--write-acceptance-manifest", type=Path, metavar="PATH",
                         help="Write reviewed input identities without starting a workload")
+    parser.add_argument("--acceptance-manifest", type=Path, metavar="PATH",
+                        help="Admit a selected contained workload against a reviewed one-use manifest")
     parser.add_argument("--manifest-not-after-unix", type=float, metavar="SECONDS",
                         help="Manifest expiry as Unix time; required with --write-acceptance-manifest")
     parser.add_argument("--acceptance-physical-gib", type=float,
