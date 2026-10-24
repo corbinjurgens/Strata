@@ -2250,9 +2250,84 @@ def acceptance_floor_check(snapshot, manifest, *, in_bytes=False):
             raise ValueError("Fresh " + name + " memory is below the manifest floor.")
 
 
-def acceptance_protection(args):
-    # This independent external protection check must eventually compare admitted protected bytes.
-    return False
+def acceptance_current_identity(row):
+    """Return the row's current identity in manifest form, or None when it is not the admitted file.
+
+    Reads are bounded by the admitted size and refuse a link or swap around the read, because
+    another local process may change any input at any instant.
+    """
+    path = Path(row["path"])
+    try:
+        def admitted():
+            return (not any(part.is_symlink() for part in (path, *path.parents)) and path.is_file()
+                    and str(path.resolve()) == row["path"])
+        if not admitted():
+            return None
+        if "mtime_ns" in row:
+            stat = path.lstat()
+            current = {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        else:
+            digest, remaining = hashlib.sha256(), row["bytes"] + 1
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                while remaining and (chunk := stream.read(min(1024**2, remaining))):
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+            named = path.lstat()
+            if not admitted() or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                return None
+            current = {"bytes": row["bytes"] + 1 - remaining, "sha256": digest.hexdigest()}
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return {"role": row["role"], "path": row["path"], **current}
+
+
+def acceptance_protection(args, worker_record):
+    """Independently re-verify the admitted manifest inputs after the worker exits.
+
+    The worker's protection rows are untrusted evidence. Protection holds only when the
+    admitted manifest is unchanged, every current input and stat equals it, and the worker's
+    before and after rows equal its inputs without roles, exactly and in order. Any defect is
+    a refusal recorded by role, path and comparison, never file contents.
+    """
+    evidence = {"status": "refused", "mismatches": []}
+    if args is not None:
+        args._acceptance_protection_evidence = evidence
+    if getattr(args, "acceptance_manifest", None) is None:
+        evidence["reason"] = "Acceptance manifest is required."
+        return False
+    mismatches = evidence["mismatches"]
+    try:
+        manifest, evidence["manifest_sha256"] = load_acceptance_manifest(args.acceptance_manifest, with_digest=True)
+        if evidence["manifest_sha256"] != getattr(args, "_controller_manifest_sha256", None):
+            raise ValueError("Manifest differs from the controller's admitted manifest.")
+        for key, comparison in (("inputs", "current-identity"), ("size_bound", "current-stat")):
+            for row in manifest[key]:
+                current = acceptance_current_identity(row)
+                if current is None or canonical_json(current) != canonical_json(row):
+                    mismatches.append({"comparison": comparison, "role": row["role"], "path": row["path"]})
+        expected = [{name: value for name, value in row.items() if name != "role"} for row in manifest["inputs"]]
+        protection = worker_record.get("protection") if type(worker_record) is dict else None
+        for side in ("before", "after"):
+            rows = protection.get(side) if type(protection) is dict else None
+            comparison = "worker-" + side
+            if type(rows) is not list:
+                mismatches.append({"comparison": comparison, "role": None, "path": None})
+                continue
+            for index, row in enumerate(manifest["inputs"]):
+                if index >= len(rows) or canonical_json(rows[index]) != canonical_json(expected[index]):
+                    mismatches.append({"comparison": comparison, "role": row["role"], "path": row["path"]})
+            if len(rows) > len(expected):
+                # Unadmitted worker rows are never copied into evidence.
+                mismatches.append({"comparison": comparison, "role": None, "path": None})
+    except Exception as exc:
+        evidence["reason"] = str(exc) if type(exc) is ValueError else (
+            "Protection evidence could not be compared (" + type(exc).__name__ + ").")
+        return False
+    if mismatches:
+        return False
+    evidence["status"] = "protected"
+    return True
 
 
 def direct_interpreter():
@@ -2663,6 +2738,7 @@ def acceptance_controller(args, started):
             record["memory"] = guard.acceptance_summary()
             raise AcceptanceFailure(record, None) from exc
         admission["status"] = "admitted"
+        args._controller_manifest_sha256 = admission["manifest_sha256"]  # Post-exit protection binding.
 
     output_authority = os.urandom(32).hex()
     admitted_output = manifest["output"] if manifest_path is not None else str(args.output.resolve())
@@ -2839,7 +2915,8 @@ def acceptance_controller(args, started):
                     record["normal_comparison"] = consume_normal_comparison(worker_record, prepared, inherited)
                 except (OSError, ValueError, TypeError, KeyError, StopIteration, AttributeError):
                     record["normal_comparison"] = normal_comparison_excluded("classification-input-unavailable")
-            record["protection"] = acceptance_protection(args) is True
+            record["protection"] = acceptance_protection(args, worker_record) is True
+            record["protection_evidence"] = getattr(args, "_acceptance_protection_evidence", None)
             guard.monitor(once=True)
             guard.check()
         # Protection and host probes may have returned after the first claim read.

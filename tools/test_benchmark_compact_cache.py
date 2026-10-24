@@ -1300,7 +1300,7 @@ class ContainedLifecycleTests(unittest.TestCase):
         patches = [
             patch.object(bench, "acceptance_ready", return_value=True),
             patch.object(bench, "acceptance_preflight", side_effect=self.preflight),
-            patch.object(bench, "acceptance_protection", side_effect=lambda args: self.mode != "protection"),
+            patch.object(bench, "acceptance_protection", side_effect=lambda args, worker_record: self.mode != "protection"),
             patch.object(bench, "WindowsProcessAPI", side_effect=lambda: self.native),
             patch.object(bench, "worker_self_identity", return_value=(321, 2**63 + 7)),
             patch.object(ctypes, "WinDLL", side_effect=AssertionError("unintercepted native DLL")),
@@ -1928,7 +1928,7 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.assertTrue(self.closed)
 
     def test_slow_returning_protection_cannot_escape_host_coverage(self):
-        def slow_protection(args):
+        def slow_protection(args, worker_record):
             self.now += 5
             return True
         with patch.object(bench, "acceptance_protection", side_effect=slow_protection):
@@ -3473,7 +3473,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
 
     def controller_name_refused(self, name):
         contents = {}
-        def protection(args):
+        def protection(args, worker_record):
             (args.output / name).write_bytes(b"pre-existing foreign controller bytes")
             contents.update({p.name: p.read_bytes() for p in args.output.iterdir()})
             return True
@@ -3490,7 +3490,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
     def test_preexisting_former_lifecycle_staging_name_is_foreign_and_refuses_untouched(self):
         # The controller no longer stages lifecycle.json, so this name is only a foreign entry.
         contents = {}
-        def protection(args):
+        def protection(args, worker_record):
             (args.output / "lifecycle.json.tmp").write_bytes(b"pre-existing foreign controller bytes")
             contents.update({p.name: p.read_bytes() for p in args.output.iterdir()})
             return True
@@ -6383,6 +6383,238 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         self.assertEqual(json.loads((self.case.output / "results.json").read_text())["status"], "held")
 
 
+class AcceptanceProtectionTests(unittest.TestCase):
+    """The controller's real post-exit protection check against the admitted manifest."""
+
+    def setUp(self):
+        real_protection = bench.acceptance_protection
+        self.real_protection = real_protection
+        self.admission = admission = AcceptanceAdmissionTests()
+        admission.setUp()
+        self.addCleanup(admission.doCleanups)
+        self.case, self.args, self.manifest = admission.case, admission.args, admission.manifest
+        self.replacement = b"SYNTHETIC INPUT, NEVER EXECUTED"
+        self.assertEqual(len(self.replacement), len(b"synthetic input, never executed"))
+        self.before_protection, self.results = None, []
+
+        def protection(args, worker_record):
+            if self.before_protection:
+                self.before_protection(args, worker_record)
+            result = real_protection(args, worker_record)
+            self.results.append(result)
+            return result
+
+        self.enterContext(patch.object(bench, "acceptance_protection", side_effect=protection))
+
+    def row(self, role, index=0):
+        rows = [row for key in ("inputs", "size_bound") for row in self.manifest[key] if row["role"] == role]
+        return rows[index]
+
+    def worker_rows(self):
+        # Spelled independently of the code under test: the admitted identity without its role.
+        return [{"path": row["path"], "bytes": row["bytes"], "sha256": row["sha256"]} for row in self.manifest["inputs"]]
+
+    def direct(self, worker_record=None):
+        args = argparse.Namespace(**vars(self.args), _controller_manifest_sha256=self.admission.digest)
+        if worker_record is None:
+            worker_record = {"protection": {"before": self.worker_rows(), "after": self.worker_rows()}}
+        return self.real_protection(args, worker_record), args._acceptance_protection_evidence
+
+    def refused(self, *mismatches):
+        with self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.case.invoke_selected()
+        record = caught.exception.record
+        self.assertEqual(self.results, [False])
+        self.assertIs(record["protection"], False)
+        self.assertFalse(bench.acceptance_final_predicate(record))
+        # Protection is the only failing qualifier, and it refused without an exception.
+        self.assertTrue(bench.acceptance_final_predicate(dict(record, protection=True)))
+        self.assertNotIn("finalization_error", record)
+        evidence = record["protection_evidence"]
+        self.assertEqual(evidence["status"], "refused")
+        self.assertEqual(evidence["mismatches"], list(mismatches))
+        saved = json.loads((self.case.output / "lifecycle.json").read_text())
+        self.assertEqual(saved["protection_evidence"], evidence)
+        self.assertFalse(saved["protection"])
+        self.assertNotIn(self.replacement.decode(), json.dumps(evidence))
+        self.assertNotIn("synthetic input", json.dumps(evidence))
+        return record
+
+    def test_green_exact_current_and_worker_evidence_protects(self):
+        result = self.case.invoke_selected()
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(self.results, [True])
+        self.assertIs(result["protection"], True)
+        evidence = {"status": "protected", "mismatches": [], "manifest_sha256": self.admission.digest}
+        self.assertEqual(result["protection_evidence"], evidence)
+        self.assertEqual(json.loads((self.case.output / "lifecycle.json").read_text())["protection_evidence"], evidence)
+
+    def test_admitted_input_changed_after_worker_exit_refuses(self):
+        target = self.admission.extra[0]
+        self.before_protection = lambda args, worker_record: target.write_bytes(self.replacement)
+        self.refused({"comparison": "current-identity", "role": "protect-input", "path": str(target.resolve())})
+
+    def test_size_bound_shard_mtime_changed_after_worker_exit_refuses(self):
+        shard = self.admission.shard
+        def touch(args, worker_record):
+            stat = shard.stat()
+            bench.os.utime(shard, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000))
+        self.before_protection = touch
+        self.refused({"comparison": "current-stat", "role": "model-shard", "path": str(shard.resolve())})
+
+    def test_worker_before_list_mismatch_refuses(self):
+        def claim(args, worker_record):
+            worker_record["protection"]["before"][1]["sha256"] = "0" * 64
+        self.before_protection = claim
+        row = self.manifest["inputs"][1]
+        self.refused({"comparison": "worker-before", "role": row["role"], "path": row["path"]})
+
+    def test_worker_after_list_mismatch_refuses(self):
+        def claim(args, worker_record):
+            worker_record["protection"]["after"].pop()
+        self.before_protection = claim
+        row = self.manifest["inputs"][-1]
+        self.refused({"comparison": "worker-after", "role": row["role"], "path": row["path"]})
+
+    def test_worker_reordered_snapshots_pass_worker_checks_but_refuse_manifest_order(self):
+        snapshot = bench.protection_snapshot
+        def reordered(paths):
+            rows = snapshot(paths)
+            if threading.current_thread() is self.case.worker_thread:
+                rows[0], rows[1] = rows[1], rows[0]
+            return rows
+        with patch.object(bench, "protection_snapshot", side_effect=reordered):
+            first, second = self.manifest["inputs"][:2]
+            self.refused(*[{"comparison": side, "role": row["role"], "path": row["path"]}
+                           for side in ("worker-before", "worker-after") for row in (first, second)])
+
+    def test_missing_manifest_after_worker_exit_refuses(self):
+        self.before_protection = lambda args, worker_record: args.acceptance_manifest.unlink()
+        record = self.refused()
+        self.assertEqual(record["protection_evidence"]["reason"], "Cannot read a valid acceptance manifest.")
+
+    def test_rebaselined_manifest_after_worker_exit_refuses(self):
+        target = self.admission.extra[0]
+        def rebaseline(args, worker_record):
+            target.write_bytes(self.replacement)
+            manifest = json.loads(args.acceptance_manifest.read_text())
+            for row in manifest["inputs"]:
+                if row["path"] == str(target.resolve()):
+                    row["sha256"] = hashlib.sha256(self.replacement).hexdigest()
+            args.acceptance_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+        self.before_protection = rebaseline
+        record = self.refused()
+        self.assertEqual(record["protection_evidence"]["reason"],
+                         "Manifest differs from the controller's admitted manifest.")
+
+    def test_direct_green_and_legacy_no_manifest_control(self):
+        self.assertEqual(self.direct(), (True, {"status": "protected", "mismatches": [],
+                                                "manifest_sha256": self.admission.digest}))
+        exact = {"protection": {"before": self.worker_rows(), "after": self.worker_rows()}}
+        legacy = argparse.Namespace(**dict(vars(self.args), acceptance_manifest=None))
+        self.assertIs(self.real_protection(legacy, exact), False)
+        self.assertEqual(legacy._acceptance_protection_evidence,
+                         {"status": "refused", "mismatches": [], "reason": "Acceptance manifest is required."})
+        self.assertIs(self.real_protection(None, None), False)
+        unadmitted = argparse.Namespace(**vars(self.args))
+        self.assertIs(self.real_protection(unadmitted, exact), False)
+        self.assertEqual(unadmitted._acceptance_protection_evidence["reason"],
+                         "Manifest differs from the controller's admitted manifest.")
+
+    def test_direct_malformed_worker_structure_and_type_aliases_refuse(self):
+        first = self.manifest["inputs"][0]
+        def every(side):
+            return [{"comparison": "worker-" + side, "role": None, "path": None}]
+        def at(side, row=first):
+            return [{"comparison": "worker-" + side, "role": row["role"], "path": row["path"]}]
+        cases = {
+            "missing protection": ({}, every("before") + every("after")),
+            "protection not object": ({"protection": [self.worker_rows()]}, every("before") + every("after")),
+            "record not object": ([], every("before") + every("after")),
+            "before missing": ({"protection": {"after": self.worker_rows()}}, every("before")),
+            "after not list": ({"protection": {"before": self.worker_rows(), "after": {}}}, every("after")),
+        }
+        for name, (record, expected) in cases.items():
+            with self.subTest(name):
+                result, evidence = self.direct(record)
+                self.assertIs(result, False)
+                self.assertEqual(evidence["mismatches"], expected)
+        mutations = {
+            "float bytes alias": lambda row: row.update(bytes=float(row["bytes"])),
+            "role retained": lambda row: row.update(role=first["role"]),
+            "uppercase digest": lambda row: row.update(sha256=row["sha256"].upper()),
+            "missing digest": lambda row: row.pop("sha256"),
+            "not an object": lambda row: row.clear(),
+        }
+        for side in ("before", "after"):
+            for name, mutate in mutations.items():
+                with self.subTest(side=side, mutation=name):
+                    rows = self.worker_rows()
+                    mutate(rows[0])
+                    protection = {"before": self.worker_rows(), "after": self.worker_rows(), side: rows}
+                    result, evidence = self.direct({"protection": protection})
+                    self.assertIs(result, False)
+                    self.assertEqual(evidence["mismatches"], at(side))
+            with self.subTest(side=side, mutation="foreign extra row"):
+                foreign = str(self.admission.root / "foreign-unrelated.bin")
+                rows = self.worker_rows() + [{"path": foreign, "bytes": 1, "sha256": "0" * 64}]
+                protection = {"before": self.worker_rows(), "after": self.worker_rows(), side: rows}
+                result, evidence = self.direct({"protection": protection})
+                self.assertIs(result, False)
+                self.assertEqual(evidence["mismatches"], every(side))
+                self.assertNotIn("foreign-unrelated", json.dumps(evidence))
+
+    def test_direct_missing_linked_unreadable_and_grown_inputs_refuse(self):
+        target = self.admission.extra[1]
+        identity = {"comparison": "current-identity", "role": "protect-input", "path": str(target.resolve())}
+        real_is_symlink, real_open = Path.is_symlink, Path.open
+        def unreadable(path, *args, **kwargs):
+            if path == target:
+                raise PermissionError("synthetic sharing violation")
+            return real_open(path, *args, **kwargs)
+        with self.subTest("linked"), patch.object(Path, "is_symlink", lambda path: path == target or real_is_symlink(path)):
+            self.assertEqual(self.direct(), (False, {"status": "refused", "mismatches": [identity],
+                                                      "manifest_sha256": self.admission.digest}))
+        with self.subTest("unreadable"), patch.object(Path, "open", unreadable):
+            self.assertEqual(self.direct()[1]["mismatches"], [identity])
+        original = target.read_bytes()
+        copy = self.admission.root / "identical-copy.txt"
+        copy.write_bytes(original)
+        def swapped(path, *args, **kwargs):
+            return real_open(copy if path == target else path, *args, **kwargs)
+        with self.subTest("swapped object"), patch.object(Path, "open", swapped):
+            self.assertEqual(self.direct()[1]["mismatches"], [identity])
+        reads = []
+        def counted(path, *args, **kwargs):
+            stream = real_open(path, *args, **kwargs)
+            if path == target:
+                read = stream.read
+                stream.read = lambda size=-1: reads.append(read(size)) or reads[-1]
+            return stream
+        with self.subTest("grown"), patch.object(Path, "open", counted):
+            target.write_bytes(original + b"x" * 1024**2)
+            self.assertEqual(self.direct()[1]["mismatches"], [identity])
+            self.assertEqual(sum(map(len, reads)), len(original) + 1)
+        with self.subTest("missing"):
+            target.unlink()
+            self.assertEqual(self.direct()[1]["mismatches"], [identity])
+        target.write_bytes(original)
+        self.assertEqual(self.direct()[0], True)
+
+    def test_direct_linked_pack_parent_refuses_every_pack_row(self):
+        pack, moved = self.admission.pack, self.admission.root / "pack-moved"
+        pack.rename(moved)
+        pack.symlink_to(moved, target_is_directory=True)
+        result, evidence = self.direct()
+        self.assertIs(result, False)
+        expected = [{"comparison": "current-identity" if key == "inputs" else "current-stat",
+                     "role": row["role"], "path": row["path"]}
+                    for key in ("inputs", "size_bound") for row in self.manifest[key]
+                    if Path(row["path"]).parent == pack]
+        self.assertEqual(len(expected), 3)
+        self.assertEqual(evidence["mismatches"], expected)
+
+
 class StageCRepairTests(unittest.TestCase):
     def source(self):
         case = StageCSourceTests()
@@ -7438,7 +7670,7 @@ class NormalComparisonTests(unittest.TestCase):
             finally:
                 case.doCleanups()
         self.assertFalse(bench.acceptance_ready())
-        self.assertFalse(bench.acceptance_protection(None))
+        self.assertFalse(bench.acceptance_protection(None, None))
         with self.assertRaisesRegex(RuntimeError, "^Acceptance manifest is required\\.$"):
             bench.acceptance_preflight(None)
 
