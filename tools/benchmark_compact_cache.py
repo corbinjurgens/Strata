@@ -1274,6 +1274,9 @@ class WindowsProcessAPI:
         return (os.read(pipe.fileno(), min(8192, available.value)) if available.value else b"", False)
 
 
+ENGINE_SERVING_PATTERN = r"strata serve: (?:WARNING: )?(\d+) MiB of VRAM free with everything loaded"
+
+
 class MemoryGuard:
     def __init__(self, owner, engine_log, *, acceptance_floors=None, deadline=None, sample_limit=4096,
                  engine_log_limit=2 * LOG_LIMIT, required_request_marks=None):
@@ -1373,7 +1376,7 @@ class MemoryGuard:
             if m:
                 value, stage = int(m[2]), (m[1] or "") + m[3].strip()
                 enforced = self.cuda_serving or stage == "the completed request"
-            m = re.search(r"strata serve: (?:WARNING: )?(\d+) MiB of VRAM free with everything loaded", line)
+            m = re.search(ENGINE_SERVING_PATTERN, line)
             if m:
                 value, stage, enforced = int(m[1]), "serving", True
                 self.cuda_serving = True
@@ -2939,6 +2942,76 @@ def acceptance_final_predicate(record):
             and not record.get("error") and not record.get("cleanup_error"))
 
 
+def acceptance_allocations(text):
+    """Read startup allocations only, from the controller's authenticated engine-log bytes."""
+    formats = (
+        ("recent_cache", "strata generate: recent file expert cache ",
+         r"strata generate: recent file expert cache ([\d.]+) MiB \(requested (\d+) MiB",
+         (("actual_mib", float), ("requested_mib", int))),
+        ("expert_cache_auto", "strata generate: expert cache auto: ",
+         r"strata generate: expert cache auto: ([\d.]+) GiB free, (\d+) MiB reserved "
+         r"\(\+(\d+) MiB for the draft head\) -> (\d+) slots\b",
+         (("free_gib", float), ("reserved_mib", int), ("draft_head_mib", int), ("slots", int))),
+        ("mapped_pinned_complement", "mapped pinned cache complement ready: ",
+         r"mapped pinned cache complement ready: resident ([\d.]+) GiB, pinned ([\d.]+) GiB\b",
+         (("resident_gib", float), ("pinned_gib", float))),
+    )
+    evidence = {key: None for key, _, _, _ in formats}
+    errors = evidence["errors"] = []
+    evidence["end_of_run_cache_capacity"] = (
+        "not collected; printed only under STRATA_FETCH_PROFILE, which acceptance arms exclude")
+    for line in text.splitlines():
+        if re.search(ENGINE_SERVING_PATTERN, line):
+            break
+        for key, marker, pattern, fields in formats:
+            match = re.search(pattern, line)
+            if match is None:
+                # The engine also prints unrelated expert-cache auto warnings and diagnostics.
+                if marker in line and (key != "expert_cache_auto" or "GiB free," in line):
+                    error = "Unreadable startup allocation: " + key
+                    if error not in errors:
+                        errors.append(error)
+                continue
+            try:
+                values = {name: convert(value) for (name, convert), value in zip(fields, match.groups())}
+                if not all(valid_number(value) and value >= 0 for value in values.values()):
+                    raise ValueError()
+            except (ValueError, OverflowError):
+                error = "Unreadable startup allocation: " + key
+                if error not in errors:
+                    errors.append(error)
+            else:
+                evidence[key] = values  # The last startup observation wins.
+    else:
+        errors.append("Engine serving startup boundary is missing.")
+    return evidence
+
+
+def acceptance_launch_evidence(launch, cohort, floors, allocations):
+    """Check the server's realized cohort/sample against both controller-owned floors."""
+    reason = None
+    if type(launch) is not dict:
+        reason = "Launch memory evidence is unavailable."
+    elif cohort not in ("automatic", "saved-static"):
+        reason = "Launch cohort is unsupported."
+    elif launch.get("cohort") != ("automatic" if cohort == "automatic" else "static"):
+        reason = "Realized launch cohort differs from the selected cohort."
+    elif cohort == "automatic":
+        sample = launch.get("sample")
+        headroom = sample.get("headroom_requested_gib") if type(sample) is dict else None
+        if launch.get("sample_status") != "available":
+            reason = "Automatic launch sample is unavailable."
+        elif not valid_number(headroom) or headroom < 0:
+            reason = "Automatic launch headroom must be a finite nonnegative number."
+        elif any(headroom > floor for floor in floors):
+            reason = "Automatic launch headroom exceeds the physical or commit floor."
+        elif allocations.get("recent_cache") is None:
+            reason = "Automatic launch recent-cache startup allocation is missing."
+    if reason is None and allocations.get("errors"):
+        reason = "Engine startup allocation evidence is unreadable or incomplete."
+    return {"status": "refused", "reason": reason} if reason else {"status": "satisfied"}
+
+
 def acceptance_controller(args, started):
     """Supervise the complete child, including admission and artifact close, from outside it.
 
@@ -3152,9 +3225,13 @@ def acceptance_controller(args, started):
                         # The authenticated bytes complete the guard's stream; consumed rows must be their prefix.
                         guard.finish_engine_log(data, (opened.st_dev, opened.st_ino))
                         record["memory"]["cuda"] = guard.cuda_summary()  # The receipt carries the bound stream.
+                        record["allocation_evidence"] = acceptance_allocations(data.decode("utf-8", errors="strict"))
             record["worker_complete"] = worker_record.get("status") == "provisional_complete"
             selection = getattr(args, "acceptance_workload", None)
             if selection:
+                record["launch_evidence"] = acceptance_launch_evidence(
+                    worker_record.get("launch_memory"), args.cohort, floors,
+                    record.get("allocation_evidence", {}))
                 record["workload_evidence"] = {key: worker_record.get(key) for key in (
                     "acceptance_workload", "cohort", "expected_max_context", "acceptance_workload_passed",
                     "final_idle", "protection", "missing_evidence")}
@@ -3444,6 +3521,8 @@ def _run_workload(args):
         engine_log = temp / "engine.log"
         cfg, environment = (clean_environment(cfg, args.timing, fetch_timing, acceptance=True)
                             if selection else clean_environment(cfg, args.timing, fetch_timing))
+        if selection:
+            cfg["launch_memory_metrics"] = True
         classification = normal_comparison_environment(cfg, environment, server_log=worker_deadline is None)
         # A refused source inventory cannot establish that instrumentation is absent.
         # Final automatic binding alone does not change diagnostic classification.
@@ -3525,6 +3604,8 @@ def _run_workload(args):
             if health.get("max_context") != expected_context:
                 raise RuntimeError(f"Loaded server context is not {expected_context}; benchmark stopped.")
             record["engine"] = client.get("/metrics")["engine"]
+            if selection:
+                record["launch_memory"] = client.get("/metrics").get("launch_memory")
             record["status"] = "running"
             save()
             if held_out or transfer_workload or long_context or selection:

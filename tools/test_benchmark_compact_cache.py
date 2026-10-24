@@ -1098,6 +1098,140 @@ class EngineLogEvidenceTests(unittest.TestCase):
                     self.log.unlink()
 
 
+class LaunchEvidenceTests(unittest.TestCase):
+    # Source formats: generate.cpp configure_file_cache/auto_cache and expert_source.cpp complement_ready_.
+    RECENT = ("strata generate: recent file expert cache 4525.0 MiB "
+              "(requested 4525 MiB; compact buffers, lazy, 8 GiB headroom)\n")
+    AUTO = ("strata generate: expert cache auto: 10.21 GiB free, 1024 MiB reserved "
+            "(+0 MiB for the draft head) -> 4542 slots\n")
+    PINNED = ("FileExpertSource: mapped pinned cache complement ready: "
+              "resident 9.00 GiB, pinned 9.00 GiB in 12 s\n")
+    SERVING = "strata serve: 761 MiB of VRAM free with everything loaded\n"
+
+    def setUp(self):
+        self.launch = {"cohort": "automatic", "sample_status": "available",
+                       "sample": {"headroom_requested_gib": 8}}
+        self.allocations = bench.acceptance_allocations(self.AUTO + self.PINNED + self.RECENT + self.SERVING)
+
+    def evidence(self, *, launch=None, cohort="automatic", floors=(8, 8), allocations=None):
+        return bench.acceptance_launch_evidence(self.launch if launch is None else launch, cohort, floors,
+                                                self.allocations if allocations is None else allocations)
+
+    def test_automatic_eight_gib_policy_satisfies_both_eight_gib_floors(self):
+        self.assertEqual(self.evidence(), {"status": "satisfied"})
+        self.launch["sample"]["headroom_requested_gib"] = 8.0
+        self.assertEqual(self.evidence(), {"status": "satisfied"})
+
+    def test_eight_gib_headroom_refuses_four_gib_floors_and_each_asymmetric_floor(self):
+        for floors in ((4, 4), (8, 4), (4, 8), (8, 7.999), (7.999, 8)):
+            with self.subTest(floors=floors):
+                self.assertEqual(self.evidence(floors=floors), {
+                    "status": "refused", "reason": "Automatic launch headroom exceeds the physical or commit floor."})
+
+    def test_launch_must_be_a_dictionary(self):
+        for launch in (None, [], "automatic", True, 8):
+            with self.subTest(launch=launch):
+                self.assertEqual(bench.acceptance_launch_evidence(launch, "automatic", (8, 8), self.allocations), {
+                    "status": "refused", "reason": "Launch memory evidence is unavailable."})
+
+    def test_saved_static_requires_static_and_automatic_requires_automatic(self):
+        for selected, realized in (("saved-static", "automatic"), ("automatic", "static"),
+                                    ("saved-static", "saved-static"), ("automatic", None)):
+            with self.subTest(selected=selected, realized=realized):
+                self.launch["cohort"] = realized
+                self.assertEqual(self.evidence(cohort=selected), {
+                    "status": "refused", "reason": "Realized launch cohort differs from the selected cohort."})
+
+    def test_static_sample_does_not_require_an_automatic_sample_or_recent_cache(self):
+        self.assertEqual(self.evidence(launch={"cohort": "static", "sample_status": "unavailable", "sample": None},
+                                      cohort="saved-static", allocations=bench.acceptance_allocations(self.SERVING)),
+                         {"status": "satisfied"})
+
+    def test_frozen_and_unknown_selected_cohorts_refuse(self):
+        for cohort in ("frozen-control", "static", None):
+            with self.subTest(cohort=cohort):
+                self.assertEqual(self.evidence(cohort=cohort), {
+                    "status": "refused", "reason": "Launch cohort is unsupported."})
+
+    def test_unavailable_or_missing_automatic_sample_status_refuses(self):
+        for status in ("unavailable", None, True, "AVAILABLE"):
+            with self.subTest(status=status):
+                self.launch["sample_status"] = status
+                self.assertEqual(self.evidence(), {
+                    "status": "refused", "reason": "Automatic launch sample is unavailable."})
+
+    def test_automatic_sample_shape_and_headroom_must_be_finite_nonnegative_numbers(self):
+        for sample in (None, [], True, {}, {"headroom_requested_gib": None},
+                       *[{"headroom_requested_gib": value} for value in
+                         (True, False, "8", float("nan"), float("inf"), -float("inf"), -0.1, 10**400)]):
+            with self.subTest(sample=sample):
+                self.launch["sample"] = sample
+                self.assertEqual(self.evidence(), {
+                    "status": "refused", "reason": "Automatic launch headroom must be a finite nonnegative number."})
+
+    def test_missing_recent_startup_line_refuses_even_with_available_automatic_sample(self):
+        allocations = bench.acceptance_allocations(self.AUTO + self.PINNED + self.SERVING)
+        self.assertEqual(self.evidence(allocations=allocations), {
+            "status": "refused", "reason": "Automatic launch recent-cache startup allocation is missing."})
+
+    def test_exact_source_format_allocation_values_and_capacity_qualification(self):
+        self.assertEqual(self.allocations, {
+            "recent_cache": {"actual_mib": 4525.0, "requested_mib": 4525},
+            "expert_cache_auto": {"free_gib": 10.21, "reserved_mib": 1024, "draft_head_mib": 0, "slots": 4542},
+            "mapped_pinned_complement": {"resident_gib": 9.0, "pinned_gib": 9.0}, "errors": [],
+            "end_of_run_cache_capacity":
+                "not collected; printed only under STRATA_FETCH_PROFILE, which acceptance arms exclude"})
+        self.assertIs(type(self.allocations["recent_cache"]["actual_mib"]), float)
+        self.assertIs(type(self.allocations["recent_cache"]["requested_mib"]), int)
+
+    def test_last_startup_values_win_and_post_serving_values_are_ignored(self):
+        early = (self.RECENT.replace("4525.0", "100.0").replace("4525 MiB", "100 MiB")
+                 + self.AUTO.replace("4542", "10") + self.PINNED.replace("9.00", "1.00"))
+        late = self.RECENT.replace("4525.0", "2.0") + self.AUTO.replace("4542", "2")
+        for serving in (self.SERVING, self.SERVING.replace("761 MiB", "WARNING: 761 MiB"),
+                        self.SERVING.rstrip() + " - LOW: requests may stall\n"):
+            with self.subTest(serving=serving):
+                self.assertEqual(bench.acceptance_allocations(early + self.AUTO + self.PINNED + self.RECENT
+                                                              + serving + late), self.allocations)
+
+    def test_recent_line_only_after_serving_cannot_satisfy_automatic_launch(self):
+        allocations = bench.acceptance_allocations(self.SERVING + self.RECENT)
+        self.assertIsNone(allocations["recent_cache"])
+        self.assertEqual(self.evidence(allocations=allocations)["status"], "refused")
+
+    def test_no_serving_boundary_refuses_startup_evidence(self):
+        allocations = bench.acceptance_allocations(self.RECENT)
+        self.assertEqual(allocations["errors"], ["Engine serving startup boundary is missing."])
+        self.assertEqual(self.evidence(allocations=allocations), {
+            "status": "refused", "reason": "Engine startup allocation evidence is unreadable or incomplete."})
+
+    def test_malformed_and_nonfinite_allocation_values_refuse_without_echoing_text(self):
+        for key, text in (("recent_cache", self.RECENT.replace("4525.0", "1..2")),
+                          ("recent_cache", self.RECENT.replace("4525.0", "9" * 400)),
+                          ("recent_cache", self.RECENT.replace("4525.0", "-1.0")),
+                          ("recent_cache", self.RECENT.replace("requested 4525", "requested " + "9" * 5000)),
+                          ("expert_cache_auto", self.AUTO.replace("10.21", "1..2")),
+                          ("expert_cache_auto", self.AUTO.replace("10.21", "9" * 400)),
+                          ("expert_cache_auto", self.AUTO.replace("1024", "-1")),
+                          ("expert_cache_auto", self.AUTO.replace("4542", "9" * 5000)),
+                          ("mapped_pinned_complement", self.PINNED.replace("9.00", "1..2")),
+                          ("mapped_pinned_complement", self.PINNED.replace("9.00", "9" * 400))):
+            with self.subTest(key=key, text=text[:100]):
+                allocations = bench.acceptance_allocations(self.RECENT + text + self.SERVING)
+                self.assertEqual(allocations["errors"], ["Unreadable startup allocation: " + key])
+                self.assertEqual(self.evidence(allocations=allocations)["status"], "refused")
+
+    def test_unrelated_auto_diagnostics_and_missing_optional_allocations_are_allowed(self):
+        text = ("strata generate: expert cache auto: Windows keeps 1024 MiB free after the cache\n"
+                + "strata generate: expert cache auto: the 1024 MiB reserve leaves too few slots\n"
+                + self.RECENT + self.SERVING)
+        allocations = bench.acceptance_allocations(text)
+        self.assertEqual(allocations["errors"], [])
+        self.assertIsNone(allocations["expert_cache_auto"])
+        self.assertIsNone(allocations["mapped_pinned_complement"])
+        self.assertEqual(self.evidence(allocations=allocations), {"status": "satisfied"})
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         scratch = Path(tempfile.gettempdir())
@@ -1305,6 +1439,7 @@ class RunTests(unittest.TestCase):
             self.assertEqual(temporary_cfg["api_key"], self.secret)
             self.assertEqual(temporary_cfg["args"], ["--max-context", "131072", "--resident-budget-gib", "8"])
             self.assertEqual(temporary_cfg["env"], expected_env or {"STRATA_FILE_CACHE_MIB": "4096"})
+            self.assertNotIn("launch_memory_metrics", temporary_cfg)
             self.assertNotIn("STRATA_VERIFY_PROFILE", kwargs["env"])
             Path(temporary_cfg["log"]).write_text("engine " + self.secret)
             return proc
@@ -1353,6 +1488,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(record["summary"]["predicted_ms"], 9000)
         self.assertAlmostEqual(record["summary"]["tokens_per_second"], 960 / 9)
         self.assertEqual(record["engine"], {"cache_slots": 4990})
+        self.assertNotIn("launch_memory", record)
         self.assertEqual(record["memory"]["min_available_gib"], 4)
         self.assertEqual(len(record["exe_sha256"]), 64)
         self.owner.stop.assert_called_once_with()
@@ -1776,6 +1912,7 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.stage = None
         # A manifest run's fake engine appends r8-format CUDA rows to the configured log.
         self.engine_stream, self.engine_marks = None, 0
+        self.engine_startup = ""
         self.engine_serving = "strata serve: 761 MiB of VRAM free with everything loaded\n"
         self.engine_mark = lambda index: "strata trace: 731 MiB free after the completed request\n"
         self.cleanup = contextlib.ExitStack()
@@ -1875,6 +2012,7 @@ class ContainedLifecycleTests(unittest.TestCase):
             self.assertTrue(Path(cfg["log"]).is_file(), "The worker creates the engine log before the server")
             # The same append open as serve/server.py StrataEngine, into the worker's object.
             self.engine_stream = open(cfg["log"], "a", encoding="utf-8")
+            self.engine_write(self.engine_startup)
             self.engine_write(self.engine_serving)
         self.events.append("server")
         def terminate():
@@ -2610,9 +2748,9 @@ class ContainedLifecycleTests(unittest.TestCase):
         self.assertFalse(error.record["worker_complete"])
         self.assertEqual(error.record["workload_evidence"]["cohort"], "frozen-control")
 
-    def invoke_selected(self, mutate=None, selection="short", missing=False):
+    def invoke_selected(self, mutate=None, selection="short", missing=False, floors=(4, 4)):
         self.args.acceptance_workload = selection
-        self.args.acceptance_physical_gib = self.args.acceptance_commit_gib = 4
+        self.args.acceptance_physical_gib, self.args.acceptance_commit_gib = floors
         self.args.expected_context = 131072
         self.args.cohort = "saved-static" if selection == "short" else "automatic"
         if selection == "near-full":
@@ -2620,7 +2758,8 @@ class ContainedLifecycleTests(unittest.TestCase):
             cfg.setdefault("memory_policy", {"version": 1})
             self.config.write_text(json.dumps(cfg))
         adapter = types.SimpleNamespace(args=self.args, count=StageCSourceTests.count, calls=[], change=None,
-            metric_change=None, reference_text="synthetic reference with planted codes")
+            metric_change=None, reference_text="synthetic reference with planted codes",
+            launch_memory=getattr(self, "launch_memory", None))
         base_client = StageCSourceTests.client_type(adapter)
         guards = []
         real_guard, real_workload, real_idle, real_open = (bench.MemoryGuard, bench.acceptance_workload_tests,
@@ -2714,6 +2853,9 @@ class StageCSourceTests(unittest.TestCase):
         self.reference_text = "synthetic reference with planted codes"
         self.calls, self.clones, self.processes = [], [], []
         self.server_environments = []
+        self.get_calls = []
+        self.launch_memory = {"cohort": "automatic", "sample_status": "available",
+                              "sample": {"headroom_requested_gib": 8}}
 
     @staticmethod
     def count(messages):
@@ -2736,9 +2878,12 @@ class StageCSourceTests(unittest.TestCase):
                 self.cfg, self.history = cfg, []
 
             def get(self, path):
+                if hasattr(test, "get_calls"):
+                    test.get_calls.append(path)
                 if path == "/health":
                     return {"loaded": True, "max_context": test.args.expected_context}
                 return {"engine": {"arena_mib": 4096, "expert_cache_mib": 1024},
+                        "launch_memory": getattr(test, "launch_memory", None),
                         "totals": {"requests": len(self.history)}, "requests": self.history[:]}
 
             def chat(self, messages, max_tokens=128, **kwargs):
@@ -2817,6 +2962,18 @@ class StageCSourceTests(unittest.TestCase):
 
     def saved(self):
         return json.loads((self.args.output / "provisional.json").read_text())
+
+    def test_selected_clone_enables_launch_metrics_and_records_after_health(self):
+        self.cfg["launch_memory_metrics"] = False
+        self.config.write_text(json.dumps(self.cfg))
+        result = self.invoke()
+        self.assertIs(self.clones[0]["launch_memory_metrics"], True)
+        self.assertEqual(self.get_calls[:3], ["/health", "/metrics", "/metrics"])
+        self.assertEqual(result["launch_memory"], {"cohort": "automatic", "sample_status": "available",
+                                                 "sample": {"headroom_requested_gib": 8}})
+        self.assertEqual(self.saved()["launch_memory"], result["launch_memory"])
+        self.assertEqual(result["engine"], {"arena_mib": 4096, "expert_cache_mib": 1024})
+        self.assertIs(json.loads(self.config.read_text())["launch_memory_metrics"], False)
 
     def test_public_near_full_body_records_separate_fresh_sustained_request_and_actual_history(self):
         result = self.invoke()
@@ -6209,7 +6366,7 @@ class AcceptanceAdmissionTests(unittest.TestCase):
     def test_in_place_engine_log_rewrite_refuses(self):
         self.worker_log_changed_after_close("engine.log", "rewritten")
 
-    def engine_run(self, mark=None, *, selection="short", refused=False):
+    def engine_run(self, mark=None, *, selection="short", refused=False, floors=(4, 4)):
         clones = []
         spawn = self.case.spawn
         def spawning(argv, **kwargs):
@@ -6221,12 +6378,82 @@ class AcceptanceAdmissionTests(unittest.TestCase):
         with patch.object(bench.subprocess, "Popen", side_effect=spawning):
             if refused:
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(bench.AcceptanceFailure) as caught:
-                    self.case.invoke_selected(selection=selection)
+                    self.case.invoke_selected(selection=selection, floors=floors)
                 result = caught.exception.record
             else:
-                result = self.case.invoke_selected(selection=selection)
+                result = self.case.invoke_selected(selection=selection, floors=floors)
         self.assertEqual(self.engine_log_handles, set())
         return result, clones
+
+    def automatic_launch_run(self, *, floors=(8, 8), startup=None, launch=None):
+        cfg = json.loads(self.case.config.read_text())
+        cfg["memory_policy"] = {"version": 1}
+        self.case.config.write_text(json.dumps(cfg))
+        self.args.acceptance_workload, self.args.cohort = "near-full", "automatic"
+        self.args.acceptance_physical_gib, self.args.acceptance_commit_gib = floors
+        manifest = self.root / "automatic-launch-manifest.json"
+        self.args.acceptance_manifest = None
+        self.args.write_acceptance_manifest, self.args.manifest_not_after_unix = manifest, 1800010000.0
+        self.assertEqual(bench.run(self.args), 0)
+        self.args.acceptance_manifest = manifest
+        self.args.write_acceptance_manifest = self.args.manifest_not_after_unix = None
+        self.case.launch_memory = ({"cohort": "automatic", "sample_status": "available",
+                                    "sample": {"headroom_requested_gib": 8}} if launch is None else launch)
+        self.case.engine_startup = (LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED + LaunchEvidenceTests.RECENT
+                                   if startup is None else startup)
+        return self.engine_run(selection="near-full", floors=floors)
+
+    def test_controller_checks_realized_automatic_launch_and_authenticated_startup_allocations(self):
+        result, clones = self.automatic_launch_run()
+        self.assertEqual(result["launch_evidence"], {"status": "satisfied"})
+        self.assertEqual(result["memory"]["floors_gib"], {"physical": 8, "commit": 8})
+        self.assertEqual(result["allocation_evidence"], {
+            "recent_cache": {"actual_mib": 4525.0, "requested_mib": 4525},
+            "expert_cache_auto": {"free_gib": 10.21, "reserved_mib": 1024, "draft_head_mib": 0, "slots": 4542},
+            "mapped_pinned_complement": {"resident_gib": 9.0, "pinned_gib": 9.0}, "errors": [],
+            "end_of_run_cache_capacity":
+                "not collected; printed only under STRATA_FETCH_PROFILE, which acceptance arms exclude"})
+        worker = json.loads((self.case.output / "provisional.json").read_bytes())
+        self.assertEqual(worker["launch_memory"], self.case.launch_memory)
+        self.assertEqual(worker["engine"], {"arena_mib": 4096, "expert_cache_mib": 1024})
+        self.assertIs(clones[0][0]["launch_memory_metrics"], True)
+        lifecycle = json.loads((self.case.output / "lifecycle.json").read_bytes())
+        self.assertEqual(lifecycle["launch_evidence"], {"status": "satisfied"})
+        self.assertEqual(lifecycle["allocation_evidence"], result["allocation_evidence"])
+
+    def test_controller_compares_automatic_headroom_with_its_commit_floor_independently(self):
+        result, _ = self.automatic_launch_run(floors=(8, 4))
+        self.assertEqual(result["launch_evidence"], {
+            "status": "refused", "reason": "Automatic launch headroom exceeds the physical or commit floor."})
+        self.assertEqual(result["memory"]["floors_gib"], {"physical": 8, "commit": 4})
+
+    def test_controller_missing_recent_allocation_refuses_an_otherwise_available_automatic_launch(self):
+        result, _ = self.automatic_launch_run(startup=LaunchEvidenceTests.AUTO + LaunchEvidenceTests.PINNED)
+        self.assertEqual(result["launch_evidence"], {
+            "status": "refused", "reason": "Automatic launch recent-cache startup allocation is missing."})
+        self.assertIsNone(result["allocation_evidence"]["recent_cache"])
+
+    def test_controller_unavailable_automatic_sample_refuses_despite_startup_allocations(self):
+        result, _ = self.automatic_launch_run(launch={"cohort": "automatic", "sample_status": "unavailable",
+                                                    "sample": {"headroom_requested_gib": 8}})
+        self.assertEqual(result["launch_evidence"], {
+            "status": "refused", "reason": "Automatic launch sample is unavailable."})
+        self.assertEqual(result["allocation_evidence"]["recent_cache"], {"actual_mib": 4525.0, "requested_mib": 4525})
+
+    def test_controller_refuses_a_realized_automatic_sample_in_a_saved_static_arm(self):
+        self.case.launch_memory = {"cohort": "automatic", "sample_status": "available",
+                                   "sample": {"headroom_requested_gib": 8}}
+        result, _ = self.engine_run()
+        self.assertEqual(result["launch_evidence"], {
+            "status": "refused", "reason": "Realized launch cohort differs from the selected cohort."})
+        self.assertEqual(json.loads((self.case.output / "lifecycle.json").read_bytes())["launch_evidence"],
+                         result["launch_evidence"])
+
+    def test_controller_static_launch_needs_no_automatic_sample(self):
+        self.case.launch_memory = {"cohort": "static", "sample_status": "unavailable", "sample": None}
+        result, _ = self.engine_run()
+        self.assertEqual(result["launch_evidence"], {"status": "satisfied"})
+        self.assertIsNone(result["allocation_evidence"]["recent_cache"])
 
     def test_manifest_short_run_enforces_eleven_marks_from_the_worker_owned_engine_log(self):
         result, clones = self.engine_run()
