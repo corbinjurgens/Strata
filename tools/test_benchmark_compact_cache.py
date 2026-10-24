@@ -163,6 +163,410 @@ class ControllerTimingTests(unittest.TestCase):
                     self.assertAlmostEqual(capture[0]["elapsed_seconds"], 0.8485836)
 
 
+class HostSamplerTests(unittest.TestCase):
+    """Real threads and controlled barriers; host/native/log resources are mocked."""
+
+    def setUp(self):
+        from tools import prepare_unsloth_q2 as preparation
+        self.snapshot = {"available_gib": 8, "commit_available_gib": 9}
+        self.published = threading.Condition()
+        self.reads = 0
+        def read():
+            with self.published:
+                self.reads += 1
+                self.published.notify_all()
+            return dict(self.snapshot)
+        self.enterContext(patch.object(preparation, "memory_snapshot", side_effect=read))
+
+    def wait_reads(self, count):
+        with self.published:
+            self.assertTrue(self.published.wait_for(lambda: self.reads >= count, timeout=2),
+                            "Actual host reads stopped behind the controller/owner barrier")
+
+    def guard(self, owner=None, log=None):
+        guard = bench.MemoryGuard(owner, log, acceptance_floors=(4, 4))
+        guard.controller_timing = bench.ControllerTiming()
+        self.addCleanup(self.shutdown, guard)
+        guard.start_host_sampler(bench.time.monotonic() + 2)
+        return guard
+
+    def shutdown(self, guard):
+        if guard.thread.is_alive() or guard.cancel_thread.is_alive():
+            guard.stop_host_sampler(bench.time.monotonic(), bench.time.monotonic() + 3)
+        self.assertFalse(guard.thread.is_alive())
+        self.assertFalse(guard.cancel_thread.is_alive())
+
+    def blocked_log(self, stage, *, emergency=None):
+        entered, release, cancelled, cancel_release = (threading.Event() for _ in range(4))
+        original_fstat = bench.os.fstat
+        def barrier(name):
+            if name == stage:
+                entered.set()
+                if not release.wait(3):
+                    raise AssertionError("Controller barrier was not released")
+        class Stream:
+            def __enter__(stream):
+                return stream
+            def __exit__(stream, *args):
+                barrier("close")
+            def fileno(stream):
+                return -501
+            def seek(stream, offset):
+                pass
+            def read(stream, size):
+                barrier("read")
+                return b""
+        class Log:
+            def is_symlink(path):
+                barrier("path")
+                return False
+            def is_junction(path):
+                return False
+            def exists(path):
+                return True
+            def open(path, mode):
+                barrier("open")
+                return Stream()
+        native = Mock()
+        proc = types.SimpleNamespace(pid=321, _handle=1234)
+        owner = bench.OwnedProcess(proc, native=native, deadline=bench.time.monotonic() + 4)
+        owner.job, owner.assigned, owner.identity = 77, True, (321, 99)
+        native.identity.return_value = (321, 99)
+        native.active.return_value = 0
+        def cancel(job):
+            cancelled.set()
+            self.assertTrue(cancel_release.wait(3))
+            if emergency is not None:
+                raise OSError("synthetic cancellation error")
+        native.terminate_job.side_effect = cancel
+        def stat(fd):
+            if fd != -501:
+                return original_fstat(fd)
+            barrier("stat")
+            return types.SimpleNamespace(st_dev=1, st_ino=2, st_size=0)
+        guard = self.guard(owner, Log())
+        controller = threading.Thread(target=guard.monitor, kwargs={"once": True})
+        with patch.object(bench.os, "fstat", side_effect=stat):
+            controller.start()
+            try:
+                self.assertTrue(entered.wait(2), stage)
+                before = self.reads
+                if emergency:
+                    self.snapshot[emergency] = 1
+                    self.assertTrue(cancelled.wait(2), "Original owner must cancel before log release")
+                self.wait_reads(before + 2)
+                self.assertTrue(controller.is_alive(), "Log barrier must still be held")
+                if emergency:
+                    self.assertTrue(guard.cancel_thread.is_alive())
+                    self.assertTrue(owner.forced)
+                    self.assertIs(guard.owner, owner)
+                    first = guard.reason
+                    guard.engine_failure("later CUDA failure", "separate CUDA evidence")
+                    self.assertEqual(guard.reason, first)
+                else:
+                    self.assertIsNone(guard.reason)
+                    self.assertFalse(cancelled.is_set())
+            finally:
+                release.set()
+                cancel_release.set()
+                controller.join(3)
+            self.assertFalse(controller.is_alive())
+        self.shutdown(guard)
+        if emergency:
+            self.assertIn("2 GiB emergency", guard.reason)
+            self.assertEqual(guard.cleanup_error, "RuntimeError: cancel: synthetic cancellation error")
+            native.terminate_job.assert_called_once_with(77)
+        self.assertTrue(all(row["finished_monotonic"] - row["started_monotonic"] <= 1
+                            for row in guard.host_samples))
+
+    def test_log_path_open_stat_read_close_never_run_on_host_lane(self):
+        for stage in ("path", "open", "stat", "read", "close"):
+            with self.subTest(stage=stage):
+                self.blocked_log(stage)
+
+    def test_physical_emergency_cancels_original_owner_while_log_and_cancel_are_blocked(self):
+        self.blocked_log("read", emergency="available_gib")
+
+    def test_commit_emergency_cancels_original_owner_while_log_and_cancel_are_blocked(self):
+        self.blocked_log("open", emergency="commit_available_gib")
+
+    def test_actual_sampler_keeps_exact_one_second_gate_for_read_and_starvation(self):
+        from tools import prepare_unsloth_q2 as preparation
+        real_clock = bench.time.monotonic
+        for raw, refused in (([10, 11], False), ([10, 11.000001], True),
+                             ([10, 10, 11, 11], False), ([10, 10, 11.000001, 11.000001], True)):
+            with self.subTest(raw=raw):
+                guard = bench.MemoryGuard(None, None, acceptance_floors=(4, 4))
+                guard.host_only = True
+                guard.host_timing = Mock(phase=lambda *args: contextlib.nullcontext())
+                values = iter(raw)
+                count = [0]
+                def read():
+                    count[0] += 1
+                    if count[0] == len(raw) // 2:
+                        guard.done.set()
+                    return {"available_gib": 8, "commit_available_gib": 9}
+                thread = threading.Thread(target=guard.host_monitor)
+                def clock():
+                    return next(values) if threading.current_thread() is thread else real_clock()
+                with patch.object(preparation, "memory_snapshot", side_effect=read), \
+                        patch.object(bench.time, "monotonic", side_effect=clock):
+                    thread.start()
+                    thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(guard.host_samples), len(raw) // 2)
+                self.assertEqual(guard.reason is not None, refused)
+                if refused:
+                    self.assertEqual(guard.reason,
+                        "Acceptance telemetry failed: Host sampling gap or read duration exceeded one second.")
+                else:
+                    self.assertEqual(guard.max_gap_seconds, 1)
+
+    def test_actual_wall_read_stall_and_sampler_starvation_are_still_refused(self):
+        from tools import prepare_unsloth_q2 as preparation
+        for in_read in (True, False):
+            with self.subTest(in_read=in_read):
+                entered, release = threading.Event(), threading.Event()
+                guard = self.guard()
+                original_read, original_wait = preparation.memory_snapshot, guard.done.wait
+                def blocked_read():
+                    entered.set()
+                    self.assertTrue(release.wait(3))
+                    return original_read()
+                def blocked_wait(seconds):
+                    if threading.current_thread() is guard.thread:
+                        entered.set()
+                        self.assertTrue(release.wait(3))
+                    return original_wait(seconds)
+                with patch.object(preparation, "memory_snapshot", side_effect=blocked_read) if in_read else \
+                        patch.object(guard.done, "wait", side_effect=blocked_wait):
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        threading.Event().wait(1.05)  # Actual wall stall; no synthetic-clock excuse.
+                    finally:
+                        release.set()
+                    self.shutdown(guard)
+                self.assertEqual(guard.reason,
+                    "Acceptance telemetry failed: Host sampling gap or read duration exceeded one second.")
+                self.assertGreater(guard.max_gap_seconds, 1)
+                if in_read:
+                    self.assertTrue(any(row["finished_monotonic"] - row["started_monotonic"] > 1
+                                        for row in guard.host_samples))
+
+    def test_failure_before_owner_attachment_is_delivered_to_the_retained_owner(self):
+        guard = self.guard()
+        guard.engine_failure("first failure before attach")
+        cancelled = threading.Event()
+        owner = Mock()
+        owner.stop.side_effect = cancelled.set
+        guard.attach_owner(owner)
+        self.assertTrue(cancelled.wait(2))
+        guard.attach_owner(None)
+        self.shutdown(guard)
+        self.assertEqual(guard.reason, "first failure before attach")
+        owner.stop.assert_called_once_with()
+
+    def test_finish_wait_allows_original_owner_cancel_and_closes_only_after_wait(self):
+        waiting, cancelled, release = (threading.Event() for _ in range(3))
+        native = Mock()
+        proc = types.SimpleNamespace(pid=321, _handle=1234)
+        owner = bench.OwnedProcess(proc, native=native, deadline=bench.time.monotonic() + 4)
+        owner.job, owner.assigned, owner.identity = 77, True, (321, 99)
+        live = {77, 1234}
+        def wait(handle, timeout):
+            self.assertIn(handle, live)
+            waiting.set()
+            self.assertTrue(release.wait(3))
+            self.assertIn(handle, live)
+            return 0
+        def close(handle):
+            self.assertIn(handle, live)
+            live.remove(handle)
+        native.wait.side_effect = wait
+        native.identity.return_value = (321, 99)
+        native.active.return_value = 0
+        native.exit_code.return_value = 1
+        native.close.side_effect = close
+        native.close_process.side_effect = lambda process: close(process._handle)
+        native.terminate_job.side_effect = lambda job: (self.assertIn(job, live), cancelled.set())
+        guard = self.guard(owner)
+        errors = []
+        def finish():
+            try:
+                owner.finish()
+            except BaseException as exc:
+                errors.append(exc)
+        finalizer = threading.Thread(target=finish)
+        second_finalizer = threading.Thread(target=finish)
+        finalizer.start()
+        second_finalizer.start()
+        try:
+            self.assertTrue(waiting.wait(2))
+            self.snapshot["available_gib"] = 1
+            self.assertTrue(cancelled.wait(2), "Final native wait must not hold cancellation lock")
+            self.wait_reads(self.reads + 2)
+        finally:
+            release.set()
+            finalizer.join(3)
+            second_finalizer.join(3)
+        self.assertFalse(finalizer.is_alive())
+        self.assertFalse(second_finalizer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(live, set())
+        native.wait.assert_called_once()
+        guard.engine_failure("late CUDA failure")
+        guard.attach_owner(None)
+        self.shutdown(guard)
+        owner.stop()  # No native operation may touch the now-closed handles.
+        native.terminate_job.assert_called_once_with(77)
+
+    def test_final_edge_is_strict_and_summary_detached_after_join(self):
+        guard = self.guard()
+        start = bench.time.monotonic()
+        self.wait_reads(2)
+        end = bench.time.monotonic()
+        guard.stop_host_sampler(end, end + 3)
+        self.assertTrue(guard.final_edge.is_set())
+        self.assertGreater(guard.host_samples[-1]["started_monotonic"], end)
+        result = guard.acceptance_summary(start, end)
+        encoded = json.dumps(result)
+        self.assertEqual(result["host_evidence"], "satisfied")
+        self.assertFalse(guard.thread.is_alive())
+        self.assertFalse(guard.cancel_thread.is_alive())
+        guard.host_samples[-1]["physical_available_bytes"] = 0
+        self.assertEqual(json.dumps(result), encoded)
+
+    def test_startup_exception_and_missing_ack_refuse_before_work_can_start(self):
+        from tools import prepare_unsloth_q2 as preparation
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked):
+                entered, release = threading.Event(), threading.Event()
+                guard = bench.MemoryGuard(None, None, acceptance_floors=(4, 4))
+                def read():
+                    entered.set()
+                    if blocked:
+                        self.assertTrue(release.wait(3))
+                        return {"available_gib": 8, "commit_available_gib": 9}
+                    raise OSError("synthetic host read error")
+                with patch.object(preparation, "memory_snapshot", side_effect=read):
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "initial acknowledgment|Host sampler failed: OSError"):
+                            guard.start_host_sampler(bench.time.monotonic() + 2)
+                        self.assertTrue(entered.is_set())
+                    finally:
+                        release.set()
+                        self.shutdown(guard)
+
+    def test_thread_start_failure_shuts_down_the_already_started_handoff(self):
+        guard = bench.MemoryGuard(None, None, acceptance_floors=(4, 4))
+        start = threading.Thread.start
+        def fail_host(thread):
+            if thread.name == "acceptance-host":
+                raise RuntimeError("synthetic thread start failure")
+            return start(thread)
+        with patch.object(threading.Thread, "start", fail_host):
+            with self.assertRaisesRegex(RuntimeError, "Host sampler startup failed: RuntimeError"):
+                guard.start_host_sampler(bench.time.monotonic() + 2)
+        guard.stop_host_sampler(bench.time.monotonic(), bench.time.monotonic() + 2)
+        self.assertEqual(guard.host_samples, [])
+        self.assertFalse(guard.thread.is_alive())
+        self.assertFalse(guard.cancel_thread.is_alive())
+
+    def test_missing_final_edge_and_join_timeout_refuse_without_daemon_abandonment(self):
+        from tools import prepare_unsloth_q2 as preparation
+        entered, release = threading.Event(), threading.Event()
+        guard = self.guard()
+        def blocked_read():
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {"available_gib": 8, "commit_available_gib": 9}
+        with patch.object(preparation, "memory_snapshot", side_effect=blocked_read):
+            try:
+                self.assertTrue(entered.wait(2))
+                edge = bench.time.monotonic()
+                guard.stop_host_sampler(edge, edge + 0.05)
+                self.assertIn("final coverage edge is missing", guard.reason)
+                self.assertTrue(guard.thread.is_alive())
+                self.assertFalse(guard.thread.daemon)
+                self.assertFalse(guard.cancel_thread.daemon)
+                result = guard.acceptance_summary(edge - 0.1, edge)
+                encoded = json.dumps(result)
+                self.assertEqual(result["host_evidence"], "refused")
+            finally:
+                release.set()
+                guard.thread.join(2)
+                guard.cancel_thread.join(2)
+            self.assertEqual(json.dumps(result), encoded)
+        self.assertFalse(guard.thread.is_alive())
+        self.assertFalse(guard.cancel_thread.is_alive())
+
+    def test_cancellation_join_timeout_retains_first_reason_and_live_handoff(self):
+        entered, release = threading.Event(), threading.Event()
+        owner = Mock()
+        def stop():
+            entered.set()
+            self.assertTrue(release.wait(3))
+        owner.stop.side_effect = stop
+        guard = self.guard(owner)
+        guard.engine_failure("first CUDA failure")
+        try:
+            self.assertTrue(entered.wait(2))
+            edge = bench.time.monotonic()
+            guard.stop_host_sampler(edge, edge + 0.4)
+            self.assertTrue(guard.final_edge.is_set())
+            self.assertFalse(guard.thread.is_alive())
+            self.assertTrue(guard.cancel_thread.is_alive())
+            self.assertEqual(guard.reason, "first CUDA failure")
+            self.assertEqual(guard.cleanup_error,
+                             "Host sampler or cancellation handoff did not join before deadline.")
+            self.assertIs(guard.owner, owner)
+        finally:
+            release.set()
+            guard.cancel_thread.join(2)
+        self.assertFalse(guard.cancel_thread.is_alive())
+
+    def test_late_shutdown_return_refuses_after_real_successful_final_edge_and_joins(self):
+        guard = self.guard()
+        edge = bench.time.monotonic()
+        deadline = edge + 2
+        real_clock, join = bench.time.monotonic, guard.cancel_thread.join
+        late = threading.Event()
+        def delayed_join(timeout):
+            join(timeout)
+            late.set()
+        def clock():
+            return deadline if late.is_set() and threading.current_thread() is threading.main_thread() else real_clock()
+        with patch.object(guard.cancel_thread, "join", side_effect=delayed_join), \
+                patch.object(bench.time, "monotonic", side_effect=clock):
+            guard.stop_host_sampler(edge, deadline)
+        self.assertTrue(guard.final_edge.is_set())
+        self.assertFalse(guard.thread.is_alive())
+        self.assertFalse(guard.cancel_thread.is_alive())
+        self.assertEqual(guard.reason, "Host sampler shutdown exceeded the absolute deadline.")
+
+    def test_cuda_publication_wins_while_host_failure_read_is_inflight(self):
+        from tools import prepare_unsloth_q2 as preparation
+        entered, release, cancelled = (threading.Event() for _ in range(3))
+        owner = Mock()
+        owner.stop.side_effect = cancelled.set
+        guard = self.guard(owner)
+        def read():
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {"available_gib": 1, "commit_available_gib": 9}
+        with patch.object(preparation, "memory_snapshot", side_effect=read):
+            try:
+                self.assertTrue(entered.wait(2))
+                guard.engine_failure("first CUDA failure", "CUDA detail")
+                self.assertTrue(cancelled.wait(2))
+            finally:
+                release.set()
+            self.shutdown(guard)
+        self.assertEqual(guard.reason, "first CUDA failure")
+        self.assertEqual(guard.cuda_errors, ["CUDA detail"])
+        self.assertLess(min(row["physical_available_bytes"] for row in guard.host_samples), 2 * 1024**3)
+
+
 class HelperTests(unittest.TestCase):
     def test_snapshot_replacement_survives_a_temporary_reader_lock(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -769,11 +1173,13 @@ class AcceptanceTelemetryTests(unittest.TestCase):
                     "observed_monotonic": sys.float_info.max})
                 self.assertEqual(summary["cuda"]["errors"], ["Completed-request CUDA marks: 0 of 11 required."])
                 summary["controller_timing"] = timing.summary()
+                summary["host_timing"] = timing.summary()  # Independent bounded host-lane ring.
                 record = dict(complete_record, memory=summary)
                 payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
                 self.assertEqual(bench.ACCEPTANCE_RECEIPT_LIMIT, 6 * 1024**2)
                 self.assertLessEqual(len(payload), bench.ACCEPTANCE_RECEIPT_LIMIT)
                 self.assertEqual(json.loads(payload)["memory"]["controller_timing"], timing.summary())
+                self.assertEqual(json.loads(payload)["memory"]["host_timing"], timing.summary())
 
     def test_actual_monitor_uses_repository_commit_snapshot_not_swap_usage(self):
         from tools import prepare_unsloth_q2 as preparation
@@ -2939,19 +3345,32 @@ class ContainedLifecycleTests(unittest.TestCase):
         def make_guard(*args, **kwargs):
             guard = real_guard(*args, **kwargs)
             phase = guard.timing_phase
-            # advance() synthesizes host observations on the fake worker thread.
-            # Production monitor calls are serial on the controller; only those
-            # calls participate in its operation timing, not this fixture's clock driver.
+            # Worker clock advancement wakes the real external host thread. It
+            # never writes a controller host row or runs its discovery/log lane.
             guard.timing_phase = lambda *args, **kwargs: (phase(*args, **kwargs)
                 if threading.current_thread() is controller_thread else contextlib.nullcontext())
             monitor = guard.monitor
             def sample(*args, **kwargs):
+                if guard.host_only:
+                    return monitor(*args, **kwargs)
                 # One lock order on every thread: the owner's lock, then the clock, as in
                 # OwnedProcess.finish(), which reads the clock while it holds its own lock.
                 owner = guard.owner
                 with owner.lock if owner is not None else contextlib.nullcontext(), self.clock_lock:
                     return monitor(*args, **kwargs)
             guard.monitor = sample
+            tick = threading.Event()
+            wait = guard.done.wait
+            def sampler_wait(seconds):
+                if threading.current_thread() is not guard.thread or not guard.host_only:
+                    return wait(seconds)
+                # External clock seam: a virtual quarter-second is a real
+                # wakeup; finalization also has to wake without worker activity.
+                tick.wait(0.001)
+                tick.clear()
+                return guard.done.is_set()
+            guard.done.wait = sampler_wait
+            guard.test_tick = tick
             guards.append(guard)
             return guard
         def advance(seconds):
@@ -2960,6 +3379,19 @@ class ContainedLifecycleTests(unittest.TestCase):
                 with self.clock_lock:
                     self.now += step
                     seconds -= step
+                if guards[0].host_only:
+                    guard = guards[0]
+                    previous = guard.samples
+                    guard.test_tick.set()
+                    # Wait for a real host publication before advancing the
+                    # synthetic workload clock again. No fake coverage rows.
+                    for _ in range(2000):
+                        if guard.samples > previous or guard.reason or not guard.thread.is_alive():
+                            break
+                        threading.Event().wait(0.001)
+                    else:
+                        raise AssertionError("Real host sampler did not acknowledge virtual clock step")
+                    continue
                 # Advance the one external sampler without overlapping a read. After the fake
                 # Job is cancelled the controller may hold the owner's lock while it accounts
                 # for and joins this worker thread, so this thread then stops waiting for it.
@@ -8057,12 +8489,15 @@ class ControllerTimingCompositionTests(unittest.TestCase):
 
     def delayed(self, target, attribute, operation, *, raised=False, cleanup_error=False):
         timing = bench.ControllerTiming()
+        host_timing = bench.ControllerTiming()
+        selected_timing = host_timing if operation == "host_read" else timing
         original = getattr(target, attribute)
         controller_thread = threading.current_thread()
         injected = []
         def delayed(*args, **kwargs):
-            if (not injected and threading.current_thread() is controller_thread and self.case.samples >= 2
-                    and timing.current is not None and timing.current["operation"] == operation):
+            if (not injected and (threading.current_thread() is controller_thread) == (operation != "host_read")
+                    and self.case.samples >= 2 and selected_timing.current is not None
+                    and selected_timing.current["operation"] == operation):
                 injected.append(self.case.now)
                 with self.case.clock_lock:
                     self.case.now += 1.1
@@ -8075,17 +8510,18 @@ class ControllerTimingCompositionTests(unittest.TestCase):
                 terminate(job)
                 raise OSError("synthetic controller cleanup failure")
             self.enterContext(patch.object(self.case.native, "terminate_job", side_effect=fail_cleanup))
-        with patch.object(bench, "ControllerTiming", return_value=timing), patch.object(target, attribute, delayed):
+        with patch.object(bench, "ControllerTiming", side_effect=[timing, host_timing]), \
+                patch.object(target, attribute, delayed):
             result = self.refused()
         self.assertEqual(len(injected), 1, "The selected controller operation must actually execute")
-        diagnostic = result["memory"]["controller_timing"]
+        diagnostic = result["memory"]["host_timing" if operation == "host_read" else "controller_timing"]
         rows = diagnostic["recent_operations"]
         delayed_row = next(row for row in rows if row["operation"] == operation and row["elapsed_seconds"] >= 1.1)
         self.assertEqual(delayed_row["outcome"], "raised" if raised else "completed")
         self.assertIsNone(diagnostic["current_operation"])
         self.assertIsNotNone(diagnostic["refusal"])
         self.assertLessEqual(len(rows), 32)
-        self.assertEqual(diagnostic, timing.summary())  # Stopped/final probes cannot erase the refusal interval.
+        self.assertEqual(diagnostic, selected_timing.summary())
         if raised:
             expected = ("Memory/process monitor failed: OSError" if operation == "discovery" else
                         "Engine CUDA-stage evidence failed: OSError" if operation in ("log_read", "log_parse") else
@@ -8099,7 +8535,7 @@ class ControllerTimingCompositionTests(unittest.TestCase):
             if operation != "host_read":
                 row = result["memory"]["raw_samples"][-1]
                 self.assertLess(row["finished_monotonic"] - row["started_monotonic"], 0.1)
-            self.assertIn("host_read", {row["operation"] for row in rows})
+            self.assertIn("host_read", {row["operation"] for row in result["memory"]["host_timing"]["recent_operations"]})
         if operation == "sleep":
             self.assertEqual(delayed_row["requested_seconds"], 0.25)
             self.assertGreater(delayed_row["finished_monotonic"] - delayed_row["started_monotonic"], 1.1)
@@ -8163,6 +8599,401 @@ class ControllerTimingCompositionTests(unittest.TestCase):
         worker = json.loads((self.case.output / "provisional.json").read_bytes())
         self.assertNotIn("controller_timing", json.dumps(worker))
         self.assertFalse(any("controller_timing" in row for row in result["memory"]["raw_samples"]))
+
+
+class ControllerAdmissionFirstFailureTests(unittest.TestCase):
+    """Race real floor admission against the actual independent host sampler."""
+
+    setUp = StageCCompositionTests.setUp
+    invoke = StageCCompositionTests.invoke
+
+    def admission_refusal(self, emergency):
+        from tools import prepare_unsloth_q2 as preparation
+        next_sample, published = threading.Event(), threading.Event()
+        baseline = set(threading.enumerate())
+        guards, floors = [], []
+        start, publish, floor_check = (bench.MemoryGuard.start_host_sampler,
+                                       bench.MemoryGuard.publish_failure, bench.acceptance_floor_check)
+        expected_emergency = ("Acceptance telemetry failed: Physical or available commit fell below "
+                              "the original 2 GiB emergency floor.")
+        floor_reason = "Fresh physical memory is below the manifest floor."
+        admission_error = "ValueError: " + floor_reason
+        def started(guard, *args):
+            guards.append(guard)
+            return start(guard, *args)
+        def snapshot():
+            return {"available_gib": 1 if next_sample.is_set() else 3, "commit_available_gib": 8}
+        def published_failure(guard, reason):
+            publish(guard, reason)
+            if reason == expected_emergency:
+                self.assertIs(threading.current_thread(), guard.thread)
+                published.set()
+        def admitted_floor(snapshot, manifest, **kwargs):
+            floors.append(snapshot)
+            self.assertEqual(snapshot["physical_available_bytes"], 3 * 1024**3)
+            self.assertEqual(snapshot["commit_available_bytes"], 8 * 1024**3)
+            if emergency:
+                next_sample.set()
+                self.assertTrue(published.wait(2), "Real sampler did not publish the emergency before floor refusal")
+            return floor_check(snapshot, manifest, **kwargs)  # Preserve the original 3/8 GiB admission row.
+        with patch.object(bench.MemoryGuard, "start_host_sampler", started), \
+                patch.object(bench.MemoryGuard, "publish_failure", published_failure), \
+                patch.object(preparation, "memory_snapshot", side_effect=snapshot), \
+                patch.object(bench, "acceptance_floor_check", side_effect=admitted_floor), \
+                patch.object(bench.subprocess, "Popen", side_effect=AssertionError("Admission must refuse before startup")) as spawn:
+            with self.assertRaises(bench.AcceptanceFailure) as caught:
+                self.invoke()
+        failure, guard = caught.exception, guards[0]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(len(floors), 1)
+        self.assertIs(failure.guard, guard)
+        self.assertIsNone(failure.owner)
+        self.assertIsNone(failure.output_owner)
+        self.assertIsNone(failure.proc)
+        self.assertIsInstance(failure.__cause__, ValueError)
+        self.assertEqual(str(failure.__cause__), floor_reason)
+        self.assertEqual(failure.record["admission"]["status"], "refused")
+        self.assertEqual(failure.record["admission"]["reason"], floor_reason)
+        self.assertEqual(failure.record["admission_error"], admission_error)
+        self.assertFalse(bench.acceptance_final_predicate(failure.record))
+        self.assertNotIn("cleanup_error", failure.record)
+        spawn.assert_not_called()
+        self.assertNotIn("create", self.case.events)
+        self.assertNotIn("server", self.case.events)
+        for thread in (guard.thread, guard.cancel_thread):
+            self.assertFalse(thread.is_alive())
+        self.assertTrue(guard.done.is_set())
+        self.assertTrue(guard.cancel_shutdown.is_set())
+        self.assertFalse([thread for thread in set(threading.enumerate()) - baseline
+                          if thread.name in ("acceptance-host", "acceptance-cancel")])
+        if emergency:
+            self.assertTrue(published.is_set())
+            self.assertEqual(guard.reason, expected_emergency)
+            self.assertEqual(failure.record["error"], "RuntimeError: " + expected_emergency)
+            self.assertEqual(failure.record["memory"]["errors"][0], expected_emergency)
+            self.assertTrue(any(row["physical_available_bytes"] == 1024**3 for row in guard.host_samples))
+        else:
+            self.assertFalse(published.is_set())
+            self.assertEqual(guard.reason, admission_error)
+            self.assertEqual(failure.record["error"], admission_error)
+            self.assertEqual(failure.record["memory"]["errors"][0], admission_error)
+            self.assertTrue(all(row["physical_available_bytes"] == 3 * 1024**3 for row in guard.host_samples))
+
+    def test_sampler_emergency_remains_primary_when_original_admission_row_then_fails(self):
+        self.admission_refusal(emergency=True)
+
+    def test_ordinary_admission_refusal_is_published_and_keeps_its_original_error(self):
+        self.admission_refusal(emergency=False)
+
+
+class ControllerInterruptTests(unittest.TestCase):
+    """Actual admitted controller, real sampler/handoff threads, mocked effects."""
+
+    def setUp(self):
+        StageCCompositionTests.setUp(self)
+        self.baseline_threads = set(threading.enumerate())
+        self.guard = self.owner = self.output_owner = None
+        self.after_start = None
+        self.root_thread = threading.current_thread()
+        start, contain, acquire = (bench.MemoryGuard.start_host_sampler, bench.OwnedProcess.contain,
+                                    bench.acceptance_acquire_output)
+        def started(guard, *args):
+            self.guard = guard
+            start(guard, *args)
+            if self.after_start:
+                self.after_start(guard)
+        def contained(owner):
+            self.owner = owner
+            return contain(owner)
+        def acquired(*args):
+            self.output_owner = acquire(*args)
+            return self.output_owner
+        self.enterContext(patch.object(bench.MemoryGuard, "start_host_sampler", started))
+        self.enterContext(patch.object(bench.OwnedProcess, "contain", contained))
+        self.enterContext(patch.object(bench, "acceptance_acquire_output", acquired))
+
+    invoke = StageCCompositionTests.invoke
+
+    def interrupted(self, kind, *, unresolved=False, primary=None):
+        with self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.invoke()
+        failure = caught.exception
+        self.assertIs(failure.guard, self.guard)
+        self.assertIs(failure.owner, self.owner)
+        self.assertIs(failure.output_owner, self.output_owner)
+        self.assertIs(failure.proc, self.case.root_proc if self.owner is not None else None)
+        self.assertFalse(bench.acceptance_final_predicate(failure.record))
+        self.assertIn(primary or kind.__name__, failure.record["error"])
+        if primary:
+            self.assertEqual(self.guard.reason, "RuntimeError: " + primary)
+            self.assertIn(kind.__name__, failure.record["cleanup_error"])
+        else:
+            self.assertIn(kind.__name__, self.guard.reason)
+        if not unresolved:
+            for thread in (self.guard.thread, self.guard.cancel_thread):
+                if thread is not None:
+                    self.assertFalse(thread.is_alive(), "Interrupt stranded an owned sampler/handoff thread")
+            extra = set(threading.enumerate()) - self.baseline_threads
+            self.assertFalse([thread for thread in extra if thread.name in ("acceptance-host", "acceptance-cancel")])
+            self.assertTrue(self.guard.done.is_set())
+            self.assertTrue(self.guard.cancel_shutdown.is_set())
+        return failure
+
+    def startup(self, kind):
+        def stop(guard):
+            self.assertTrue(guard.ready.is_set())
+            self.assertGreaterEqual(len(guard.host_samples), 1)
+            raise kind(0 if kind is SystemExit else "synthetic acknowledged startup interrupt")
+        self.after_start = stop
+        failure = self.interrupted(kind)
+        self.assertIsNone(failure.owner)
+        self.assertNotIn("create", self.case.events)
+
+    def test_keyboard_interrupt_after_startup_acknowledgment(self):
+        self.startup(KeyboardInterrupt)
+
+    def test_system_exit_after_startup_acknowledgment(self):
+        self.startup(SystemExit)
+
+    def test_startup_interrupt_keeps_an_already_published_first_guard_failure(self):
+        def stop(guard):
+            guard.publish_failure("first guard failure")
+            raise SystemExit(0)
+        self.after_start = stop
+        with self.assertRaises(bench.AcceptanceFailure) as caught:
+            self.invoke()
+        failure = caught.exception
+        self.assertIs(failure.guard, self.guard)
+        self.assertEqual(self.guard.reason, "first guard failure")
+        self.assertEqual(failure.record["error"], "RuntimeError: first guard failure")
+        self.assertIn("SystemExit", failure.record["cleanup_error"])
+        self.assertIsInstance(failure.__cause__, SystemExit)
+        self.assertFalse(self.guard.thread.is_alive())
+        self.assertFalse(self.guard.cancel_thread.is_alive())
+
+    def partial_start(self, kind, lane, after):
+        start = threading.Thread.start
+        injected = []
+        def interrupted_start(thread):
+            if thread.name == lane:
+                if after:
+                    start(thread)
+                injected.append(thread)
+                raise kind("synthetic partial thread start")
+            return start(thread)
+        with patch.object(threading.Thread, "start", interrupted_start):
+            failure = self.interrupted(kind)
+        self.assertEqual(len(injected), 1)
+        self.assertIs(injected[0], self.guard.thread if lane == "acceptance-host" else self.guard.cancel_thread)
+        self.assertIsNone(failure.owner)
+        self.assertNotIn("create", self.case.events)
+
+    def test_keyboard_interrupt_before_host_thread_start_cleans_started_handoff(self):
+        self.partial_start(KeyboardInterrupt, "acceptance-host", False)
+
+    def test_system_exit_after_host_thread_start_retains_and_joins_both_threads(self):
+        self.partial_start(SystemExit, "acceptance-host", True)
+
+    def test_keyboard_interrupt_after_handoff_start_cleans_partial_startup(self):
+        self.partial_start(KeyboardInterrupt, "acceptance-cancel", True)
+
+    def final_wait(self, kind, primary=None):
+        wait, capture = self.case.native.wait, self.case.native.capture
+        injected = []
+        def waiting(handle, milliseconds):
+            if milliseconds > 0 and not injected:
+                injected.append(handle)
+                raise kind(0 if kind is SystemExit else "synthetic owner final wait interrupt")
+            return wait(handle, milliseconds)
+        def failing_capture(*args):
+            raise RuntimeError(primary)
+        with patch.object(self.case.native, "wait", side_effect=waiting), \
+                patch.object(self.case.native, "capture", side_effect=failing_capture if primary else capture):
+            failure = self.interrupted(kind, primary=primary)
+        self.assertEqual(injected, [1234])
+        self.assertIs(failure.owner.proc, self.case.root_proc)
+        self.assertFalse(failure.owner.closed)  # Interrupted native finalization is retained, never retried.
+        self.assertFalse(failure.record["owned_cleanup"])
+        self.assertIn("cancel-job", self.case.events)
+        return failure
+
+    def test_keyboard_interrupt_in_owner_final_native_wait(self):
+        self.final_wait(KeyboardInterrupt)
+
+    def test_system_exit_in_owner_final_native_wait(self):
+        self.final_wait(SystemExit)
+
+    def test_interrupted_finalizer_keeps_primary_controller_failure_and_separate_cleanup_error(self):
+        self.final_wait(KeyboardInterrupt, primary="first controller failure")
+
+    def joined(self, kind, lane):
+        join = threading.Thread.join
+        injected = []
+        def interrupted_join(thread, timeout=None):
+            if (thread.name == lane and threading.current_thread() is self.root_thread and not injected):
+                injected.append(thread)
+                raise kind("synthetic join interrupt")
+            return join(thread, timeout)
+        with patch.object(threading.Thread, "join", interrupted_join):
+            failure = self.interrupted(kind)
+        self.assertEqual(len(injected), 1)
+        self.assertIs(failure.owner, self.owner)
+        self.assertIn(kind.__name__, failure.record["cleanup_error"])
+
+    def test_keyboard_interrupt_in_host_join_still_signals_and_joins_handoff(self):
+        self.joined(KeyboardInterrupt, "acceptance-host")
+
+    def test_system_exit_in_handoff_join_still_retains_all_authority(self):
+        self.joined(SystemExit, "acceptance-cancel")
+
+    def test_keyboard_interrupt_in_final_edge_wait_still_stops_both_threads(self):
+        def after_start(guard):
+            self.enterContext(patch.object(guard.final_edge, "wait", side_effect=KeyboardInterrupt("final edge")))
+        self.after_start = after_start
+        self.interrupted(KeyboardInterrupt)
+
+    def output_close(self, kind, after):
+        close = bench.AcceptanceOutputOwner.close
+        injected = []
+        def interrupted_close(owner):
+            if owner is self.output_owner and not injected:
+                injected.append(owner)
+                if after:
+                    close(owner)
+                raise kind("synthetic output close interrupt")
+            return close(owner)
+        with patch.object(bench.AcceptanceOutputOwner, "close", interrupted_close):
+            failure = self.interrupted(kind)
+        self.assertEqual(injected, [self.output_owner])
+        self.assertFalse(failure.record["finalization"])
+        # The test, as operator of its mock resources, releases retained output
+        # authority after asserting the controller did not retry an uncertain close.
+        close(self.output_owner)
+
+    def test_keyboard_interrupt_before_output_close_retains_exact_output_authority(self):
+        self.output_close(KeyboardInterrupt, False)
+
+    def test_system_exit_after_output_close_does_not_retry_native_close(self):
+        self.output_close(SystemExit, True)
+
+    def test_interrupted_partial_output_cleanup_retains_owner_and_original_acquisition_failure(self):
+        close = bench.AcceptanceOutputOwner.close
+        injected = []
+        def missing(owner):
+            self.output_owner = owner
+            raise RuntimeError("first acquisition failure")
+        def interrupted_close(owner):
+            if owner is self.output_owner:
+                injected.append(owner)
+                raise KeyboardInterrupt("partial acquisition cleanup interrupted")
+            return close(owner)
+        try:
+            with patch.object(bench.AcceptanceOutputOwner, "open_receipt", missing), \
+                    patch.object(bench.AcceptanceOutputOwner, "close", interrupted_close):
+                failure = self.interrupted(KeyboardInterrupt, primary="first acquisition failure")
+            self.assertEqual(injected, [self.output_owner], "An uncertain close must not be retried")
+            self.assertIs(failure.output_owner, self.output_owner)
+            self.assertIn("partial acquisition cleanup interrupted", failure.record["cleanup_error"])
+            self.assertFalse(self.output_owner.acknowledged)
+        finally:
+            if self.output_owner is not None:
+                close(self.output_owner)
+
+    def test_interrupted_native_process_close_is_not_used_as_open_cancellation_authority(self):
+        close = self.case.native.close_process
+        injected = []
+        def interrupted_close(proc):
+            close(proc)
+            injected.append(proc)
+            raise KeyboardInterrupt("native close returned, Python accounting interrupted")
+        with patch.object(self.case.native, "close_process", side_effect=interrupted_close), \
+                patch.object(self.case.native, "terminate_process", side_effect=AssertionError("Closed handle reused")), \
+                patch.object(self.case.native, "terminate_job", side_effect=AssertionError("Closed Job reused")):
+            failure = self.interrupted(KeyboardInterrupt)
+        self.assertEqual(injected, [self.case.root_proc])
+        self.assertEqual(failure.owner.close_uncertain, "process")
+        self.assertFalse(failure.owner.closed)
+        self.assertIn("known-open", failure.record["cleanup_error"])
+
+    def test_startup_interrupt_retains_actual_unjoined_read_and_immutable_refusal(self):
+        from tools import prepare_unsloth_q2 as preparation
+        entered, release = threading.Event(), threading.Event()
+        def read():
+            entered.set()
+            self.assertTrue(release.wait(3))
+            return {"available_gib": 8, "commit_available_gib": 9}
+        def after_start(guard):
+            self.enterContext(patch.object(preparation, "memory_snapshot", side_effect=read))
+            self.assertTrue(entered.wait(2))
+            self.case.now = 1001.0  # The original 100 + 900 absolute deadline has expired.
+            raise KeyboardInterrupt("startup interrupt with blocked host read")
+        self.after_start = after_start
+        try:
+            failure = self.interrupted(KeyboardInterrupt, unresolved=True)
+            self.assertTrue(failure.guard.thread.is_alive())
+            self.assertFalse(failure.guard.thread.daemon)
+            self.assertIn("did not join", failure.record["cleanup_error"])
+            self.assertFalse(failure.record["within_deadline"])
+            frozen = json.dumps(failure.record)
+        finally:
+            release.set()
+            if self.guard is not None:
+                self.guard.thread.join(2)
+                self.guard.cancel_thread.join(2)
+        self.assertFalse(self.guard.thread.is_alive())
+        self.assertFalse(self.guard.cancel_thread.is_alive())
+        self.assertEqual(json.dumps(failure.record), frozen)
+
+
+class HostControllerIndependenceTests(unittest.TestCase):
+    setUp = StageCCompositionTests.setUp
+    invoke = StageCCompositionTests.invoke
+
+    def stalled(self, target, attribute):
+        from tools import prepare_unsloth_q2 as preparation
+        original, snapshot = getattr(target, attribute), preparation.memory_snapshot
+        published = threading.Condition()
+        host_reads = [0]
+        stalled = []
+        controller = threading.current_thread()
+        def read():
+            value = snapshot()
+            if threading.current_thread().name == "acceptance-host":
+                with published:
+                    host_reads[0] += 1
+                    published.notify_all()
+            return value
+        def block(*args, **kwargs):
+            if threading.current_thread() is controller and not stalled:
+                with published:
+                    before = host_reads[0]
+                    if before:
+                        stalled.append(attribute)
+                        self.assertTrue(published.wait_for(lambda: host_reads[0] >= before + 2, timeout=2),
+                            "Controller operation blocked the actual host sampler")
+            return original(*args, **kwargs)
+        with patch.object(preparation, "memory_snapshot", side_effect=read), \
+                patch.object(target, attribute, block):
+            result = self.invoke()
+        self.assertEqual(stalled, [attribute])
+        self.assertTrue(bench.acceptance_final_predicate(result))
+        self.assertEqual(result["memory"]["host_evidence"], "satisfied")
+        self.assertLessEqual(result["memory"]["max_gap_seconds"], 1)
+
+    def test_capture_stall_does_not_stop_host_rows(self):
+        self.stalled(self.case.native, "capture")
+
+    def test_discovery_stall_does_not_stop_host_rows(self):
+        self.stalled(bench.OwnedProcess, "discover")
+
+    def test_protection_stall_does_not_stop_host_rows(self):
+        self.stalled(bench, "acceptance_protection")
+
+    def test_owned_finalization_stall_does_not_stop_host_rows(self):
+        self.stalled(bench.OwnedProcess, "finish")
+
+    def test_artifact_finalization_stall_does_not_stop_host_rows(self):
+        self.stalled(bench, "bounded_create")
 
 
 class AcceptanceProtectionTests(unittest.TestCase):

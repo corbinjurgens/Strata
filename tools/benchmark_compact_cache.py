@@ -980,10 +980,12 @@ class OwnedProcess:
         self.proc = proc
         self.native, self.deadline = native, deadline
         self.lock = threading.RLock()
+        self.finish_lock = threading.Lock()
         self.errors = []
         self.job = None
         self.identity = None
         self.assigned = self.closed = self.forced = False
+        self.close_uncertain = None
         self.exit_code = None
         self.final_accounting = {}
         self.stopped = False
@@ -1027,12 +1029,13 @@ class OwnedProcess:
                     self.stopped = self.forced = True
                     # A failed wait must never skip cancellation of our exact handles.
                     try:
-                        if self.assigned:
+                        if self.assigned and self.job is not None and self.close_uncertain != "job":
                             self.native.terminate_job(self.job)
-                        elif self.handle:
+                        elif self.handle and self.close_uncertain != "process":
                             self.native.terminate_process(self.handle)
                         else:
-                            raise RuntimeError("Cannot cancel without creation handle.")
+                            raise RuntimeError("Cannot cancel without a known-open creation handle."
+                                               if self.close_uncertain else "Cannot cancel without creation handle.")
                     except Exception as exc:
                         self.errors.append("cancel: " + str(exc))
                 if self.errors:
@@ -1081,6 +1084,26 @@ class OwnedProcess:
 
     def finish(self):
         """Account before closing; failures retain authority on the raised exception's owner."""
+        # Serialize finalizers, but allow stop() to cancel the retained handles while
+        # the final wait is pending. Only this finalizer can close those handles.
+        with self.finish_lock:
+            with self.lock:
+                if self.closed:
+                    if self.errors:
+                        raise RuntimeError("; ".join(self.errors))
+                    return
+                if self.close_uncertain is not None:
+                    raise RuntimeError("Owned handle closure is unresolved; authority is retained.")
+            wait_error = None
+            try:
+                remaining = max(0, self.deadline - time.monotonic())
+                result = self.native.wait(self.handle, int(remaining * 1000))
+            except Exception as exc:
+                wait_error = exc
+                result = None
+            self._finish_accounting(result, wait_error)
+
+    def _finish_accounting(self, result, wait_error):
         with self.lock:
             if self.closed:
                 if self.errors:
@@ -1098,8 +1121,8 @@ class OwnedProcess:
                     pass  # stop retains its own error; independent accounting must continue.
 
             try:
-                remaining = max(0, self.deadline - time.monotonic())
-                result = self.native.wait(self.handle, int(remaining * 1000))
+                if wait_error is not None:
+                    raise wait_error
                 self.final_accounting["wait_result"] = result
                 if result != 0:
                     raise RuntimeError("Final owned wait was not signaled: " + str(result))
@@ -1141,10 +1164,14 @@ class OwnedProcess:
             # No wait is pending while handles are closed, including monitor cancellation.
             try:
                 if self.job is not None:
+                    self.close_uncertain = "job"
                     self.native.close(self.job)
                     self.job = None
+                    self.close_uncertain = None
+                self.close_uncertain = "process"
                 self.native.close_process(self.proc)
                 self.closed = True
+                self.close_uncertain = None
             except Exception as exc:
                 self.errors.append("close: " + str(exc))
             if self.errors:
@@ -1281,9 +1308,8 @@ ENGINE_SERVING_PATTERN = r"strata serve: (?:WARNING: )?(\d+) MiB of VRAM free wi
 class ControllerTiming:
     """Selected-controller wall intervals, not CPU time or evidence of descheduling.
 
-    A loop has at most ten operations between host reads; 32 completed entries
-    retain both bounding reads and their intervening work. Freeze before cleanup
-    can replace that interval. No extra sampler or per-host-row payload is needed.
+    Each lane has its own bounded ring. Snapshot locks cover bookkeeping only,
+    never an operation, filesystem call, host read or ownership wait.
     """
     OPERATIONS = frozenset(("capture", "poll", "output_acquisition", "discovery", "host_read",
                             "log_read", "log_parse", "sleep"))
@@ -1293,6 +1319,7 @@ class ControllerTiming:
         self.recent = deque(maxlen=self.LIMIT)
         self.current = self.refusal = None
         self.clock_valid = True
+        self.lock = threading.RLock()
 
     def clock(self):
         value = time.monotonic()
@@ -1308,46 +1335,50 @@ class ControllerTiming:
         if requested_seconds is not None and (operation != "sleep" or not valid_number(requested_seconds)
                                               or not 0 <= requested_seconds <= 0.25):
             raise ValueError("Invalid controller timing sleep request.")
-        if self.refusal is not None:
+        with self.lock:
+            frozen = self.refusal is not None
+            if not frozen:
+                if self.current is not None:
+                    raise RuntimeError("Controller timing operations must be serial.")
+                row = {"operation": operation, "started_monotonic": self.clock(),
+                       "finished_monotonic": None, "elapsed_seconds": None, "outcome": "running"}
+                if requested_seconds is not None:
+                    row["requested_seconds"] = float(requested_seconds)
+                self.current = row
+        if frozen:
             yield
             return
-        if self.current is not None:
-            raise RuntimeError("Controller timing operations must be serial.")
-        row = {"operation": operation, "started_monotonic": self.clock(),
-               "finished_monotonic": None, "elapsed_seconds": None, "outcome": "running"}
-        if requested_seconds is not None:
-            row["requested_seconds"] = float(requested_seconds)
-        self.current = row
+        outcome = "raised"
         try:
             yield
-        except BaseException:
-            row["outcome"] = "raised"
-            raise
-        else:
-            row["outcome"] = "completed"
+            outcome = "completed"
         finally:
-            finished = self.clock()
-            started = row["started_monotonic"]
-            if started is not None and finished is not None and finished >= started:
-                row["finished_monotonic"] = finished
-                row["elapsed_seconds"] = finished - started
-            else:
-                self.clock_valid = False
-            self.recent.append(row)
-            self.current = None
+            with self.lock:
+                row["outcome"] = outcome
+                finished = self.clock()
+                started = row["started_monotonic"]
+                if started is not None and finished is not None and finished >= started:
+                    row["finished_monotonic"] = finished
+                    row["elapsed_seconds"] = finished - started
+                else:
+                    self.clock_valid = False
+                self.recent.append(row)
+                self.current = None
 
     def freeze(self):
-        if self.refusal is None:
-            self.refusal = {"observed_monotonic": self.clock(),
-                            "current_operation": dict(self.current) if self.current else None,
-                            "last_completed_operation": dict(self.recent[-1]) if self.recent else None}
+        with self.lock:
+            if self.refusal is None:
+                self.refusal = {"observed_monotonic": self.clock(),
+                                "current_operation": dict(self.current) if self.current else None,
+                                "last_completed_operation": dict(self.recent[-1]) if self.recent else None}
 
     def summary(self):
-        return {"operation_limit": self.LIMIT, "clock_valid": self.clock_valid,
-                "recent_operations": [dict(row) for row in self.recent],
-                "current_operation": dict(self.current) if self.current else None,
-                "last_completed_operation": dict(self.recent[-1]) if self.recent else None,
-                "refusal": copy.deepcopy(self.refusal)}
+        with self.lock:
+            return {"operation_limit": self.LIMIT, "clock_valid": self.clock_valid,
+                    "recent_operations": [dict(row) for row in self.recent],
+                    "current_operation": dict(self.current) if self.current else None,
+                    "last_completed_operation": dict(self.recent[-1]) if self.recent else None,
+                    "refusal": copy.deepcopy(self.refusal)}
 
 
 class MemoryGuard:
@@ -1382,7 +1413,125 @@ class MemoryGuard:
         self.host_samples = []
         self.max_gap_seconds = 0
         self.controller_timing = None  # Enabled only by the selected, manifest-backed controller.
+        self.host_timing = None
+        self.state_lock = threading.RLock()
+        self.host_only = False
+        self.ready = threading.Event()
+        self.final_edge = threading.Event()
+        self.final_boundary = None
+        self.cancel_requested = threading.Event()
+        self.cancel_shutdown = threading.Event()
+        self.cancel_thread = None
         self.thread = threading.Thread(target=self.monitor, daemon=True)
+
+    def publish_failure(self, reason):
+        with self.state_lock:
+            first = self.reason is None
+            if first:
+                self.reason = reason
+        if first:
+            self.stop_owner()
+
+    def attach_owner(self, owner):
+        with self.state_lock:
+            self.owner = owner
+            if self.reason is not None and owner is not None:
+                self.cancel_requested.set()
+
+    def cancel_monitor(self):
+        # One fixed handoff thread; host reads never wait for an owner lock or
+        # native cancellation. The original owner alone retains/uses handles.
+        while True:
+            self.cancel_requested.wait()
+            self.cancel_requested.clear()
+            with self.state_lock:
+                owner = self.owner if self.reason is not None else None
+            if owner is not None:
+                try:
+                    owner.stop()
+                except BaseException as exc:
+                    error = type(exc).__name__ + ": " + str(exc)
+                    with self.state_lock:
+                        if self.cleanup_error is None or error not in self.cleanup_error:
+                            self.cleanup_error = (self.cleanup_error + "; " if self.cleanup_error else "") + error
+            if self.cancel_shutdown.is_set():
+                return
+
+    def start_host_sampler(self, deadline):
+        self.host_only = True
+        self.host_timing = ControllerTiming()
+        self.thread = threading.Thread(target=self.host_monitor, name="acceptance-host", daemon=False)
+        self.cancel_thread = threading.Thread(target=self.cancel_monitor, name="acceptance-cancel", daemon=False)
+        try:
+            self.cancel_thread.start()
+            self.thread.start()
+        except Exception as exc:
+            self.publish_failure("Host sampler startup failed: " + type(exc).__name__)
+            self.check()
+        if not self.ready.wait(max(0, min(1, deadline - time.monotonic()))):
+            self.publish_failure("Host sampler initial acknowledgment is missing.")
+        if time.monotonic() >= deadline:
+            self.publish_failure("Host sampler startup exceeded the absolute deadline.")
+        self.check()
+
+    def host_monitor(self):
+        try:
+            while not self.done.is_set():
+                from tools.prepare_unsloth_q2 import memory_snapshot
+                with self.host_timing.phase("host_read"):
+                    started = time.monotonic()
+                    snapshot = memory_snapshot()
+                    finished = time.monotonic()
+                self.acceptance_sample(snapshot, started, finished)
+                self.ready.set()
+                with self.state_lock:
+                    final = self.final_boundary is not None and started > self.final_boundary
+                if final:
+                    self.final_edge.set()
+                    return
+                self.done.wait(0.25)
+        except BaseException as exc:
+            self.publish_failure("Host sampler failed: " + type(exc).__name__)
+        finally:
+            self.ready.set()  # check() distinguishes an exception from acknowledged evidence.
+
+    def stop_host_sampler(self, boundary, deadline):
+        interrupted = None
+        try:
+            with self.state_lock:
+                self.final_boundary = boundary
+            if not self.final_edge.wait(max(0, min(1, deadline - time.monotonic()))):
+                self.publish_failure("Host sampler final coverage edge is missing.")
+        except BaseException as exc:
+            interrupted = exc
+        finally:
+            # Signal both lanes before any interruptible join. In particular an
+            # interrupted host join must not strand the handoff on Event.wait().
+            self.done.set()
+            self.cancel_shutdown.set()
+            self.cancel_requested.set()
+        for thread in (self.thread, self.cancel_thread):
+            if thread is not None and thread.ident is not None:
+                try:
+                    thread.join(max(0, deadline - time.monotonic()))
+                except BaseException as exc:
+                    with self.state_lock:
+                        error = "Host sampler join interrupted: " + type(exc).__name__
+                        self.cleanup_error = (self.cleanup_error + "; " if self.cleanup_error else "") + error
+                    if interrupted is None:
+                        interrupted = exc
+        if interrupted is not None:
+            self.publish_failure("Host sampler shutdown interrupted: " + type(interrupted).__name__)
+        if any(thread is not None and thread.is_alive() for thread in (self.thread, self.cancel_thread)):
+            error = "Host sampler or cancellation handoff did not join before deadline."
+            with self.state_lock:
+                if self.cleanup_error is None or error not in self.cleanup_error:
+                    self.cleanup_error = (self.cleanup_error + "; " if self.cleanup_error else "") + error
+            self.publish_failure(error)
+        if time.monotonic() >= deadline:
+            self.publish_failure("Host sampler shutdown exceeded the absolute deadline.")
+        if interrupted is not None:
+            raise interrupted
 
     def timing_phase(self, operation, **kwargs):
         return (self.controller_timing.phase(operation, **kwargs) if self.controller_timing is not None
@@ -1391,10 +1540,18 @@ class MemoryGuard:
     def timing_refusal(self):
         if self.controller_timing is not None:
             self.controller_timing.freeze()
+        if self.host_timing is not None:
+            self.host_timing.freeze()
 
     def acceptance_sample(self, snapshot, started, finished):
         """Record unadjusted host availability; pagefile use is never commit availability."""
-        if self.reason is not None:
+        with self.state_lock:
+            error = self._acceptance_sample(snapshot, started, finished)
+        if error is not None:
+            self.publish_failure(error)
+
+    def _acceptance_sample(self, snapshot, started, finished):
+        if self.reason is not None and not self.host_only:
             return
         try:
             if not all(valid_number(value) for value in (started, finished)) or finished < started:
@@ -1425,15 +1582,14 @@ class MemoryGuard:
             if self.max_gap_seconds > 1:
                 raise ValueError("Host sampling gap or read duration exceeded one second.")
         except (KeyError, TypeError, ValueError) as exc:
-            if self.reason is None:
-                self.reason = "Acceptance telemetry failed: " + str(exc)
-                self.timing_refusal()
-                if self.owner is not None:
-                    self.stop_owner()
+            return "Acceptance telemetry failed: " + str(exc)
 
     def stop_owner(self):
         """Keep the first guard reason even if its cancellation also fails."""
         self.timing_refusal()
+        if self.host_only:
+            self.cancel_requested.set()
+            return
         try:
             if self.owner is not None:
                 self.owner.stop()
@@ -1447,11 +1603,7 @@ class MemoryGuard:
         self.engine_stopped = True
         if error is not None:
             self.cuda_errors.append(error)
-        if self.reason is None:
-            self.reason = reason
-            self.timing_refusal()
-            if self.owner is not None:
-                self.stop_owner()
+        self.publish_failure(reason)
 
     def engine_row(self, line):
         """guard.py TraceReader.line: a later format on the same line overrides an earlier one."""
@@ -1599,11 +1751,14 @@ class MemoryGuard:
                 "status": "refused" if errors else "satisfied", "errors": errors}
 
     def acceptance_summary(self, start=None, end=None):
-        rows = list(self.host_samples)
-        errors = [self.reason] if self.reason else []
+        with self.state_lock:
+            rows = [dict(row) for row in self.host_samples]
+            errors = [self.reason] if self.reason else []
+            max_gap_seconds, cleanup_error = self.max_gap_seconds, self.cleanup_error
         if (not all(valid_number(value) for value in (start, end)) or end <= start
                 or len(rows) < 2 or rows[0]["finished_monotonic"] > start
-                or rows[-1]["started_monotonic"] < end):
+                or (rows[-1]["started_monotonic"] <= end if self.host_only
+                    else rows[-1]["started_monotonic"] < end)):
             errors.append("Required monotonic coverage edges are missing or insufficient.")
         minima = {}
         for name, floor in zip(("physical", "commit"), self.acceptance_floors):
@@ -1615,13 +1770,15 @@ class MemoryGuard:
                 errors.append(name + " configured headroom evidence failed.")
         result = {"host_evidence": "refused" if errors else "satisfied",
                 "errors": errors, "floors_gib": dict(zip(("physical", "commit"), self.acceptance_floors)),
-                "raw_samples": rows, "minima": minima, "max_gap_seconds": self.max_gap_seconds,
+                "raw_samples": rows, "minima": minima, "max_gap_seconds": max_gap_seconds,
                 "coverage_start_monotonic": start, "coverage_end_monotonic": end,
                 "sample_limit": self.sample_limit, "cuda": self.cuda_summary(),
-                "cleanup_error": self.cleanup_error, "cuda_floor_mib": 256,
+                "cleanup_error": cleanup_error, "cuda_floor_mib": 256,
                 "lifecycle_acceptance": "pending", "cleanup": "pending", "finalization": "pending"}
         if self.controller_timing is not None:
             result["controller_timing"] = self.controller_timing.summary()
+        if self.host_timing is not None:
+            result["host_timing"] = self.host_timing.summary()
         return result
 
     def sample(self, available, pagefile):
@@ -1636,6 +1793,19 @@ class MemoryGuard:
             self.owner.stop()
 
     def monitor(self, *, once=False):
+        if self.host_only:
+            # Controller lane only. The host thread is the sole host-row writer.
+            try:
+                with self.state_lock:
+                    owner = self.owner
+                if owner is not None:
+                    with self.timing_phase("discovery"):
+                        owner.discover()
+                if self.engine_log is not None:
+                    self.read_engine_log()
+            except Exception as exc:
+                self.publish_failure("Memory/process monitor failed: " + type(exc).__name__)
+            return
         try:
             while not self.done.is_set():
                 if self.owner is not None:
@@ -1685,8 +1855,10 @@ class MemoryGuard:
                 self.stop_owner()
 
     def check(self):
-        if self.reason:
-            raise RuntimeError(self.reason)
+        with self.state_lock:
+            reason = self.reason
+        if reason:
+            raise RuntimeError(reason)
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise TimeoutError("Absolute worker deadline reached.")
 
@@ -2158,10 +2330,11 @@ class AcceptanceOutputOwner:
     def close_after_failure(self, primary):
         try:
             self.close()
-        except Exception as cleanup:
+        except BaseException as cleanup:
             # Preserve the first failure and the still-retained cleanup authority.
             primary.output_owner = self
             primary.output_cleanup_error = type(cleanup).__name__ + ": " + str(cleanup)
+            primary.output_close_interrupted = not isinstance(cleanup, Exception)
 
     def open_receipt(self):
         """Hold the worker's receipt object while its live writer still denies replacement.
@@ -3153,302 +3326,398 @@ def acceptance_controller(args, started):
     coverage_start = coverage_end = None
     eof = False
     output_authority = os.urandom(32).hex()
-
-    if manifest_path is not None:
-        admission = record["admission"] = {"status": "refused"}
-        try:
-            if os.name != "nt":
-                raise ValueError("Manifest containment requires Windows directory authority.")
-            manifest, admission["manifest_sha256"] = load_acceptance_manifest(manifest_path, with_digest=True)
-            acceptance_admission(args, manifest, time.time())
-            # Bound before any engine-log read: rows carrying either private value are refused.
-            guard.engine_log_secrets = (acceptance_config_secret(args.config, manifest), output_authority)
-            args.output = Path(manifest["output"])
-            guard.monitor(once=True)
-            guard.check()
-            acceptance_floor_check(guard.host_samples[0], manifest, in_bytes=True)
-        except Exception as exc:
-            guard.timing_refusal()
-            admission["reason"] = str(exc)
-            record["error"] = type(exc).__name__ + ": " + str(exc)
-            record["memory"] = guard.acceptance_summary()
-            raise AcceptanceFailure(record, None) from exc
-        admission["status"] = "admitted"
-        args._controller_manifest_sha256 = admission["manifest_sha256"]  # Post-exit protection binding.
-
-    admitted_output = manifest["output"] if manifest_path is not None else str(args.output.resolve())
+    output_close_attempted = False
 
     def cleanup_failure(error):
         previous = record.get("cleanup_error")
         record["cleanup_error"] = (previous + "; " if previous else "") + str(error)
 
-    try:
-        # Host coverage starts before any owned process/native startup work.
-        if manifest_path is None:
-            guard.monitor(once=True)
-        guard.check()
-        coverage_start = time.monotonic()
-        interpreter = direct_interpreter()
-        native = WindowsProcessAPI()
-        settings = json.dumps({"work_deadline": work_deadline, "python_path": [str(ROOT), *sys.path],
-                               "admitted_manifest_sha256": record.get("admission", {}).get("manifest_sha256"),
-                               "output_authority": output_authority,
-                               "args": {key: str(value) if isinstance(value, Path) else value
-                                        for key, value in vars(args).items()}})
-        if len(settings) > 16384:
-            raise RuntimeError("Bootstrap settings exceed the environment budget.")
-        environment = dict(os.environ, STRATA_BENCHMARK_BOOTSTRAP=settings)
-        if time.monotonic() >= work_deadline:
-            raise TimeoutError("Deadline expired before creation.")
-        proc = subprocess.Popen([str(interpreter), "-I", "-S", str(Path(__file__).resolve()),
-                                 "--internal-acceptance-worker"], cwd=ROOT, env=environment,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                bufsize=0, close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        owner = OwnedProcess(proc, native=native, deadline=total_deadline)
-        owner.contain()
-        guard.owner = owner
-        guard.monitor(once=True)
-        guard.check()
-        identity = dict(zip(("pid", "creation_filetime"), map(str, owner.identity)))
-        record["identity"] = identity
-        envelope = {"command": "START", "identity": identity}
-        data = (json.dumps(envelope) + "\n").encode("utf-8")
-        # The initially empty anonymous pipe receives only this tiny control token,
-        # never dependency paths/configuration that could fill its buffer before a read.
-        if len(data) > 256 or time.monotonic() >= work_deadline:
-            raise RuntimeError("START exceeds its size or time budget.")
-        if proc.stdin.write(data) != len(data):
-            raise OSError("Short START write.")
-        proc.stdin.close()
-        job_active = None
-        while True:
+    @contextlib.contextmanager
+    def sampler_lifetime():
+        """Own every exit from partial startup through the last shutdown/join."""
+        nonlocal output_owner, output_close_attempted
+        try:
+            yield
+        except BaseException as exc:
+            if manifest_path is None:
+                raise  # The unselected route has no independent sampler lifetime.
+            if getattr(exc, "output_owner", None) is not None:
+                output_owner = exc.output_owner
+                output_close_attempted = output_close_attempted or getattr(exc, "output_close_interrupted", False)
+            error = type(exc).__name__ + ": " + str(exc)
+            def attempt(label, operation):
+                try:
+                    return operation()
+                except BaseException as cleanup:
+                    cleanup_failure(label + ": " + type(cleanup).__name__ + ": " + str(cleanup))
+                    return None
+
+            if not isinstance(exc, AcceptanceFailure):
+                attempt("failure publication", lambda: guard.publish_failure(record.get("error", error)))
+                with guard.state_lock:
+                    reason = guard.reason
+                record.setdefault("error", "RuntimeError: " + reason if reason and reason != error else error)
+                if record["error"] != error:
+                    cleanup_failure(error)
+                record["finalization"] = False
+                record["lifecycle_evidence"] = "refused"
+
+            failure = exc if isinstance(exc, AcceptanceFailure) else AcceptanceFailure(record, owner, output_owner)
+            failure.guard, failure.owner, failure.output_owner, failure.proc = guard, owner, output_owner, proc
+            needs_cleanup = not isinstance(exc, AcceptanceFailure)
+            try:
+                # Ordinary refused results already completed cleanup. Interrupted
+                # phases still have this boundary, retaining their exact owners.
+                live = any(thread is not None and thread.is_alive()
+                           for thread in (guard.thread, guard.cancel_thread))
+                needs_cleanup = needs_cleanup or live
+                if needs_cleanup:
+                    if isinstance(exc, AcceptanceFailure):
+                        attempt("failure publication", lambda: guard.publish_failure(record.get("error", error)))
+                    if owner is not None and not owner.closed:
+                        attempt("owned cancellation", owner.stop)
+                    if proc is not None:
+                        for pipe in (proc.stdin, proc.stdout):
+                            if not pipe.closed:
+                                attempt("worker pipe close", pipe.close)
+                    if output_owner is not None and not output_close_attempted:
+                        output_close_attempted = True
+                        attempt("controller output close", output_owner.close)
+                    record["owned_cleanup"] = owner is not None and owner.closed
+                    if owner is not None:
+                        record["owned_accounting"] = dict(owner.final_accounting)
+            except BaseException as cleanup:
+                cleanup_failure("exception cleanup: " + type(cleanup).__name__ + ": " + str(cleanup))
+            finally:
+                # This also runs when cleanup itself was interrupted. Never retry
+                # a native finalizer/close whose return state may be uncertain.
+                if guard.host_only and (not guard.done.is_set() or any(
+                        thread is not None and thread.is_alive() for thread in (guard.thread, guard.cancel_thread))):
+                    attempt("sampler shutdown", lambda: guard.stop_host_sampler(time.monotonic(), total_deadline))
+                if needs_cleanup and guard.host_only:
+                    memory = attempt("host evidence snapshot", lambda: guard.acceptance_summary(coverage_start, coverage_end))
+                    if memory is not None:
+                        record["memory"] = memory
+                    record["within_deadline"] = attempt("shutdown deadline", lambda: time.monotonic() < total_deadline) is True
+                if guard.cleanup_error and guard.cleanup_error not in record.get("cleanup_error", ""):
+                    cleanup_failure(guard.cleanup_error)
+                if failure is exc:
+                    raise
+                raise failure from exc
+
+    with sampler_lifetime():
+        if manifest_path is not None:
+            admission = record["admission"] = {"status": "refused"}
+            try:
+                if os.name != "nt":
+                    raise ValueError("Manifest containment requires Windows directory authority.")
+                manifest, admission["manifest_sha256"] = load_acceptance_manifest(manifest_path, with_digest=True)
+                acceptance_admission(args, manifest, time.time())
+                # Bound before any engine-log read: rows carrying either private value are refused.
+                guard.engine_log_secrets = (acceptance_config_secret(args.config, manifest), output_authority)
+                args.output = Path(manifest["output"])
+                guard.start_host_sampler(work_deadline)
+                guard.check()
+                acceptance_floor_check(guard.host_samples[0], manifest, in_bytes=True)
+            except Exception as exc:
+                admission["reason"] = str(exc)
+                error = record["admission_error"] = type(exc).__name__ + ": " + str(exc)
+                guard.publish_failure(error)
+                with guard.state_lock:
+                    reason = guard.reason
+                record["error"] = error if reason == error else "RuntimeError: " + reason
+                if guard.host_only:
+                    guard.stop_host_sampler(time.monotonic(), total_deadline)
+                record["memory"] = guard.acceptance_summary()
+                failure = AcceptanceFailure(record, None)
+                failure.guard = guard  # Retain live authority if a blocked read/handoff could not join.
+                raise failure from exc
+            admission["status"] = "admitted"
+            args._controller_manifest_sha256 = admission["manifest_sha256"]  # Post-exit protection binding.
+
+        admitted_output = manifest["output"] if manifest_path is not None else str(args.output.resolve())
+
+        try:
+            # Host coverage starts before any owned process/native startup work.
+            if manifest_path is None:
+                guard.monitor(once=True)
+            guard.check()
+            coverage_start = time.monotonic()
+            interpreter = direct_interpreter()
+            native = WindowsProcessAPI()
+            settings = json.dumps({"work_deadline": work_deadline, "python_path": [str(ROOT), *sys.path],
+                                   "admitted_manifest_sha256": record.get("admission", {}).get("manifest_sha256"),
+                                   "output_authority": output_authority,
+                                   "args": {key: str(value) if isinstance(value, Path) else value
+                                            for key, value in vars(args).items()}})
+            if len(settings) > 16384:
+                raise RuntimeError("Bootstrap settings exceed the environment budget.")
+            environment = dict(os.environ, STRATA_BENCHMARK_BOOTSTRAP=settings)
             if time.monotonic() >= work_deadline:
-                if record.get("worker_exit") == 0 and job_active:
-                    record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
-                    raise TimeoutError("Job members remained after worker exit.")
-                raise TimeoutError("Absolute worker deadline reached, including capture/finalization.")
-            with guard.timing_phase("capture"):
-                chunk, eof = native.capture(proc.stdout)
-                capture.write(chunk)
-                if capture.total > ACCEPTANCE_LOG_LIMIT:
-                    raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
-            with guard.timing_phase("poll"):
-                code = owner.poll()
-            if code is not None:
-                record["worker_exit"] = code
-                record.setdefault("worker_observed_exit_monotonic", time.monotonic())
-                if code != 0:
-                    guard.check()  # Keep an already-recorded guard failure as the primary reason.
-                    raise RuntimeError("Worker exited unsuccessfully.")
-            if manifest_path is not None and output_owner is None and code is None:
-                with guard.timing_phase("output_acquisition"):
-                    try:
-                        output_owner = acceptance_acquire_output(args.output, admitted_output, output_authority)
-                    except (FileNotFoundError, json.JSONDecodeError) as incomplete:
-                        if getattr(incomplete, "output_owner", None) is not None:
-                            raise
-                        pass  # Birth/partial claim may complete only within the original deadline.
-                    else:
-                        # One shot: a failure stops the owned job while output_owner stays held.
-                        acceptance_publish_acknowledgment(output_owner, output_authority, work_deadline)
+                raise TimeoutError("Deadline expired before creation.")
+            proc = subprocess.Popen([str(interpreter), "-I", "-S", str(Path(__file__).resolve()),
+                                     "--internal-acceptance-worker"], cwd=ROOT, env=environment,
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    bufsize=0, close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            owner = OwnedProcess(proc, native=native, deadline=total_deadline)
+            guard.attach_owner(owner)
+            owner.contain()
             guard.monitor(once=True)
             guard.check()
-            if code is not None:
-                with guard.timing_phase("discovery"):
-                    job_active = owner.discover()
-                record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
-                if job_active == 0 and eof:
-                    break
-            seconds = min(0.25, max(0, work_deadline - time.monotonic()))
+            identity = dict(zip(("pid", "creation_filetime"), map(str, owner.identity)))
+            record["identity"] = identity
+            envelope = {"command": "START", "identity": identity}
+            data = (json.dumps(envelope) + "\n").encode("utf-8")
+            # The initially empty anonymous pipe receives only this tiny control token,
+            # never dependency paths/configuration that could fill its buffer before a read.
+            if len(data) > 256 or time.monotonic() >= work_deadline:
+                raise RuntimeError("START exceeds its size or time budget.")
+            if proc.stdin.write(data) != len(data):
+                raise OSError("Short START write.")
+            proc.stdin.close()
+            job_active = None
+            while True:
+                if time.monotonic() >= work_deadline:
+                    if record.get("worker_exit") == 0 and job_active:
+                        record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
+                        raise TimeoutError("Job members remained after worker exit.")
+                    raise TimeoutError("Absolute worker deadline reached, including capture/finalization.")
+                with guard.timing_phase("capture"):
+                    chunk, eof = native.capture(proc.stdout)
+                    capture.write(chunk)
+                    if capture.total > ACCEPTANCE_LOG_LIMIT:
+                        raise RuntimeError("Worker stdout/stderr exceeded the output budget.")
+                with guard.timing_phase("poll"):
+                    code = owner.poll()
+                if code is not None:
+                    record["worker_exit"] = code
+                    record.setdefault("worker_observed_exit_monotonic", time.monotonic())
+                    if code != 0:
+                        guard.check()  # Keep an already-recorded guard failure as the primary reason.
+                        raise RuntimeError("Worker exited unsuccessfully.")
+                if manifest_path is not None and output_owner is None and code is None:
+                    with guard.timing_phase("output_acquisition"):
+                        try:
+                            output_owner = acceptance_acquire_output(args.output, admitted_output, output_authority)
+                        except (FileNotFoundError, json.JSONDecodeError) as incomplete:
+                            if getattr(incomplete, "output_owner", None) is not None:
+                                raise
+                            pass  # Birth/partial claim may complete only within the original deadline.
+                        else:
+                            # One shot: a failure stops the owned job while output_owner stays held.
+                            acceptance_publish_acknowledgment(output_owner, output_authority, work_deadline)
+                guard.monitor(once=True)
+                guard.check()
+                if code is not None:
+                    with guard.timing_phase("discovery"):
+                        job_active = owner.discover()
+                    record["job_drain_seconds"] = time.monotonic() - record["worker_observed_exit_monotonic"]
+                    if job_active == 0 and eof:
+                        break
+                seconds = min(0.25, max(0, work_deadline - time.monotonic()))
+                with guard.timing_phase("sleep", requested_seconds=seconds):
+                    time.sleep(seconds)
+            # Explicit final edge after externally observed exit and inherited-pipe EOF.
+            seconds = min(0.001, max(0, total_deadline - time.monotonic()))
             with guard.timing_phase("sleep", requested_seconds=seconds):
                 time.sleep(seconds)
-        # Explicit final edge after externally observed exit and inherited-pipe EOF.
-        seconds = min(0.001, max(0, total_deadline - time.monotonic()))
-        with guard.timing_phase("sleep", requested_seconds=seconds):
-            time.sleep(seconds)
-        guard.monitor(once=True)
-        guard.check()
-        record["natural_exit"] = not owner.forced
-        record["capture_complete"] = eof
-    except BaseException as exc:
-        guard.timing_refusal()
-        record["error"] = type(exc).__name__ + ": " + str(exc)
-        if getattr(exc, "output_owner", None) is not None:
-            output_owner = exc.output_owner
-            cleanup_failure(exc.output_cleanup_error)
-        if owner is not None:
-            try:
-                owner.stop()
-            except Exception as cleanup:
-                cleanup_failure(cleanup)
-    finally:
-        if owner is not None:
-            try:
-                owner.finish()
-                record["owned_cleanup"] = owner.closed
-            except Exception as cleanup:
-                cleanup_failure(cleanup)
-            record["owned_accounting"] = dict(owner.final_accounting)
-        if proc is not None:
-            for pipe in (proc.stdin, proc.stdout):
-                try:
-                    pipe.close()
-                except Exception as cleanup:
-                    cleanup_failure(cleanup)
-        # Ownership has finished (or failed and been retained separately). Continue
-        # host reads independently, including when owned accounting was unavailable.
-        guard.owner = None
-        guard.monitor(once=True)
-        if guard.reason:
-            record.setdefault("error", guard.reason)
-        record["memory"] = guard.acceptance_summary(coverage_start, coverage_end)
-        minima = record["memory"]["minima"]
-        record["base_host_floors_satisfied"] = all(
-            minima[name] is not None and minima[name]["available_bytes"] >= 4 * 1024**3
-            for name in ("physical", "commit"))
-        if guard.cleanup_error:
-            cleanup_failure(guard.cleanup_error)
-    try:
-        if manifest_path is not None and (output_owner is None or not output_owner.acknowledged):
-            raise ValueError("Controller output authority was not acquired.")
-        worker_record = acceptance_claimed_output(args.output, admitted_output, output_authority, owner=output_owner)
-        if output_owner is not None:
-            consumed = output_owner.receipt_bytes
-            record["artifact_sha256"] = {"provisional.json": hashlib.sha256(consumed).hexdigest()}
-        if not record.get("error") and not record.get("cleanup_error"):
-            paths = list(args.output.iterdir())
-            expected_artifacts = {"provisional.json", "server.log", "engine.log"}
-            if output_owner is not None:
-                expected_artifacts.add("controller-ack.json")
-            if ({path.name for path in paths} != expected_artifacts
-                    or any(path.is_symlink() or not path.is_file()
-                           or path.stat().st_size > ACCEPTANCE_LOG_LIMIT for path in paths)):
-                raise RuntimeError("Missing, unexpected or oversized worker artifacts.")
-            if output_owner is not None:
-                # One bounded read of each closed log, bound to the authenticated receipt.
-                digests = worker_record.get("artifact_sha256")
-                for name in ("server.log", "engine.log"):
-                    with (args.output / name).open("rb") as stream:
-                        data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
-                        opened = os.fstat(stream.fileno())
-                    digest = hashlib.sha256(data).hexdigest()
-                    if (len(data) > ACCEPTANCE_LOG_LIMIT or type(digests) is not dict
-                            or type(digests.get(name)) is not str or not hmac.compare_digest(digests[name], digest)):
-                        raise ValueError("Worker " + name + " differs from its authenticated digest.")
-                    record["artifact_sha256"][name] = digest
-                    if name == "engine.log":
-                        # The authenticated bytes complete the guard's stream; consumed rows must be their prefix.
-                        guard.finish_engine_log(data, (opened.st_dev, opened.st_ino))
-                        record["memory"]["cuda"] = guard.cuda_summary()  # The receipt carries the bound stream.
-                        record["allocation_evidence"] = acceptance_allocations(data.decode("utf-8", errors="strict"))
-            record["worker_complete"] = worker_record.get("status") == "provisional_complete"
-            selection = getattr(args, "acceptance_workload", None)
-            if selection:
-                record["launch_evidence"] = acceptance_launch_evidence(
-                    worker_record.get("launch_memory"), args.cohort, floors,
-                    record.get("allocation_evidence", {}))
-                record["workload_evidence"] = {key: worker_record.get(key) for key in (
-                    "acceptance_workload", "cohort", "expected_max_context", "acceptance_workload_passed",
-                    "final_idle", "protection", "missing_evidence")}
-                complete = record["worker_complete"]
-                record["worker_complete"] = False
-                try:
-                    record["worker_complete"] = complete and validate_selected_workload(
-                        worker_record, args, min(work_deadline, record["worker_observed_exit_monotonic"]))
-                except ValueError as exc:
-                    record["workload_error"] = str(exc)
-                # Consume classification independently of workload/lifecycle success.
-                # Never promote the worker's bool, digest or inventory on its own.
-                try:
-                    with args.config.open("rb") as stream:
-                        data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
-                    if len(data) > ACCEPTANCE_LOG_LIMIT:
-                        raise ValueError("Configuration exceeds its bounded read budget.")
-                    config_identity = next(item for item in worker_record["protection"]["before"]
-                                           if item["path"] == str(args.config.resolve()))
-                    if config_identity["sha256"] != hashlib.sha256(data).hexdigest():
-                        raise ValueError("Consumed configuration binding differs.")
-                    cfg = json.loads(data.decode("utf-8-sig"))
-                    prepared, inherited = clean_environment(cfg, args.timing, getattr(args, "fetch_timing", False),
-                                                           acceptance=True, inherited=worker_environment)
-                    record["normal_comparison"] = consume_normal_comparison(worker_record, prepared, inherited)
-                except (OSError, ValueError, TypeError, KeyError, StopIteration, AttributeError):
-                    record["normal_comparison"] = normal_comparison_excluded("classification-input-unavailable")
-            record["protection"] = acceptance_protection(args, worker_record) is True
-            record["protection_evidence"] = getattr(args, "_acceptance_protection_evidence", None)
             guard.monitor(once=True)
             guard.check()
-        # Protection and host probes may have returned after the first claim read.
-        acceptance_claimed_output(args.output, admitted_output, output_authority, owner=output_owner)
-        if output_owner is not None:
-            if output_owner.receipt_bytes != consumed:
-                raise ValueError("Worker receipt changed after controller consumption.")
-            if any(os.path.lexists(args.output / name) for name in ("controller.log", "lifecycle.json")):
-                raise FileExistsError("Controller artifact already exists.")
-        write = bounded_create if output_owner is not None else bounded_write
-        controller_log = capture.text().encode("utf-8")
-        write(args.output / "controller.log", controller_log, total_deadline)
-        if output_owner is not None:
-            record["artifact_sha256"]["controller.log"] = hashlib.sha256(controller_log).hexdigest()
-        # A saved receipt always remains HELD. Only the caller can observe this function's
-        # post-close result, and must also observe its external exit before qualifying it.
-        record["memory_finalization"] = "provisional until post-artifact host edge in returned result"
-        payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
-        if output_owner is not None:
-            # Exclusive direct create: no staging name, and nothing is unlinked or replaced.
-            bounded_create(args.output / "lifecycle.json", payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
-            with (args.output / "lifecycle.json").open("rb") as stream:
-                readback = stream.read(ACCEPTANCE_RECEIPT_LIMIT + 1)
-        else:
-            pending = args.output / "lifecycle.json.tmp"
-            write(pending, payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
-            pending.replace(args.output / "lifecycle.json")
-            readback = (args.output / "lifecycle.json").read_bytes()
-        if readback != payload:
-            raise OSError("Final receipt readback mismatch.")
-        if sum(path.stat().st_size for path in args.output.iterdir()) > ACCEPTANCE_ARTIFACT_LIMIT:
-            raise RuntimeError("Total retained artifact budget exceeded.")
-        if output_owner is not None:
-            paths = list(args.output.iterdir())
-            allowed = {"provisional.json", "server.log", "engine.log", "controller-ack.json",
-                       "controller.log", "lifecycle.json"}
-            if any(path.name not in allowed or path.is_symlink() or not path.is_file()
-                   or path.stat().st_size > (ACCEPTANCE_RECEIPT_LIMIT if path.name == "lifecycle.json"
-                       else 4096 if path.name == "controller-ack.json"
-                       else ACCEPTANCE_LOG_LIMIT) for path in paths):
-                raise RuntimeError("Unexpected or oversized retained artifacts.")
-            output_owner.validate()
-        record["finalization"] = True
-    except Exception as exc:
-        guard.timing_refusal()
-        record["finalization_error"] = type(exc).__name__ + ": " + str(exc)
-        record["finalization"] = False
-    finally:
-        if output_owner is not None:
-            try:
-                output_owner.close()
-            except Exception as cleanup:
-                cleanup_failure("Controller output authority close failed: " + str(cleanup))
-                record["finalization"] = False
-        # No filesystem/native finalization follows this edge. A slow returning
-        # operation is refused by the observed gap; this is not syscall preemption.
-        coverage_end = time.monotonic()
-        guard.monitor(once=True)
-        if guard.reason:
-            record.setdefault("error", guard.reason)
-        record["memory"] = guard.acceptance_summary(coverage_start, coverage_end)
-        minima = record["memory"]["minima"]
-        record["base_host_floors_satisfied"] = all(
-            minima[name] is not None and minima[name]["available_bytes"] >= 4 * 1024**3
-            for name in ("physical", "commit"))
-        record["within_deadline"] = time.monotonic() < total_deadline
-    if not acceptance_final_predicate(record):
-        guard.timing_refusal()
-        if guard.controller_timing is not None:
-            record["memory"]["controller_timing"] = guard.controller_timing.summary()
-        raise AcceptanceFailure(record, owner, output_owner)
-    record["lifecycle_evidence"] = "satisfied"
-    return record
+            record["natural_exit"] = not owner.forced
+            record["capture_complete"] = eof
+        except BaseException as exc:
+            guard.timing_refusal()
+            error = type(exc).__name__ + ": " + str(exc)
+            if guard.host_only:
+                guard.publish_failure(error)
+                if guard.reason != error:
+                    error = "RuntimeError: " + guard.reason
+            record["error"] = error
+            if getattr(exc, "output_owner", None) is not None:
+                output_owner = exc.output_owner
+                output_close_attempted = output_close_attempted or getattr(exc, "output_close_interrupted", False)
+                cleanup_failure(exc.output_cleanup_error)
+            if owner is not None:
+                try:
+                    owner.stop()
+                except Exception as cleanup:
+                    cleanup_failure(cleanup)
+        finally:
+            if owner is not None:
+                try:
+                    owner.finish()
+                    record["owned_cleanup"] = owner.closed
+                except Exception as cleanup:
+                    cleanup_failure(cleanup)
+                record["owned_accounting"] = dict(owner.final_accounting)
+            if proc is not None:
+                for pipe in (proc.stdin, proc.stdout):
+                    try:
+                        pipe.close()
+                    except Exception as cleanup:
+                        cleanup_failure(cleanup)
+            # Ownership has finished (or failed and been retained separately). Continue
+            # host reads independently, including when owned accounting was unavailable.
+            guard.attach_owner(None)
+            guard.monitor(once=True)
+            if guard.reason:
+                record.setdefault("error", guard.reason)
+            record["memory"] = guard.acceptance_summary(coverage_start, coverage_end)
+            minima = record["memory"]["minima"]
+            record["base_host_floors_satisfied"] = all(
+                minima[name] is not None and minima[name]["available_bytes"] >= 4 * 1024**3
+                for name in ("physical", "commit"))
+            if guard.cleanup_error:
+                cleanup_failure(guard.cleanup_error)
+        try:
+            if manifest_path is not None and (output_owner is None or not output_owner.acknowledged):
+                raise ValueError("Controller output authority was not acquired.")
+            worker_record = acceptance_claimed_output(args.output, admitted_output, output_authority, owner=output_owner)
+            if output_owner is not None:
+                consumed = output_owner.receipt_bytes
+                record["artifact_sha256"] = {"provisional.json": hashlib.sha256(consumed).hexdigest()}
+            if not record.get("error") and not record.get("cleanup_error"):
+                paths = list(args.output.iterdir())
+                expected_artifacts = {"provisional.json", "server.log", "engine.log"}
+                if output_owner is not None:
+                    expected_artifacts.add("controller-ack.json")
+                if ({path.name for path in paths} != expected_artifacts
+                        or any(path.is_symlink() or not path.is_file()
+                               or path.stat().st_size > ACCEPTANCE_LOG_LIMIT for path in paths)):
+                    raise RuntimeError("Missing, unexpected or oversized worker artifacts.")
+                if output_owner is not None:
+                    # One bounded read of each closed log, bound to the authenticated receipt.
+                    digests = worker_record.get("artifact_sha256")
+                    for name in ("server.log", "engine.log"):
+                        with (args.output / name).open("rb") as stream:
+                            data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+                            opened = os.fstat(stream.fileno())
+                        digest = hashlib.sha256(data).hexdigest()
+                        if (len(data) > ACCEPTANCE_LOG_LIMIT or type(digests) is not dict
+                                or type(digests.get(name)) is not str or not hmac.compare_digest(digests[name], digest)):
+                            raise ValueError("Worker " + name + " differs from its authenticated digest.")
+                        record["artifact_sha256"][name] = digest
+                        if name == "engine.log":
+                            # The authenticated bytes complete the guard's stream; consumed rows must be their prefix.
+                            guard.finish_engine_log(data, (opened.st_dev, opened.st_ino))
+                            record["memory"]["cuda"] = guard.cuda_summary()  # The receipt carries the bound stream.
+                            record["allocation_evidence"] = acceptance_allocations(data.decode("utf-8", errors="strict"))
+                record["worker_complete"] = worker_record.get("status") == "provisional_complete"
+                selection = getattr(args, "acceptance_workload", None)
+                if selection:
+                    record["launch_evidence"] = acceptance_launch_evidence(
+                        worker_record.get("launch_memory"), args.cohort, floors,
+                        record.get("allocation_evidence", {}))
+                    record["workload_evidence"] = {key: worker_record.get(key) for key in (
+                        "acceptance_workload", "cohort", "expected_max_context", "acceptance_workload_passed",
+                        "final_idle", "protection", "missing_evidence")}
+                    complete = record["worker_complete"]
+                    record["worker_complete"] = False
+                    try:
+                        record["worker_complete"] = complete and validate_selected_workload(
+                            worker_record, args, min(work_deadline, record["worker_observed_exit_monotonic"]))
+                    except ValueError as exc:
+                        record["workload_error"] = str(exc)
+                    # Consume classification independently of workload/lifecycle success.
+                    # Never promote the worker's bool, digest or inventory on its own.
+                    try:
+                        with args.config.open("rb") as stream:
+                            data = stream.read(ACCEPTANCE_LOG_LIMIT + 1)
+                        if len(data) > ACCEPTANCE_LOG_LIMIT:
+                            raise ValueError("Configuration exceeds its bounded read budget.")
+                        config_identity = next(item for item in worker_record["protection"]["before"]
+                                               if item["path"] == str(args.config.resolve()))
+                        if config_identity["sha256"] != hashlib.sha256(data).hexdigest():
+                            raise ValueError("Consumed configuration binding differs.")
+                        cfg = json.loads(data.decode("utf-8-sig"))
+                        prepared, inherited = clean_environment(cfg, args.timing, getattr(args, "fetch_timing", False),
+                                                               acceptance=True, inherited=worker_environment)
+                        record["normal_comparison"] = consume_normal_comparison(worker_record, prepared, inherited)
+                    except (OSError, ValueError, TypeError, KeyError, StopIteration, AttributeError):
+                        record["normal_comparison"] = normal_comparison_excluded("classification-input-unavailable")
+                record["protection"] = acceptance_protection(args, worker_record) is True
+                record["protection_evidence"] = getattr(args, "_acceptance_protection_evidence", None)
+                guard.monitor(once=True)
+                guard.check()
+            # Protection and host probes may have returned after the first claim read.
+            acceptance_claimed_output(args.output, admitted_output, output_authority, owner=output_owner)
+            if output_owner is not None:
+                if output_owner.receipt_bytes != consumed:
+                    raise ValueError("Worker receipt changed after controller consumption.")
+                if any(os.path.lexists(args.output / name) for name in ("controller.log", "lifecycle.json")):
+                    raise FileExistsError("Controller artifact already exists.")
+            write = bounded_create if output_owner is not None else bounded_write
+            controller_log = capture.text().encode("utf-8")
+            write(args.output / "controller.log", controller_log, total_deadline)
+            if output_owner is not None:
+                record["artifact_sha256"]["controller.log"] = hashlib.sha256(controller_log).hexdigest()
+            # A saved receipt always remains HELD. Only the caller can observe this function's
+            # post-close result, and must also observe its external exit before qualifying it.
+            record["memory_finalization"] = "provisional until post-artifact host edge in returned result"
+            payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
+            if output_owner is not None:
+                # Exclusive direct create: no staging name, and nothing is unlinked or replaced.
+                bounded_create(args.output / "lifecycle.json", payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
+                with (args.output / "lifecycle.json").open("rb") as stream:
+                    readback = stream.read(ACCEPTANCE_RECEIPT_LIMIT + 1)
+            else:
+                pending = args.output / "lifecycle.json.tmp"
+                write(pending, payload, total_deadline, limit=ACCEPTANCE_RECEIPT_LIMIT)
+                pending.replace(args.output / "lifecycle.json")
+                readback = (args.output / "lifecycle.json").read_bytes()
+            if readback != payload:
+                raise OSError("Final receipt readback mismatch.")
+            if sum(path.stat().st_size for path in args.output.iterdir()) > ACCEPTANCE_ARTIFACT_LIMIT:
+                raise RuntimeError("Total retained artifact budget exceeded.")
+            if output_owner is not None:
+                paths = list(args.output.iterdir())
+                allowed = {"provisional.json", "server.log", "engine.log", "controller-ack.json",
+                           "controller.log", "lifecycle.json"}
+                if any(path.name not in allowed or path.is_symlink() or not path.is_file()
+                       or path.stat().st_size > (ACCEPTANCE_RECEIPT_LIMIT if path.name == "lifecycle.json"
+                           else 4096 if path.name == "controller-ack.json"
+                           else ACCEPTANCE_LOG_LIMIT) for path in paths):
+                    raise RuntimeError("Unexpected or oversized retained artifacts.")
+                output_owner.validate()
+            record["finalization"] = True
+        except Exception as exc:
+            guard.timing_refusal()
+            record["finalization_error"] = type(exc).__name__ + ": " + str(exc)
+            record["finalization"] = False
+        finally:
+            if output_owner is not None and not output_close_attempted:
+                try:
+                    output_close_attempted = True
+                    output_owner.close()
+                except Exception as cleanup:
+                    cleanup_failure("Controller output authority close failed: " + str(cleanup))
+                    record["finalization"] = False
+            # No filesystem/native finalization follows this edge. Only a host read
+            # starting strictly after it can complete coverage, followed by both joins.
+            coverage_end = time.monotonic()
+            if guard.host_only:
+                guard.stop_host_sampler(coverage_end, total_deadline)
+            else:
+                guard.monitor(once=True)
+            if guard.reason:
+                record.setdefault("error", guard.reason)
+            record["memory"] = guard.acceptance_summary(coverage_start, coverage_end)
+            if guard.cleanup_error and guard.cleanup_error not in record.get("cleanup_error", ""):
+                cleanup_failure(guard.cleanup_error)
+            minima = record["memory"]["minima"]
+            record["base_host_floors_satisfied"] = all(
+                minima[name] is not None and minima[name]["available_bytes"] >= 4 * 1024**3
+                for name in ("physical", "commit"))
+            record["within_deadline"] = time.monotonic() < total_deadline
+        if not acceptance_final_predicate(record):
+            guard.timing_refusal()
+            if guard.controller_timing is not None:
+                record["memory"]["controller_timing"] = guard.controller_timing.summary()
+            failure = AcceptanceFailure(record, owner, output_owner)
+            failure.guard = guard
+            raise failure
+        record["lifecycle_evidence"] = "satisfied"
+        return record
 
 
 def run(args):
