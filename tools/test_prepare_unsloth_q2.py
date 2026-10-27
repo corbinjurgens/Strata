@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch, Mock
 
 from tools import prepare_unsloth_q2 as prep
+from serve import credentials
 
 
 def value(args, flag):
@@ -376,7 +377,9 @@ class PortableProfiles(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def make_config(self, overrides=None):
-        return prep.config_for(self.root / "source", self.root / "pack", 131072, None, overrides=overrides)
+        cfg = prep.config_for(self.root / "source", self.root / "pack", 131072, None, overrides=overrides)
+        cfg["api_key"] = "legacy-test-credential-for-profile"
+        return cfg
 
     def prepared_server(self, command, **kwargs):
         """Simulate the child server's preparation at the subprocess boundary."""
@@ -569,7 +572,10 @@ class PortableProfiles(unittest.TestCase):
         cfg = self.make_config()
         self.assertEqual(Path(cfg["exe"]).name, "strata-unsloth-portable.exe")
         self.assertEqual(Path(cfg["build_metadata"]).name, "BUILD-unsloth-portable.json")
-        self.assertGreaterEqual(len(cfg["api_key"]), 32)
+        cfg = prep.config_for(self.root / "source", self.root / "pack", 131072, None)
+        prep.write_profile(self.config, cfg, create_config=True)
+        self.assertNotIn("api_key", cfg)
+        self.assertGreaterEqual(len(prep.read_key_file(cfg["api_key_file"])[0]), 32)
         self.assertTrue(cfg["fit_max_tokens"])
         self.assertFalse(cfg["open_browser"])
         self.assertEqual(cfg["host"], "127.0.0.1")
@@ -579,6 +585,41 @@ class PortableProfiles(unittest.TestCase):
         key_config.write_text(json.dumps({"api_key": "local-test-key", "host": "0.0.0.0", "port": 8182}))
         cfg = prep.config_for(self.root, self.root / "pack", 131072, key_config)
         self.assertEqual((cfg["api_key"], cfg["host"], cfg["port"]), ("local-test-key", "0.0.0.0", 8182))
+
+    def test_previous_file_key_is_reused_and_multi_key_source_refuses_before_writes(self):
+        key_path = self.root / "existing.key"
+        credentials.create_key_file(key_path, "literal,comma-key")
+        source = self.root / "previous.json"
+        source.write_text(json.dumps({"api_key_file": str(key_path), "api_key": "ignored,legacy",
+                                      "host": "0.0.0.0", "port": 8182}))
+        original = key_path.read_bytes()
+        cfg = prep.config_for(self.root, self.root / "pack", 131072, source)
+        prep.write_profile(self.config, cfg, True)
+        self.assertNotIn("api_key", cfg)
+        self.assertEqual(cfg["api_key_file"], str(key_path))
+        self.assertEqual((cfg["host"], cfg["port"]), ("0.0.0.0", 8182))
+        self.assertEqual(key_path.read_bytes(), original)
+        for legacy in ("first,second", ["first", "second"]):
+            source.write_text(json.dumps({"api_key": legacy}))
+            before = {path.name: path.read_bytes() for path in self.root.iterdir()}
+            with self.assertRaisesRegex(ValueError, "multiple API keys"):
+                prep.config_for(self.root, self.root / "pack", 131072, source)
+            self.assertEqual({path.name: path.read_bytes() for path in self.root.iterdir()}, before)
+
+    def test_public_helper_migrates_single_key_without_key_in_config_launcher_or_output(self):
+        source = self.root / "previous.json"
+        source.write_text(json.dumps({"api_key": ["private,fixture-key"]}))
+        original = source.read_bytes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(prep.main(["--write-config", "--config", str(self.config),
+                                        "--key-config", str(source), "--gguf-dir", str(self.root)]), 0)
+        cfg = json.loads(self.config.read_text())
+        self.assertNotIn("api_key", cfg)
+        self.assertEqual(credentials.read_key_file(cfg["api_key_file"]), ["private,fixture-key"])
+        script, _ = prep.launcher_contents(self.config)
+        self.assertNotIn("private,fixture-key", self.config.read_text() + script.read_text() + output.getvalue())
+        self.assertEqual(source.read_bytes(), original)
 
     def test_existing_config_is_preserved_byte_for_byte(self):
         cfg = self.make_config()
@@ -844,7 +885,7 @@ class PortableProfiles(unittest.TestCase):
         self.assertEqual(value(second["args"], "--resident-budget-gib"), "12")
         self.assertNotIn("--resident-budget-gib", second["memory_policy"]["overrides"]["args"])
 
-    def test_saved_key_takes_precedence_over_inherited_key_at_launch(self):
+    def test_inherited_key_is_forwarded_at_launch(self):
         for inherited in ("unrelated-key", ""):
             with self.subTest(inherited=inherited):
                 cfg = self.make_config()
@@ -854,7 +895,7 @@ class PortableProfiles(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     run.return_value.returncode = 0
                     self.assertEqual(prep.launch(self.config), 0)
-                self.assertNotIn("STRATA_API_KEY", run.call_args.kwargs["env"])
+                self.assertEqual(run.call_args.kwargs["env"]["STRATA_API_KEY"], inherited)
                 self.assertNotIn(cfg["api_key"], run.call_args.args[0])
                 self.assertEqual(json.loads(self.config.read_text())["api_key"], cfg["api_key"])
 
@@ -1178,7 +1219,8 @@ class PortableProfiles(unittest.TestCase):
 
     def test_unauthenticated_lan_profile_is_rejected(self):
         cfg = self.make_config()
-        cfg.update(host="0.0.0.0", api_key="")
+        cfg.update(host="0.0.0.0")
+        cfg.pop("api_key")
         with self.assertRaisesRegex(ValueError, "LAN access requires"):
             prep.check_ready(cfg)
 
@@ -1381,6 +1423,172 @@ class PortableProfiles(unittest.TestCase):
                     patch.dict(prep.os.environ, {"STRATA_BATCH_VALUE": "UNWANTED_EXPANSION"}):
                 env = prep.msvc_environment(supplied)
                 self.assertEqual(env["STRATA_TEST_COMPILER_ENV"], "verified")
+
+
+class PrivateProfileCredentials(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="strata-pair-u1-credentials-r2-profile-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / "profile.json"
+        self.key = self.root / "profile.json.key"
+        patcher = patch.object(prep, "ROOT", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_generation_migration_reuse_and_no_secret_in_published_config(self):
+        for legacy, expected in (("  one-key  ", "one-key"), (["literal,comma"], "literal,comma")):
+            with self.subTest(legacy=legacy):
+                cfg = {"api_key": legacy, "host": "127.0.0.1"}
+                prep.write_profile(self.config, cfg, True)
+                saved = json.loads(self.config.read_text())
+                self.assertEqual(saved, {"host": "127.0.0.1", "api_key_file": str(self.key)})
+                self.assertNotIn(expected, self.config.read_text())
+                self.assertEqual(credentials.read_key_file(self.key), [expected])
+                self.assertEqual(cfg, saved)
+                before = self.key.read_bytes()
+                prep.write_profile(self.config, cfg, True)
+                self.assertEqual(self.key.read_bytes(), before)
+                self.key.unlink()
+        cfg = {}
+        prep.write_profile(self.config, cfg, True)
+        self.assertGreaterEqual(len(credentials.read_key_file(self.key)[0]), 32)
+        original = self.key.read_bytes()
+        prep.write_profile(self.config, {}, True)
+        self.assertEqual(self.key.read_bytes(), original)
+
+    def test_multi_key_migration_refuses_without_any_publication(self):
+        for legacy in ("one,two", ["one", "two"]):
+            for existing in (False, True):
+                with self.subTest(legacy=legacy, existing=existing):
+                    if existing:
+                        credentials.create_key_file(self.key, "existing-key")
+                    self.config.write_bytes(b"previous config")
+                    before = {path.name: path.read_bytes() for path in self.root.iterdir()}
+                    with patch.object(prep, "atomic_files") as publish, \
+                            self.assertRaisesRegex(ValueError, "multiple API keys"):
+                        prep.write_profile(self.config, {"api_key": legacy}, True)
+                    publish.assert_not_called()
+                    self.assertEqual({path.name: path.read_bytes() for path in self.root.iterdir()}, before)
+                    if existing:
+                        self.key.unlink()
+
+    def test_config_and_launcher_publish_failure_restore_all_state(self):
+        for boundary in ("config", "launcher"):
+            for existing_key in (False, True):
+                with self.subTest(boundary=boundary, existing_key=existing_key):
+                    if existing_key:
+                        credentials.create_key_file(self.key, "preserved-key")
+                    self.config.write_bytes(b"old config")
+                    script, _ = prep.launcher_contents(self.config)
+                    script.write_bytes(b"old launcher")
+                    before = {path.name: path.read_bytes() for path in self.root.iterdir()}
+                    real_replace = prep.os.replace
+                    fired = False
+                    target_path = self.config if boundary == "config" else script
+                    def replace(source, target):
+                        nonlocal fired
+                        if Path(target) == target_path and not fired:
+                            fired = True
+                            raise OSError("injected publication failure")
+                        return real_replace(source, target)
+                    cfg = {"api_key": "preserved-key"} if existing_key else {}
+                    original = dict(cfg)
+                    with patch.object(prep.os, "replace", side_effect=replace), \
+                            self.assertRaisesRegex(OSError, "injected publication failure"):
+                        prep.write_profile(self.config, cfg, True)
+                    self.assertTrue(fired)
+                    self.assertEqual(cfg, original)
+                    self.assertEqual({path.name: path.read_bytes() for path in self.root.iterdir()}, before)
+                    if existing_key:
+                        self.key.unlink()
+
+    def test_key_create_security_write_failure_prevents_profile_publication(self):
+        for owner, name in ((prep, "create_key_file"), (credentials, "_validate"), (credentials.os, "fsync")):
+            with self.subTest(seam=name):
+                self.config.write_bytes(b"old config")
+                cfg = {"api_key": "fixture-secret"}
+                before = {path.name: path.read_bytes() for path in self.root.iterdir()}
+                with patch.object(owner, name, side_effect=OSError("failure")), \
+                        patch.object(prep, "atomic_files") as publish, self.assertRaises(ValueError if name != "create_key_file" else OSError):
+                    prep.write_profile(self.config, cfg, True)
+                publish.assert_not_called()
+                self.assertEqual({path.name: path.read_bytes() for path in self.root.iterdir()}, before)
+
+    def test_existing_insecure_mismatched_or_missing_source_remains_unchanged(self):
+        credentials.create_key_file(self.key, "existing-key")
+        before = self.key.read_bytes()
+        with self.assertRaises(ValueError):
+            prep.write_profile(self.config, {"api_key": "different-key"}, True)
+        self.assertEqual(self.key.read_bytes(), before)
+        self.assertFalse(self.config.exists())
+        with patch.object(credentials, "_validate", side_effect=ValueError("unsafe permissions")), \
+                self.assertRaises(ValueError):
+            prep.write_profile(self.config, {"api_key_file": str(self.key)}, True)
+        self.assertEqual(self.key.read_bytes(), before)
+        self.assertFalse(self.config.exists())
+
+        for path in (self.root / "missing.key", Path("relative.key")):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                prep.write_profile(self.config, {"api_key_file": str(path), "api_key": "fallback"}, True)
+        self.assertEqual(self.key.read_bytes(), before)
+        self.assertFalse(self.config.exists())
+
+    def test_serialization_failure_after_new_key_rolls_back_without_config_or_launcher(self):
+        cfg = {"not_json": object()}
+        with self.assertRaises(TypeError):
+            prep.write_profile(self.config, cfg, True)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_key_file_is_separate_even_when_config_has_key_suffix(self):
+        config = self.root / "profile.key"
+        cfg = {}
+        prep.write_profile(config, cfg, True)
+        self.assertEqual(cfg["api_key_file"], str(self.root / "profile.key.key"))
+        self.assertEqual(json.loads(config.read_text()), cfg)
+        self.assertGreaterEqual(len(credentials.read_key_file(cfg["api_key_file"])[0]), 32)
+
+    def test_new_profile_directory_is_created_with_a_separate_private_key(self):
+        config = self.root / "new" / "profile.json"
+        cfg = {}
+        prep.write_profile(config, cfg, True)
+        self.assertEqual(json.loads(config.read_text()), cfg)
+        self.assertEqual(Path(cfg["api_key_file"]), self.root / "new" / "profile.json.key")
+        self.assertGreaterEqual(len(credentials.read_key_file(cfg["api_key_file"])[0]), 32)
+
+    def test_profile_or_launcher_cannot_overwrite_an_existing_credential_file(self):
+        script, _ = prep.launcher_contents(self.config)
+        for target in (self.config, script):
+            for create_config in (False, True):
+                with self.subTest(target=target.name, create_config=create_config):
+                    credentials.create_key_file(target, "preserved-key")
+                    cfg = {"api_key_file": str(target)}
+                    before = {path.name: path.read_bytes() for path in self.root.iterdir()}
+                    with self.assertRaisesRegex(ValueError, "separate from"):
+                        prep.write_profile(self.config, cfg, create_config)
+                    self.assertEqual({path.name: path.read_bytes() for path in self.root.iterdir()}, before)
+                    target.unlink()
+
+    def test_readiness_uses_shared_precedence_before_artifact_checks(self):
+        cfg = {"api_key_file": "relative.key", "api_key": "inline-key", "host": "0.0.0.0",
+               "args": ["--pack", str(self.root), "--native", str(self.root / "model.gguf")],
+               "exe": str(self.root / "engine.exe")}
+        with patch.dict(prep.os.environ, {}, clear=True), patch.object(prep, "missing_shards") as artifacts:
+            with self.assertRaisesRegex(ValueError, "absolute path"):
+                prep.check_ready(cfg)
+            artifacts.assert_not_called()
+        with patch.dict(prep.os.environ, {"STRATA_API_KEY": "env-key"}), \
+                patch.object(prep, "missing_shards", return_value=[]) as artifacts:
+            with self.assertRaisesRegex(ValueError, "Not ready yet"):
+                prep.check_ready(cfg)
+            artifacts.assert_called_once()
+        with patch.dict(prep.os.environ, {"STRATA_API_KEY": ""}), \
+                patch.object(prep, "missing_shards", return_value=[]) as artifacts:
+            with self.assertRaisesRegex(ValueError, "empty"):
+                prep.check_ready(cfg)
+            artifacts.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "Not ready yet"):
+                prep.check_ready(cfg, cli_api_key="cli-key")
 
 
 class SharedFiles(unittest.TestCase):

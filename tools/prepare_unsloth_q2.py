@@ -9,7 +9,6 @@ import math
 import os
 from pathlib import Path
 import re
-import secrets
 import shlex
 import subprocess
 import sys
@@ -18,6 +17,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import setup
+from serve.credentials import create_key_file, key_list, read_key_file, remove_created_key, resolve_credentials
 
 MODEL = "UD-Q2_K_XL"
 TAG = "unsloth-ud-q2_k_xl"
@@ -330,7 +330,7 @@ def verify_sources(folder: Path, pack: Path) -> None:
     setup.write_config(receipt, verified)
 
 
-def atomic_files(files: dict[Path, bytes]) -> None:
+def atomic_files(files: dict[Path, bytes], *, executable=()) -> None:
     """Stage every write, then roll back already replaced files if publishing a pair fails."""
     staged, before, published = {}, {}, []
     try:
@@ -342,6 +342,8 @@ def atomic_files(files: dict[Path, bytes]) -> None:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if path in executable:
+                staged[path].chmod(staged[path].stat().st_mode | 0o111)
         for path, temporary in staged.items():
             os.replace(temporary, path)
             published.append(path)
@@ -521,14 +523,20 @@ def config_for(folder: Path, pack: Path, context: int, key_config: Path | None,
            "tokenizer": str(pack / "tokenizer"), "model_name": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
            "log": str(ROOT / f"strata-{PROFILE}.log"), "lib_dirs": lib_dirs, "env": env,
            "gpu": gpu["index"], "gpus_asked": True, "parallel": 1, "port": 8080, "host": "127.0.0.1",
-           "fit_max_tokens": True, "open_browser": False, "api_key": secrets.token_urlsafe(32),
+           "fit_max_tokens": True, "open_browser": False,
            "memory_policy": {"version": POLICY_VERSION, "generated_args": list(args),
                              "generated_env": dict(env), "overrides": overrides or {}, "sample": plan}}
     if key_config and key_config.is_file():
         previous = json.loads(key_config.read_text(encoding="utf-8-sig"))
-        key = previous.get("api_key")
-        if isinstance(key, str) and key.strip():
-            cfg.update(api_key=key, host=previous.get("host", "127.0.0.1"), port=previous.get("port", 8080))
+        keys = key_list(resolve_credentials(previous, environ={}))
+        if len(keys) > 1:
+            raise ValueError("Cannot migrate multiple API keys to one credential file.")
+        if keys:
+            cfg.update(host=previous.get("host", "127.0.0.1"), port=previous.get("port", 8080))
+            if "api_key_file" in previous:
+                cfg["api_key_file"] = previous["api_key_file"]
+            else:
+                cfg["api_key"] = previous["api_key"]
     apply_overrides(cfg, overrides or {})
     return cfg
 
@@ -650,12 +658,12 @@ def refreshed_config(cfg: dict) -> dict:
     return cfg
 
 
-def check_ready(cfg: dict) -> None:
+def check_ready(cfg: dict, *, cli_api_key=None) -> None:
+    key = resolve_credentials(cfg, cli_api_key)
     args = cfg["args"]
     pack = Path(args[args.index("--pack") + 1])
     source = Path(args[args.index("--native") + 1]).parent
-    key = cfg.get("api_key")
-    if cfg.get("host", "127.0.0.1") not in ("127.0.0.1", "localhost", "::1") and not (isinstance(key, str) and key.strip()):
+    if cfg.get("host", "127.0.0.1") not in ("127.0.0.1", "localhost", "::1") and not key_list(key):
         raise ValueError("LAN access requires a saved API key.")
     missing = missing_shards(source)
     required = [Path(cfg["exe"]), pack / "native_experts.txt", pack / "tokenizer/vocab.json",
@@ -688,11 +696,38 @@ def launcher_contents(config: Path) -> tuple[Path, bytes]:
 
 def write_profile(config: Path, cfg: dict, create_config: bool) -> Path:
     script, content = launcher_contents(config)
-    files = {config: json_bytes(cfg)} if create_config else {}
-    files[script] = content
-    atomic_files(files)
-    if os.name != "nt":
-        script.chmod(script.stat().st_mode | 0o111)
+    saved = dict(cfg)
+    created_key = None
+    key_path = None
+    if "api_key_file" in saved:
+        read_key_file(saved["api_key_file"])
+        key_path = Path(saved["api_key_file"])
+    elif create_config:
+        key_path = config.absolute().with_name(config.name + ".key")
+    if key_path is not None and key_path.exists():
+        if any(target.exists() and key_path.samefile(target) for target in (config, script)):
+            raise ValueError("API credential file must be separate from the profile and launcher.")
+    if create_config:
+        if "api_key_file" not in saved:
+            keys = key_list(resolve_credentials(saved, environ={}))
+            if len(keys) > 1:
+                raise ValueError("Cannot migrate multiple API keys to one credential file.")
+            identity = create_key_file(key_path, keys[0] if keys else None)
+            if identity is not None:
+                created_key = (key_path, identity)
+            saved["api_key_file"] = str(key_path)
+        saved.pop("api_key", None)
+    try:
+        files = {config: json_bytes(saved)} if create_config else {}
+        files[script] = content
+        atomic_files(files, executable=(script,) if os.name != "nt" else ())
+    except BaseException:
+        if created_key is not None:
+            remove_created_key(*created_key)
+        raise
+    if create_config:
+        cfg.clear()
+        cfg.update(saved)
     return script
 
 
@@ -708,7 +743,7 @@ def admit_automatic_launch(plan: dict) -> None:
                          f"only {plan['expert_pool_gib']:g} GiB remains after policy allowances.")
 
 
-def prepare_launch(config: Path, *, gpu=None) -> dict:
+def prepare_launch(config: Path, *, gpu=None, cli_api_key=None) -> dict:
     """Prepare an automatic profile once, before the server creates its engine.
 
     A CLI GPU selection applies to this launch's sample and engine only; the
@@ -722,7 +757,10 @@ def prepare_launch(config: Path, *, gpu=None) -> dict:
         return cfg
     cfg = refreshed_config(cfg)
     admit_automatic_launch(cfg["memory_policy"]["sample"])
-    check_ready(cfg)
+    if cli_api_key is None:
+        check_ready(cfg)
+    else:
+        check_ready(cfg, cli_api_key=cli_api_key)
     report_memory(cfg["memory_policy"]["sample"], cfg)
     if config.read_bytes() != original:
         raise ValueError("Configuration changed while checking readiness; launch again to preserve those edits.")
@@ -743,9 +781,6 @@ def launch(config: Path) -> int:
     env = dict(os.environ)
     for name in ("STRATA_VERIFY_PROFILE", "STRATA_DECODE_TIMING", "STRATA_FETCH_PROFILE"):
         env.pop(name, None)  # Explicit config env values are still applied by the server.
-    if isinstance(cfg.get("api_key"), str) and cfg["api_key"].strip():
-        # server.py gives the inherited key precedence over config; keep this profile's saved credential effective.
-        env = {key: value for key, value in env.items() if key.upper() != "STRATA_API_KEY"}
     return subprocess.run(command, cwd=ROOT, env=env).returncode
 
 
@@ -804,7 +839,8 @@ def main(argv=None) -> int:
             report_memory(preview["memory_policy"]["sample"], preview, sampled_now=not existing or a.plan)
         if a.plan:
             safe = {"config": str(a.config), "existing_config_preserved": existing, "exe": cfg["exe"],
-                    "context": flag_value(cfg["args"], "--max-context"), "api_key_enabled": bool(cfg.get("api_key")),
+                    "context": flag_value(cfg["args"], "--max-context"),
+                    "api_key_enabled": not existing or bool(cfg.get("api_key_file") or cfg.get("api_key")),
                     "host": cfg.get("host", "127.0.0.1"), "port": cfg.get("port", 8080),
                     "fit_max_tokens": cfg.get("fit_max_tokens"), "open_browser": cfg.get("open_browser"),
                     "pending_shards": missing_shards(folder)}
@@ -819,7 +855,7 @@ def main(argv=None) -> int:
                                 "--compat-bf16"], env=env, cwd=ROOT, check=True)
         script = write_profile(a.config, cfg, create_config=not existing)
         if not existing:
-            print(f"Wrote {a.config.name}; saved API key enabled: {bool(cfg.get('api_key'))}.")
+            print(f"Wrote {a.config.name}; saved API key enabled: {bool(cfg.get('api_key_file'))}.")
         else:
             print("Existing config preserved. Configuration options apply only when creating a new config.")
         print(f"Launcher: {script.name}")

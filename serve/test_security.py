@@ -11,12 +11,14 @@ import io
 import json
 import socket
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
+from serve.credentials import create_key_file, resolve_credentials
 from serve.server import (ByteTokenizer, MockEngine, Service, allowed_hosts_of, host_allowed,  # noqa: E402
                           host_name, host_names_for, origin_allowed, serve)
 
@@ -187,6 +189,23 @@ class OverHttp(unittest.TestCase):
                                 {"Content-Type": "application/json", "Authorization": "Bearer s3cret"}, host=tunnel)
         self.assertEqual(code, 200)
         self.assertNotIn("refused", log)
+
+    def test_file_key_with_comma_authenticates_literally_without_leaking(self):
+        with tempfile.TemporaryDirectory(prefix="strata-pair-u1-credentials-r2-http-") as directory:
+            path = Path(directory) / "api.key"
+            create_key_file(path, "literal,file-key")
+            self.start(api_key=resolve_credentials({"api_key_file": str(path)}, environ={}))
+            for header in ({}, {"Authorization": "Bearer literal"}, {"x-api-key": "file-key"}):
+                code, body, log = self.req("GET", "/v1/models", headers=header)
+                self.assertEqual(code, 401)
+                self.assertNotIn("literal,file-key", json.dumps(body) + log)
+            for header in ({"Authorization": "Bearer literal,file-key"}, {"x-api-key": "literal,file-key"}):
+                code, body, log = self.req("GET", "/v1/models", headers=header)
+                self.assertEqual(code, 200)
+                self.assertNotIn("literal,file-key", json.dumps(body) + log)
+            code, body, log = self.req("GET", "/v1/status", headers={"x-api-key": "literal,file-key"})
+            self.assertEqual(code, 200)
+            self.assertNotIn("literal,file-key", json.dumps(body) + log)
 
     def test_a_trusted_origin_s_host_is_allowed(self):
         self.start(trusted_origins=["https://strata.example.com"])

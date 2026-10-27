@@ -121,6 +121,7 @@ class Startup(unittest.TestCase):
         for name, content in (("vocab.json", "{}"), ("merges.txt", ""), ("token_type.json", "[]")):
             (tokenizer / name).write_text(content)
         cfg = prep.config_for(root / "source", root / "pack", 131072, None)
+        cfg["api_key"] = "startup-legacy-fixture-credential"
         cfg.update(tokenizer=str(tokenizer), gpu=0, host="0.0.0.0", port=8182, open_browser=True)
         cfg["env"]["STRATA_DECODE_TIMING"] = "explicit"
         path = root / "profile.json"
@@ -183,7 +184,7 @@ class Startup(unittest.TestCase):
                         self.assertNotIn("launch_memory", svc.metrics())
                     self.assertEqual(svc.config_path, str(path))
                     self.assertEqual(svc.shared_path, str(path.with_suffix("")) + ".shared-settings.json")
-                    self.assertEqual(svc.api_key, cfg["api_key"] if helper else "inherited")
+                    self.assertEqual(svc.api_key, "inherited")
                     self.assertEqual(http.call_args.kwargs, {"host": "0.0.0.0", "port": 8182})
                     self.assertEqual(browser.call_count, int(helper))
                     saved = json.loads(path.read_text())
@@ -191,6 +192,92 @@ class Startup(unittest.TestCase):
                     self.assertEqual((saved["host"], saved["port"], saved["api_key"]),
                                      ("0.0.0.0", 8182, cfg["api_key"]))
                     self.assertEqual(path.read_bytes(), original)
+
+    def test_automatic_startup_uses_credentials_from_final_prepared_config(self):
+        from serve import credentials
+        from tools import prepare_unsloth_q2 as prep
+        for source in ("api_key", "api_key_file"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch.object(prep, "detected_memory", return_value={"ram_gib": 64,
+                        "available_gib": 48, "commit_available_gib": 48, "windows_commit": True}), \
+                    patch.object(prep, "detected_gpu", return_value={"vram_gb": 6, "index": 0}), \
+                    patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                    patch.object(prep, "missing_shards", return_value=[]):
+                path, final = self.fixture(Path(directory), prep)
+                final.pop("build_metadata", None)
+                initial = dict(final)
+                initial.pop("api_key", None)
+                initial["host"] = "127.0.0.1"
+                if source == "api_key_file":
+                    key = Path(directory) / "api.key"
+                    credentials.create_key_file(key, "literal,prepared-key")
+                    final.pop("api_key")
+                    final["api_key_file"] = str(key)
+                path.write_bytes(prep.json_bytes(final))
+                read_text = Path.read_text
+                def observed_text(target, *args, **kwargs):
+                    # Main's first read precedes preparation's two consistent reads.
+                    return json.dumps(initial) if target == path else read_text(target, *args, **kwargs)
+                checked = []
+                ready = prep.check_ready
+                def check_ready(cfg, **kwargs):
+                    checked.append(credentials.resolve_credentials(cfg, kwargs.get("cli_api_key")))
+                    return ready(cfg, **kwargs)
+                with patch.object(Path, "read_text", observed_text), \
+                        patch.object(Path, "is_file", return_value=True), \
+                        patch.object(prep, "check_ready", side_effect=check_ready):
+                    _, http, _ = self.run_main(path)
+                svc = http.call_args.args[0]
+                self.assertEqual(svc.api_key, checked[0])
+                self.assertTrue(svc.api_key)
+                self.assertEqual(http.call_args.kwargs["host"], "0.0.0.0")
+                handler_type = server.make_handler(svc)
+                handler = handler_type.__new__(handler_type)
+                handler.headers = {}
+                handler._json = lambda *args: None
+                self.assertFalse(handler._authorized())
+
+    def test_file_and_environment_credentials_reach_direct_and_helper_server(self):
+        from serve.credentials import create_key_file
+        from tools import prepare_unsloth_q2 as prep
+        for helper in (False, True):
+            for inherited in (None, "environment,key"):
+                with self.subTest(helper=helper, inherited=inherited), tempfile.TemporaryDirectory(
+                        prefix="strata-pair-u1-credentials-r2-startup-") as directory, \
+                        patch.object(prep, "detected_memory", return_value={"ram_gib": 64,
+                            "available_gib": 48, "commit_available_gib": 48, "windows_commit": True}), \
+                        patch.object(prep, "detected_gpu", return_value={"vram_gb": 6, "index": 0}), \
+                        patch.object(prep.setup, "find_nvcc", return_value=(None, None)), \
+                        patch.object(prep, "check_ready"), patch.dict(os.environ, {}, clear=True):
+                    path, cfg = self.fixture(Path(directory), prep)
+                    key_path = Path(directory) / "api.key"
+                    create_key_file(key_path, "literal,file-key")
+                    cfg.pop("api_key")
+                    cfg["api_key_file"] = str(key_path)
+                    path.write_bytes(prep.json_bytes(cfg))
+                    original = path.read_bytes()
+                    if inherited is not None:
+                        os.environ["STRATA_API_KEY"] = inherited
+                    observed = {}
+                    def invoke(command, **kwargs):
+                        with patch.dict(os.environ, kwargs["env"], clear=True):
+                            observed["main"] = self.run_main(path, command[2:])
+                        return SimpleNamespace(returncode=0)
+                    if helper:
+                        with patch.object(prep.subprocess, "run", side_effect=invoke):
+                            self.assertEqual(prep.launch(path), 0)
+                        create, http, _ = observed["main"]
+                    else:
+                        create, http, _ = self.run_main(path)
+                    self.assertEqual(http.call_args.args[0].api_key,
+                                     ["literal,file-key"] if inherited is None else "environment,key")
+                    self.assertNotIn("STRATA_API_KEY", create.call_args.kwargs["env"])
+                    self.assertEqual(path.read_bytes(), original)
+                    # CLI wins even over an explicitly empty environment value.
+                    os.environ["STRATA_API_KEY"] = ""
+                    _, http, _ = self.run_main(path, ["--api-key", "cli,key"])
+                    self.assertEqual(http.call_args.args[0].api_key, "cli,key")
 
     def test_launch_memory_metrics_reach_http_from_once_refreshed_consumed_plan(self):
         from tools import prepare_unsloth_q2 as prep
@@ -1095,7 +1182,7 @@ class Startup(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                 server.main()
             self.assertEqual(error.exception.code, 2)
-            prepare.assert_called_once_with(path, gpu=None)
+            prepare.assert_called_once_with(path, gpu=None, cli_api_key=None)
             engine.assert_not_called()
             http.assert_not_called()
 

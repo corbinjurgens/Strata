@@ -25,7 +25,6 @@ import contextlib
 import collections
 import base64
 import hashlib
-import hmac
 import codecs
 import ctypes
 import json
@@ -59,6 +58,8 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve.credentials import (api_key_of as api_key_of, key_list as key_list,
+                               key_matches, resolve_credentials)
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -2378,6 +2379,7 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     env = config_environment(cfg, env)
+    env = {name: value for name, value in env.items() if name.upper() != "STRATA_API_KEY"}
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -5556,50 +5558,6 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
-def key_list(value) -> list[str]:
-    """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
-    separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
-    the way to give a key that contains a comma).  A list is taken as it is."""
-    if value is None or value == "":
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(k) for k in value if str(k)]
-    return [k.strip() for k in str(value).split(",") if k.strip()]
-
-
-def api_key_of(value):
-    """The key as a client can send it (#725).  An HTTP header loses the spaces and line ends around its value, so a
-    key kept with them (a config file or an environment file with CRLF line ends, a quoted " key ") matched no
-    request: every client got 401 with the right key.  A value that is only such characters raises ValueError, it
-    never means "no key" (#213).  #1344: a config list of keys returns the list (each key stripped, none empty); a
-    string stays a string (its commas separate keys, see key_list)."""
-    if isinstance(value, (list, tuple)):
-        keys = [str(k).strip() for k in value]
-        if not keys or any(not k for k in keys):
-            raise ValueError("an API key was given but it is empty")
-        return keys
-    key = "" if value is None else str(value)
-    if key and not key_list(key):
-        raise ValueError("an API key was given but it is empty")
-    return key.strip()
-
-
-def key_matches(given: str, key) -> bool:
-    """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
-    arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
-    bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213).  #1344: `key` may name several
-    keys (see key_list); the given one must match any, and every key is compared whatever the outcome."""
-    raw = given.encode("latin-1", "replace")
-    ok = False
-    for k in key_list(key):
-        ok |= hmac.compare_digest(raw, k.encode())
-        try:
-            ok |= hmac.compare_digest(raw, k.encode("latin-1"))
-        except UnicodeEncodeError:
-            pass
-    return ok
-
-
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
     """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
     request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
@@ -5774,7 +5732,7 @@ def main() -> int:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
+    ap.add_argument("--api-key", default=None,
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
@@ -5811,10 +5769,15 @@ def main() -> int:
         from tools.prepare_unsloth_q2 import prepare_launch
         gpu = (int(a.gpu) if a.gpu.strip().isdigit() else a.gpu) if a.gpu is not None else None
         try:
-            cfg = prepare_launch(Path(a.config), gpu=gpu)
+            cfg = prepare_launch(Path(a.config), gpu=gpu, cli_api_key=a.api_key)
             automatic = True
         except (OSError, ValueError) as e:
             ap.error(str(e))
+    try:
+        api_key = resolve_credentials(cfg, a.api_key)
+    except ValueError as e:
+        print(f"[strata] {e}", file=sys.stderr)
+        return 2
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -5914,20 +5877,7 @@ def main() -> int:
         raise SystemExit(f"[strata] config {e}")
     if svc.aliases:
         print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
-    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
-                for i, x in enumerate(sys.argv)):
-        # #213: an empty key would switch authentication off without a word
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
-              file=sys.stderr)
-        return 2
-    try:
-        svc.api_key = api_key_of(a.api_key or cfg.get("api_key", ""))
-    except ValueError as e:
-        print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
-        return 2
-    if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
-        print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
-              "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    svc.api_key = api_key
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
