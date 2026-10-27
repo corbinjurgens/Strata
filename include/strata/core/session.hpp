@@ -26,6 +26,16 @@
 
 namespace strata::core {
 
+/// Explicit count-only KV policy. Does not consult process-global KV modes.
+struct SessionSizing {
+    enum class Kv { Fp16, Int8, Q4, Hybrid };
+    Kv kv = Kv::Int8;
+    int64_t resident_cells = 0;
+    bool elastic = false;
+};
+uint64_t qsa_state_bytes_for(const ModelGeometry& g, int64_t cells, bool rope, const SessionSizing& sizing);
+uint64_t session_bytes_for(const ModelGeometry& g, int64_t cells, int64_t k, const SessionSizing& sizing);
+
 /// Everything a sequence needs that is NOT a weight: the per-layer state, the block scratch, and the pinned
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {

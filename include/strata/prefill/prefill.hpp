@@ -46,6 +46,23 @@ namespace strata::prefill {
 
 class Prefill {
 public:
+    static constexpr int staging_slots = 8;
+    static constexpr int streaming_ring_min = 16;
+    static constexpr int native_ring_capacity = 512;
+    static constexpr bool valid_native_ring(uint64_t slots) {
+        return slots == staging_slots || (slots >= streaming_ring_min && slots <= native_ring_capacity);
+    }
+    /// Captured allocation inventory; counting it needs neither globals nor an allocated SessionState.
+    struct Sizing {
+        uint64_t weight_scratch = 0, workspace = 0, common = 0, region = 0;
+        uint64_t max_blob = 0, chunk = 0, experts = 0;
+        int ring = 0;
+        bool mmq = false, ring_enabled = true, reserve_bo = true, stage_own = false;
+        std::vector<uint64_t> kv_runs;
+    };
+    static Sizing sizing_inputs(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
+                                const core::SessionSizing& kv);
+    static uint64_t bytes_needed_for(const Sizing& inputs, bool owned_pages);
     /// E-9: the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual rows `R_rows`
     /// (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs and its idle
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another

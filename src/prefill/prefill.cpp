@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -99,7 +100,7 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
-constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
+constexpr int STAGE = Prefill::staging_slots; // host->device staging below stream_all_min()
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
 // Opt-in routed-only staging at the original chunk threshold and GPU ring size. The fallback uses eight of
 // those slots and full-chunk MoE buffers; it can select different expert kernels from the streamed walk.
@@ -273,7 +274,7 @@ inline bool fused_ring() {
 }
 // the largest ring: 512 slots; 1024 with the Q2_0 pack's fused experts (P3's smaller buffers, measured there) - the
 // native packs' fused layers were measured at 512
-inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_layout().native ? RING_MAX : 512; }
+inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_layout().native ? RING_MAX : Prefill::native_ring_capacity; }
 // The ring's budget in bytes: the measured slot counts above, at the blob size they were measured with.  It is
 // bytes and not slots because a slot is one whole blob and the blob is the pack's - see the note above.
 inline constexpr uint64_t Q2_0_BLOB = 1382400ull;   // the blob of the pack the ring was tuned on
@@ -326,7 +327,7 @@ inline int ring_slots(size_t T) {
     const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
-    const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
+    const int big = r < Prefill::streaming_ring_min ? Prefill::streaming_ring_min : r > ring_cap() ? ring_cap() : r;
     return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
@@ -409,9 +410,14 @@ struct Alloc {
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
     template <typename T> T* take(size_t n, bool& ok) {
+        if (n > (UINT64_MAX - 4096) / sizeof(T)) throw std::overflow_error("prefill allocation size overflow");
         uint64_t bytes = detail::buffer_bytes((uint64_t) n * sizeof(T));
         if (count_only) {
-            if (granule > 0) bytes = (bytes + granule - 1) / granule * granule;
+            if (granule > 0) {
+                if (bytes > UINT64_MAX - (granule - 1)) throw std::overflow_error("prefill allocation alignment overflow");
+                bytes = (bytes + granule - 1) / granule * granule;
+            }
+            if (used > UINT64_MAX - bytes) throw std::overflow_error("prefill workspace size overflow");
             used += bytes;
             return nullptr;
         }
@@ -1962,43 +1968,80 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
     return bytes_needed_impl(g, ss, chunk, true);
 }
 
-uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                    bool owned_pages) {
-    // the same allocation sequence as `init`, counted
-    if (chunk <= 0) return 0;
+Prefill::Sizing Prefill::sizing_inputs(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
+                                       const core::SessionSizing& kv) {
+    if (cells <= 0 || chunk <= 0)
+        throw std::invalid_argument("unsupported prefill count geometry");
+    Sizing i;
     const size_t T = (size_t) chunk;
-    bool ok = true;
-    Alloc o;
-    o.count_only = true;
-    if (owned_pages) o.granule = 2ull << 20;
-    o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok);
-    o.take<uint8_t>(GEMM_WS, ok);
-    auto f = [&](size_t n) { o.take<float>(n, ok); };
-    const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
-    if (owned_pages) o.take<uint8_t>((size_t) common_set_bytes(T, f16_io, false, !emb_reuse_account()), ok);
-    else o.used += common_set_bytes(T, f16_io, !ring_bytes_on(), !emb_reuse_account());
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
+    i.chunk = T; i.experts = g.n_expert;
+    i.weight_scratch = weight_scratch_layout().bytes;
+    i.workspace = GEMM_WS;
+    i.ring = ring_slots(T); i.max_blob = MAXBLOB(); i.mmq = mmq_plan().any;
+    i.ring_enabled = ring_bytes_on(); i.reserve_bo = !emb_reuse_account(); i.stage_own = stage_own();
+    i.common = common_set_bytes(T, prompt_f16(), false, i.reserve_bo);
+    auto s = strata::kernels::qsa_real_shapes();
+    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     const auto batches = detail::prompt_batch_caps(T);
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, batches.select, batches.attention, s),
-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
-    if (mmq_plan().any) {
-        o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+    i.region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, cells / s.idx_block + 2,
+                         batches.select, batches.attention, s), moe_set_bytes(T, g.n_expert, fused_layout(T, true))});
+    if (kv.resident_cells > 0 && kv.resident_cells < cells) {
+        const uint64_t pages = (uint64_t) (cells + s.page_size - 1) / s.page_size;
+        const uint64_t rows = pages * s.n_head_kv * s.page_size;
+        using Kv = core::SessionSizing::Kv;
+        if (kv.kv == Kv::Q4) i.kv_runs = {rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim),
+                                                          rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim)};
+        else if (kv.kv == Kv::Hybrid) i.kv_runs = {rows * s.head_dim, rows * (s.head_dim / 64) * 2,
+                                                          rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim)};
+        else if (kv.kv == Kv::Int8) i.kv_runs = {rows * s.head_dim, rows * s.head_dim,
+                                                rows * (s.head_dim / 64) * 2, rows * (s.head_dim / 64) * 2};
+        else i.kv_runs = {rows * s.head_dim * 2, rows * s.head_dim * 2};
+    }
+    return i;
+}
+
+uint64_t Prefill::bytes_needed_for(const Sizing& i, bool owned_pages) {
+    if (i.chunk == 0) return 0;
+    if (i.chunk > SIZE_MAX / N || i.experts > 512 || i.ring < 0 || i.ring > 1024 || i.max_blob > (1ull << 30) ||
+        i.weight_scratch > (64ull << 30) || i.workspace > (64ull << 30) || i.common > (64ull << 30) ||
+        i.region > (64ull << 30) || i.kv_runs.size() > 4)
+        throw std::invalid_argument("unbounded prefill count inventory");
+    for (auto run : i.kv_runs) if (run > (64ull << 30)) throw std::invalid_argument("unbounded prefill KV run");
+    bool ok = true;
+    Alloc o; o.count_only = true;
+    if (owned_pages) o.granule = 2ull << 20;
+    o.take<uint8_t>((size_t) i.weight_scratch, ok);
+    o.take<uint8_t>((size_t) i.workspace, ok);
+    if (owned_pages) o.take<uint8_t>((size_t) i.common, ok);
+    else o.used += i.common;
+    o.take<uint8_t>((size_t) i.region, ok);
+    if (i.mmq) {
+        o.take<int32_t>((size_t) i.chunk * K, ok);
+        o.take<int32_t>((size_t) (2 * (i.experts + i.experts / MMQ_GROUP + 2)), ok);
     }
     if (owned_pages) {
-        if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
-    } else {
-        for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
-    }
-    f(T * N);
-    f((size_t) strata::kernels::NG_HC_DIM);
-    strata::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok);
-    return o.used + (8u << 20);   // alignment slack
+        if (i.ring > 0) o.take<uint8_t>((size_t) i.ring * (size_t) i.max_blob, ok);
+    } else for (int r = 0; r < i.ring; ++r) o.take<uint8_t>((size_t) i.max_blob, ok);
+    o.take<float>((size_t) i.chunk * N, ok);
+    o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
+    if (!i.stage_own) for (uint64_t run : i.kv_runs) o.take<uint8_t>((size_t) run, ok);
+    return o.used + (8u << 20);
+}
+
+uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                    bool owned_pages) {
+    if (chunk <= 0) return 0;
+    const auto& q = ss.qsa_states[ss.qsa_primary()];
+    core::SessionSizing kv;
+    using Kv = core::SessionSizing::Kv;
+    kv.kv = q.kv_hybrid ? Kv::Hybrid : q.kv_q4 ? Kv::Q4 : q.kv_int8 ? Kv::Int8 : Kv::Fp16;
+    kv.resident_cells = q.kv_mode == 1 ? q.n_slots * strata::kernels::qsa_real_shapes().page_size : 0;
+    auto i = sizing_inputs(g, q.max_cells, chunk, kv);
+    // Legacy borrowed pricing includes its compatibility common/ring inventory.
+    if (!owned_pages) i.common = common_set_bytes((size_t) chunk, prompt_f16(), !ring_bytes_on(), !emb_reuse_account());
+    return bytes_needed_for(i, owned_pages);
 }
 
 uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {

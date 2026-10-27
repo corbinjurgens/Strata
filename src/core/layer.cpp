@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/session.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -40,6 +41,7 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <stdexcept>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
@@ -652,15 +654,24 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     }
     return p;
 }
-uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
+uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8, bool q4) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
                rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
     }
-    if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    if (q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
+}
+uint64_t qsa_count(const QsaShapes& s, const KvPlan& p, int64_t cells, bool rope, uint64_t pool) {
+    uint64_t n = pool;
+    n += (uint64_t) p.pages * 4;
+    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;
+    n += (uint64_t) s.idx_block * s.idx_dim * 4 + (uint64_t) p.pooled_rows * s.idx_dim * 4 + 16;
+    if (rope) n += (uint64_t) cells * (s.n_rot / 2) * 8;
+    n += strata::kernels::qsa_step_bytes() + 16 + (uint64_t) s.n_head * 4;
+    return align_up16(n) + 256;
 }
 }  // namespace
 
@@ -672,20 +683,26 @@ uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
-    uint64_t n = 0;
+    uint64_t pool = 0;
     if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
-        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
-    n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
-    n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
-    n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
-    n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
-    n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
-    n += (uint64_t) s.n_head * 4;                                              // pos_dev
-    return align_up16(n) + 256;
+        pool = kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
+                           g_kv_int8 || g_kv_hybrid, g_kv_q4) + 4 * 16;   // K/V pools (the VRAM slots)
+    return qsa_count(s, p, max_cells, with_rope, pool);
+}
+
+uint64_t qsa_state_bytes_for(const ModelGeometry& g, int64_t max_cells, bool with_rope, const SessionSizing& sizing) {
+    if (max_cells <= 0 || max_cells > 1048576 || sizing.resident_cells < 0 || sizing.resident_cells > 1048576 ||
+        (int)sizing.kv < 0 || (int)sizing.kv > 3 || g.n_head != 24 || g.n_head_kv != 2 ||
+        g.head_dim != 256 || g.idx_q_heads != 4 || g.idx_key_dim != 128)
+        throw std::invalid_argument("unsupported QSA count geometry");
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = max_cells / s.page_size + (max_cells % s.page_size != 0);
+    const int64_t resident = std::max<int64_t>(sizing.resident_cells, 20480);
+    const int64_t slots = sizing.resident_cells > 0 ? std::min(pages, (resident + s.page_size - 1) / s.page_size) : pages;
+    const uint64_t pool = kv_pool_bytes(s, slots, sizing.kv == SessionSizing::Kv::Hybrid,
+                                       sizing.kv == SessionSizing::Kv::Int8, sizing.kv == SessionSizing::Kv::Q4);
+    const KvPlan p{slots < pages ? 1 : 0, pages, slots, max_cells / s.idx_block + 2};
+    return qsa_count(s, p, max_cells, with_rope, sizing.elastic && slots == pages ? 0 : pool + 4 * 16);
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,

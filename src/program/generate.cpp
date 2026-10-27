@@ -20,6 +20,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
+#include "strata/plan/launch.hpp"
 #include "strata/core/expert_cache_retry.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -646,6 +647,7 @@ struct Options {
 };
 
 void usage() {
+    std::fprintf(stderr, "  --resolve-launch    metadata-only native settings/estimates; strict replay is not yet available\n");
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
@@ -1561,6 +1563,9 @@ double pcie_frac_for_gbps(double gbps, double base) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--resolve-launch") == 0)
+            return strata::plan::launch_metadata_main(argc, argv);
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -2898,9 +2903,8 @@ int main(int argc, char** argv) {
         const strata::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
         const strata::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
         const strata::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
-        if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
-            std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
-                                 "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
+        if (!wt.check_ple_metadata(err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
@@ -2931,15 +2935,6 @@ int main(int argc, char** argv) {
         // a plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is
         // refused here (#255, gopinath87607).  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0
         // (verbatim 2-byte F16) in the canonical Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
-        const bool f16 = wc->kind == strata::core::WeightKind::F16InF32 ||
-                         (wc->kind == strata::core::WeightKind::Verbatim && wc->code_bits == 0);
-        if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
-            std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
-                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
-                                 "tools/iq_pack.py\n",
-                         (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
-            return 1;
-        }
         ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
         ss.ple.consts = strata::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
@@ -6268,12 +6263,9 @@ int main(int argc, char** argv) {
     // allocated, then finalize the target after required startup buffers. Lazy growth also checks the same
     // physical/commit headroom at allocation time (4 GiB without resident experts).
     bool file_cache_compact = false;
-    if (const char* v = std::getenv("STRATA_FILE_CACHE_COMPACT"); v != nullptr && v[0] != '\0') {
-        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0) {
-            std::fprintf(stderr, "strata generate: STRATA_FILE_CACHE_COMPACT must be 0 or 1\n");
-            return 2;
-        }
-        file_cache_compact = v[0] == '1';
+    if (!strata::core::parse_file_cache_compact(std::getenv("STRATA_FILE_CACHE_COMPACT"), file_cache_compact, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 2;
     }
     const char* file_cache_request = std::getenv("STRATA_FILE_CACHE_MIB");
     const bool file_cache_given = file_cache_request != nullptr && file_cache_request[0] != '\0';

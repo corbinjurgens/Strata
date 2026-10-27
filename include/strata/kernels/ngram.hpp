@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <string>
 
+namespace strata { class GgufFile; }
+
 namespace strata::kernels {
 
 // ---- geometry, every value confirmed against the artifact (docs/gguf-metadata.txt) ----
@@ -167,6 +169,8 @@ struct PleIoOptions {
 /// translation unit that wants the hash.
 class PleTable {
 public:
+    /// Validate the table header and span without mapping payloads or starting readers.
+    static bool check_metadata(const strata::GgufFile& file, std::string& err);
     PleTable();
     ~PleTable();
     PleTable(const PleTable&) = delete;

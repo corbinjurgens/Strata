@@ -863,14 +863,8 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         err = "FileExpertSource: cannot size " + path;
         return false;
     }
-    if ((uint64_t) sz.QuadPart != want) {
-        char buf[400];
-        std::snprintf(buf, sizeof buf,
-                      "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
-                      "the pack this geometry came from",
-                      path.c_str(), (unsigned long long) sz.QuadPart, (unsigned long long) want);
+    if (!check_expert_file_size(path, (uint64_t)sz.QuadPart, want, err)) {
         CloseHandle(f);
-        err = buf;
         return false;
     }
     HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
@@ -895,15 +889,8 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
     if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
-    if (st.st_size < 0 || (uint64_t) st.st_size != want) {
-        char buf[400];
-        std::snprintf(buf, sizeof buf,
-                      "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
-                      "the pack this geometry came from",
-                      path.c_str(), (unsigned long long) (st.st_size < 0 ? 0 : st.st_size),
-                      (unsigned long long) want);
+    if (!check_expert_file_size(path, st.st_size < 0 ? 0 : (uint64_t)st.st_size, want, err)) {
         ::close(fd);
-        err = buf;
         return false;
     }
     void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
@@ -4052,6 +4039,28 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
     for (int64_t l = 0; l < lay.n_layers; ++l)
         for (int r = 0; r < 3; ++r)
             inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
+}
+
+bool check_expert_file_size(const std::string& path, uint64_t actual, uint64_t required, std::string& err) {
+    if (actual == required) return true;
+    char buf[400];
+    std::snprintf(buf, sizeof buf,
+                  "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
+                  "the pack this geometry came from",
+                  path.c_str(), (unsigned long long)actual, (unsigned long long)required);
+    err = buf;
+    return false;
+}
+
+bool parse_file_cache_compact(const char* value, bool& compact, std::string& err) {
+    compact = false;
+    if (!value || !*value) return true;
+    if (std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+        err = "STRATA_FILE_CACHE_COMPACT must be 0 or 1";
+        return false;
+    }
+    compact = *value == '1';
+    return true;
 }
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {

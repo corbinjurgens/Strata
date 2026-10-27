@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <stdexcept>
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
 // spin is just less polite to the pipeline.
@@ -51,6 +52,13 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
+static uint64_t session_count(const ModelGeometry& g, int64_t cells, int64_t k, int64_t gdn_n,
+                               uint64_t qsa_states) {
+    uint64_t n = gdn_buffers_bytes(g) + (uint64_t) gdn_n * gdn_state_floats(g) * 4 + qsa_states;
+    n += qsa_buffers_bytes(g, cells) + moe_buffers_bytes(g, k) + block_buffers_bytes(g) + ple_hist_bytes();
+    return align_up(n, SESSION_STATE_ALIGN) + 4096;
+}
+
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
@@ -59,17 +67,25 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     const int64_t q_lo = layer_lo / I, q_hi = layer_hi / I;
     const int64_t q_n = std::max<int64_t>(q_hi - q_lo, g.n_qsa_layers() > 0 ? 1 : 0);
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
-    uint64_t n = 0;
-    n += gdn_buffers_bytes(g);
-    n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
+    uint64_t qsa = 0;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
-    n += qsa_buffers_bytes(g, max_cells);
-    n += moe_buffers_bytes(g, k);
-    n += block_buffers_bytes(g);
-    n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
-    return align_up(n, SESSION_STATE_ALIGN) + 4096;
+        qsa = qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+    return session_count(g, max_cells, k, gdn_n, qsa);
+}
+
+uint64_t session_bytes_for(const ModelGeometry& g, int64_t cells, int64_t k, const SessionSizing& sizing) {
+    if (cells <= 0 || cells > 1048576 || k != 10 || g.n_embd != 2560 || g.n_layers != 48 ||
+        g.qsa_interval != 4 || g.n_expert <= 0 || g.n_expert > 512 || g.n_ff != 640 ||
+        g.ssm_state_size != 128 || g.ssm_v_heads != 48 || g.ssm_conv_channels != 10240 || g.ssm_d_conv != 4 ||
+        g.ssm_value_dim != 6144 || g.hc != 4 || g.hc_lr != 320)
+        throw std::invalid_argument("unsupported session count geometry");
+    // Same arena inventory as session_bytes, replacing only the policy-dependent QSA states.
+    uint64_t qsa = 0;
+    if (g.n_qsa_layers() > 0)
+        qsa = qsa_state_bytes_for(g, cells, true, sizing) +
+             (uint64_t) (g.n_qsa_layers() - 1) * qsa_state_bytes_for(g, cells, false, sizing);
+    return session_count(g, cells, k, g.n_gdn_layers(), qsa);
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,

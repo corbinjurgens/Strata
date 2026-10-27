@@ -12,6 +12,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <limits>
+#include <charconv>
+#include <climits>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -42,6 +47,57 @@ struct IndexRow {
     bool raw16 = false;   ///< plan v0.3 P6: already 16-bit in the file (kinds 4/5)
 };
 
+bool parse_index_row(const char* line, IndexRow& r, std::string& err) {
+    char name[256] = {0};
+    int kind = 0;
+    // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
+    // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
+    const int n = std::sscanf(line,
+                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64 " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
+                  name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+                  &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
+                  &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
+                  &r.scales_fp16, &r.act_kind);
+    if (n != 19) {
+        // A malformed index line is a WRONG BYTE OFFSET waiting to happen, and a wrong offset decodes to
+        // a plausible weight.  Refuse loudly instead of loading the rows that happened to parse.
+        err = "index.txt: could not parse a row (" + std::to_string(n) + " of 19 fields)";
+        return false;
+    }
+    r.name = name;
+    // plan v0.3 P6: a standalone native pack (tools/iq_pack.py) stores 16-bit floats as they are in the GGUF:
+    // index kinds 4 (BF16) and 5 (F16) are copied and take the engine forms of kinds 1 and 3
+    if (kind == 4 || kind == 5) {
+        r.raw16 = true;
+        kind = kind == 4 ? (int) WeightKind::Bf16InF32 : (int) WeightKind::F16InF32;
+    }
+    r.kind = (WeightKind) kind;
+    return true;
+}
+
+WeightRef index_ref(const IndexRow& r) {
+    WeightRef wr;
+    wr.bytes = r.dst_bytes;
+    wr.ne0 = r.ne0;
+    wr.ne1 = r.ne1;
+    wr.elements = r.ne0 * (r.ne1 > 0 ? r.ne1 : 1);
+    wr.kind = r.kind;
+    wr.code_bits = r.code_bits;
+    wr.code_bias = r.code_bias;
+    wr.group_elems = r.group_elems;
+    wr.codebook_iq4nl = r.codebook != 0;
+    wr.has_offset = r.has_offset != 0;
+    wr.codes_bytes = r.codes_bytes;
+    wr.scales_bytes = r.scales_bytes;
+    wr.offset_bytes = r.offset_bytes;
+    wr.src_off = r.src_off;
+    wr.src_bytes = r.src_bytes;
+    wr.file_id = r.file;
+    wr.scales_fp16 = r.scales_fp16 != 0;
+    wr.act_kind = r.act_kind;
+    return wr;
+}
+
 /// How a segment's bytes must be transformed on the way from the pack to the arena.
 enum class Conv : int {
     Copy = 0,      ///< the bytes are already the engine form
@@ -62,6 +118,90 @@ struct Seg {
     uint64_t dst_bytes = 0;
     Conv conv = Conv::Copy;
 };
+
+bool row_segments(const IndexRow& r, Seg* segs, int& n_segs, std::string& err) {
+    n_segs = 0;
+    auto add = [](uint64_t a, uint64_t b, uint64_t& result) {
+        if (a > UINT64_MAX - b) return false;
+        result = a + b;
+        return true;
+    };
+    if (r.codes_bytes != 0) {
+        segs[n_segs++] = Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy};
+        const uint64_t src_scales = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
+        if (r.scales_bytes)
+            segs[n_segs++] = Seg{r.codes_bytes, src_scales, r.codes_bytes, r.scales_bytes,
+                                 r.scales_fp16 ? Conv::WidenF16 : Conv::Copy};
+        if (r.offset_bytes) {
+            uint64_t source_offset, dest_offset;
+            if (!add(r.codes_bytes, src_scales, source_offset) ||
+                !add(r.codes_bytes, r.scales_bytes, dest_offset)) {
+                err = r.name + ": tensor plane offset overflow";
+                return false;
+            }
+            segs[n_segs++] = Seg{source_offset, r.offset_bytes, dest_offset, r.offset_bytes, Conv::Copy};
+        }
+    } else {
+        Conv c = Conv::Copy;
+        if (!r.raw16 && r.kind == WeightKind::Bf16InF32) c = Conv::Bf16High;
+        else if (!r.raw16 && r.kind == WeightKind::F16InF32) c = Conv::ToF16;
+        if (c != Conv::Copy) {
+            const uint64_t rows = r.ne1 > 0 ? (uint64_t)r.ne1 : 1;
+            if (r.ne0 <= 0 || (uint64_t)r.ne0 > UINT64_MAX / rows / 4) {
+                err = r.name + ": promoted tensor element count overflow";
+                return false;
+            }
+            const uint64_t elems = (uint64_t)r.ne0 * rows;
+            if (r.src_bytes != elems * 4 || r.dst_bytes != elems * 2) {
+                char buf[320];
+                std::snprintf(buf, sizeof buf,
+                              "%s: a promoted tensor of %llu elements is %llu B in and %llu B out, not %llu/%llu",
+                              r.name.c_str(), (unsigned long long)elems, (unsigned long long)r.src_bytes,
+                              (unsigned long long)r.dst_bytes, (unsigned long long)(elems * 4),
+                              (unsigned long long)(elems * 2));
+                err = buf;
+                return false;
+            }
+        }
+        segs[n_segs++] = Seg{0, r.src_bytes, 0, r.dst_bytes, c};
+    }
+    uint64_t sum_src = 0, sum_dst = 0;
+    for (int i = 0; i < n_segs; ++i) {
+        const auto& s = segs[i];
+        bool valid = false;
+        switch (s.conv) {
+            case Conv::Copy:
+                valid = s.src_bytes == s.dst_bytes;
+                break;
+            case Conv::Bf16High:
+            case Conv::ToF16:
+                valid = s.src_bytes % 4 == 0 && s.dst_bytes == s.src_bytes / 2;
+                break;
+            case Conv::WidenF16:
+                valid = s.src_bytes % 2 == 0 && s.src_bytes <= UINT64_MAX / 2 && s.dst_bytes == s.src_bytes * 2;
+                break;
+        }
+        if (!valid) {
+            err = r.name + ": storage conversion has incomplete elements or inconsistent byte spans";
+            return false;
+        }
+        if (!add(sum_src, s.src_bytes, sum_src) || !add(sum_dst, s.dst_bytes, sum_dst)) {
+            err = r.name + ": tensor segment size overflow";
+            return false;
+        }
+    }
+    if (sum_src != r.src_bytes || sum_dst != r.dst_bytes) {
+        char buf[360];
+        std::snprintf(buf, sizeof buf,
+                      "%s: the segments cover %llu/%llu B but the index says %llu/%llu - the plane layout "
+                      "this loader built is not the one the index describes",
+                      r.name.c_str(), (unsigned long long)sum_src, (unsigned long long)sum_dst,
+                      (unsigned long long)r.src_bytes, (unsigned long long)r.dst_bytes);
+        err = buf;
+        return false;
+    }
+    return true;
+}
 
 const char* file_name(int id) {
     switch (id) {
@@ -88,6 +228,79 @@ bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, 
 
 }  // namespace
 
+bool WeightTable::read_metadata(const std::string& pack_dir, std::string& err) {
+    std::ifstream in(pack_dir + "/index.txt");
+    if (!in) { err = "cannot open pack index"; return false; }
+    std::map<std::string, WeightRef> refs;
+    char rawline[1024];
+    while (in.getline(rawline,sizeof rawline)) {
+        const std::string line(rawline);
+        if (refs.size() > 100000) { err = "pack index exceeds metadata bounds"; return false; }
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream tokens(line);
+        std::string token;
+        size_t field=0;
+        while (tokens >> token) {
+            bool valid=field<19;
+            if (field && valid) {
+                const bool unsigned_field=field==3 || field==4 || field==5 || field==6 || field==14 || field==15 || field==16;
+                if (unsigned_field) {
+                    uint64_t value;
+                    auto r=std::from_chars(token.data(),token.data()+token.size(),value);
+                    valid=r.ec==std::errc() && r.ptr==token.data()+token.size();
+                } else {
+                    int64_t value=0;
+                    auto r=std::from_chars(token.data(),token.data()+token.size(),value);
+                    valid=r.ec==std::errc() && r.ptr==token.data()+token.size() &&
+                          ((field==7 || field==8) || (value>=INT_MIN && value<=INT_MAX));
+                }
+            }
+            if (!valid) { err="invalid pack metadata number or extra field"; return false; }
+            ++field;
+        }
+        if (field!=19) { err="truncated pack metadata row"; return false; }
+        IndexRow r;
+        if (!parse_index_row(line.c_str(), r, err) || r.name.size()>255 ||
+            r.ne0 <= 0 || r.ne1 < 0 || r.ne0 > INT64_MAX / std::max<int64_t>(r.ne1, 1) ||
+            r.src_off > UINT64_MAX - r.src_bytes || r.dst_off > UINT64_MAX - r.dst_bytes ||
+            r.dst_bytes > (1ull << 40) || r.src_bytes > (1ull << 40) ||
+            r.file < 0 || r.file > 3 || (int)r.kind < 0 || (int)r.kind > 3) {
+            err = "invalid pack metadata row"; return false;
+        }
+        Seg segments[3]; int n_segments;
+        if ((r.src_bytes || r.dst_bytes) && !row_segments(r, segments, n_segments, err)) return false;
+        WeightRef ref = index_ref(r);
+        ref.resident = false;
+        if (!refs.emplace(r.name, ref).second) { err = "duplicate pack tensor"; return false; }
+    }
+    if (!in.eof() || refs.empty()) { err = "empty, oversized or unreadable pack metadata"; return false; }
+    table_ = std::move(refs);
+    return true;
+}
+
+bool WeightTable::check_ple_metadata(std::string& err) const {
+    for (const char* suffix : {"key", "value", "norm_key", "norm_query", "norm_conv", "conv1d"}) {
+        if (!find(std::string("blk.1.ple_") + suffix + ".weight")) {
+            err = "the pack has no blk.1.ple_* tensors, so the PLE cannot be wired - and running without it is a DIFFERENT MODEL (LEDGER L123)";
+            return false;
+        }
+    }
+    const auto* wc = find("blk.1.ple_conv1d.weight");
+    const bool f16 = wc->kind == WeightKind::F16InF32 ||
+                     (wc->kind == WeightKind::Verbatim && wc->code_bits == 0);
+    if (!f16 || wc->elements <= 0 || (uint64_t)wc->elements > UINT64_MAX / 2 ||
+        wc->bytes != (uint64_t)wc->elements * 2) {
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, %llu B for %lld values); "
+                      "the PLE conv1d kernel reads F16 - repack with tools/iq_pack.py",
+                      (int)wc->kind, (unsigned long long)wc->bytes, (long long)wc->elements);
+        err = buf;
+        return false;
+    }
+    return true;
+}
+
 bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                              const std::set<std::string>* skip) {
     const std::string path = pack_dir + "/index.txt";
@@ -112,6 +325,10 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
             continue;
         if (skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
+        if (a > (1ull << 20) || dst_bytes > UINT64_MAX - (a - 1) ||
+            compact > UINT64_MAX - (dst_bytes + a - 1) / a * a) {
+            std::fclose(f); err = "pack pool size overflow"; return false;
+        }
         compact += (dst_bytes + a - 1) / a * a;
     }
     std::fclose(f);
@@ -161,31 +378,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             continue;
         }
         IndexRow r;
-        char name[256] = {0};
-        int kind = 0;
-        // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
-        // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
-        const int n = std::sscanf(line,
-                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64 " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
-                                  name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
-                                  &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
-                                  &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
-                                  &r.scales_fp16, &r.act_kind);
-        if (n != 19) {
-            // A malformed index line is a WRONG BYTE OFFSET waiting to happen, and a wrong offset decodes to
-            // a plausible weight.  Refuse loudly instead of loading the rows that happened to parse.
-            err = "index.txt: could not parse a row (" + std::to_string(n) + " of 19 fields)";
-            std::fclose(idx);
-            return false;
-        }
-        r.name = name;
-        // plan v0.3 P6: a standalone native pack (tools/iq_pack.py) stores 16-bit floats as they are in the GGUF:
-        // index kinds 4 (BF16) and 5 (F16) are copied and take the engine forms of kinds 1 and 3
-        if (kind == 4 || kind == 5) {
-            r.raw16 = true;
-            kind = kind == 4 ? (int) WeightKind::Bf16InF32 : (int) WeightKind::F16InF32;
-        }
-        r.kind = (WeightKind) kind;
+        if (!parse_index_row(line, r, err)) { std::fclose(idx); return false; }
         rows.push_back(r);
     }
     std::fclose(idx);
@@ -243,27 +436,9 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
         const IndexRow& r = rows[row_i];
         if (skipped[row_i]) {
-            WeightRef wr;
+            WeightRef wr = index_ref(r);
             wr.data = nullptr;
             wr.resident = false;
-            wr.bytes = r.dst_bytes;
-            wr.ne0 = r.ne0;
-            wr.ne1 = r.ne1;
-            wr.elements = r.ne0 * (r.ne1 > 0 ? r.ne1 : 1);
-            wr.kind = r.kind;
-            wr.code_bits = r.code_bits;
-            wr.code_bias = r.code_bias;
-            wr.group_elems = r.group_elems;
-            wr.codebook_iq4nl = r.codebook != 0;
-            wr.has_offset = r.has_offset != 0;
-            wr.codes_bytes = r.codes_bytes;
-            wr.scales_bytes = r.scales_bytes;
-            wr.offset_bytes = r.offset_bytes;
-            wr.src_off = r.src_off;
-            wr.src_bytes = r.src_bytes;
-            wr.file_id = r.file;
-            wr.scales_fp16 = r.scales_fp16 != 0;
-            wr.act_kind = r.act_kind;
             table_[r.name] = wr;
             ++report_.tensors;
             continue;
@@ -292,63 +467,9 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms
         Seg segs[3];
         int n_segs = 0;
-        bool bad = false;
-        uint64_t sum_src = 0, sum_dst = 0;
-        if (r.codes_bytes != 0) {
-            // A quantized tensor: codes, then scales, then the optional offset plane, each contiguous in the
-            // source span in that order (pack_index.py verifies the contiguity and refuses otherwise).
-            segs[n_segs++] = Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy};
-            if (r.scales_bytes) {
-                const uint64_t src_scale_bytes = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
-                if (r.scales_fp16 && (r.scales_bytes % 2 || src_scale_bytes * 2 != r.scales_bytes)) {
-                    err = r.name + ": an fp16 scale plane of an odd byte count";
-                    bad = true;
-                }
-                segs[n_segs++] = Seg{r.codes_bytes, src_scale_bytes, r.codes_bytes, r.scales_bytes,
-                                     r.scales_fp16 ? Conv::WidenF16 : Conv::Copy};
-            }
-            if (r.offset_bytes) {
-                const uint64_t after = r.codes_bytes + (r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes);
-                segs[n_segs++] = Seg{after, r.offset_bytes, r.codes_bytes + r.scales_bytes, r.offset_bytes,
-                                     Conv::Copy};
-            }
-        } else {
-            // Everything else is one run whose transform is the row's kind.  The two promoted types shrink
-            // 4 B/elem to 2; the rest are already the engine form.
-            Conv c = Conv::Copy;
-            if (r.raw16) c = Conv::Copy;
-            else if (r.kind == WeightKind::Bf16InF32) c = Conv::Bf16High;
-            else if (r.kind == WeightKind::F16InF32) c = Conv::ToF16;
-            const uint64_t elems = (uint64_t) r.ne0 * (uint64_t) (r.ne1 > 0 ? r.ne1 : 1);
-            if (c != Conv::Copy && (r.src_bytes != elems * 4 || r.dst_bytes != elems * 2)) {
-                // A promoted type is 4 B/elem in and 2 B/elem out, and nothing else.  If those two numbers do
-                // not say so, the shape and the byte counts disagree and the element count this loop would
-                // use to walk the source is not the element count the pack wrote.
-                char buf[320];
-                std::snprintf(buf, sizeof buf,
-                              "%s: a promoted tensor of %llu elements is %llu B in and %llu B out, not %llu/%llu",
-                              r.name.c_str(), (unsigned long long) elems, (unsigned long long) r.src_bytes,
-                              (unsigned long long) r.dst_bytes, (unsigned long long) (elems * 4),
-                              (unsigned long long) (elems * 2));
-                err = buf;
-                bad = true;
-            }
-            segs[n_segs++] = Seg{0, r.src_bytes, 0, r.dst_bytes, c};
+        if (!row_segments(r, segs, n_segs, err)) {
+            cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false;
         }
-        for (int i = 0; i < n_segs; ++i) { sum_src += segs[i].src_bytes; sum_dst += segs[i].dst_bytes; }
-        // The segment list is this loop's own idea of the layout, and it is the ONLY thing standing between a
-        // mis-sized plane and a wrong byte offset.  It is checked against both recorded totals, not trusted.
-        if (!bad && (sum_src != r.src_bytes || sum_dst != r.dst_bytes)) {
-            char buf[360];
-            std::snprintf(buf, sizeof buf,
-                          "%s: the segments cover %llu/%llu B but the index says %llu/%llu - the plane layout "
-                          "this loader built is not the one the index describes",
-                          r.name.c_str(), (unsigned long long) sum_src, (unsigned long long) sum_dst,
-                          (unsigned long long) r.src_bytes, (unsigned long long) r.dst_bytes);
-            err = buf;
-            bad = true;
-        }
-        if (bad) { cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
 
         for (int si = 0; si < n_segs; ++si) {
             const Seg& s = segs[si];
@@ -440,26 +561,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             }
         }
 
-        WeightRef wr;
+        WeightRef wr = index_ref(r);
         wr.data = dst_base + r.dst_off;
-        wr.bytes = r.dst_bytes;
-        wr.ne0 = r.ne0;
-        wr.ne1 = r.ne1;
-        wr.elements = r.ne0 * (r.ne1 > 0 ? r.ne1 : 1);
-        wr.kind = r.kind;
-        wr.code_bits = r.code_bits;
-        wr.code_bias = r.code_bias;
-        wr.group_elems = r.group_elems;
-        wr.codebook_iq4nl = r.codebook != 0;
-        wr.has_offset = r.has_offset != 0;
-        wr.codes_bytes = r.codes_bytes;
-        wr.scales_bytes = r.scales_bytes;
-        wr.offset_bytes = r.offset_bytes;
-        wr.src_off = r.src_off;
-        wr.src_bytes = r.src_bytes;
-        wr.file_id = r.file;
-        wr.scales_fp16 = r.scales_fp16 != 0;
-        wr.act_kind = r.act_kind;
         table_[r.name] = wr;
 
         ++report_.tensors;

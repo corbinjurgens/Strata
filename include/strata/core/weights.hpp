@@ -116,6 +116,11 @@ public:
     static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
 
+    /// Index only; no payload reads, device allocations or resident pointers.
+    bool read_metadata(const std::string& pack_dir, std::string& err);
+    /// Required PLE pack entries and storage, independent of loaded pointers.
+    bool check_ple_metadata(std::string& err) const;
+
     /// The `code_bits` field of one row of `<pack_dir>/index.txt`, readable WITHOUT loading anything (0 = the
     /// pack stores the tensor unquantized, e.g. a --compat-bf16 key; -1 = no such row).  #326: the loader has
     /// to know this before it builds the skip set.

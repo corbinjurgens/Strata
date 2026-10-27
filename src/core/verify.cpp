@@ -54,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <immintrin.h>
 
 namespace strata::core {
@@ -112,8 +113,11 @@ struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
     template <typename T> T* take(uint64_t n) {
+        if (n > (UINT64_MAX - 255) / sizeof(T)) throw std::overflow_error("verifier allocation size overflow");
+        const uint64_t bytes = (n * sizeof(T) + 255) & ~255ull;
+        if (used > UINT64_MAX - bytes) throw std::overflow_error("verifier workspace size overflow");
         T* p = base ? (T*) (base + used) : nullptr;
-        used += (n * sizeof(T) + 255) & ~255ull;
+        used += bytes;
         return p;
     }
 };
@@ -409,6 +413,85 @@ Verifier::~Verifier() {
         if (h) cudaFreeHost(h);
 }
 
+uint64_t Verifier::carve_workspace(void* base, const ModelGeometry& g, int64_t cells, int64_t k,
+                                    int max_t, int64_t vocab, uint64_t max_blob) {
+    n_vocab_ = vocab;
+    const auto s = shapes_of(g);
+    cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    max_blocks_ = cells / s.idx_block + 2;
+    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    const int64_t pc = max_t * k, i32 = 4 + (pc + 1) + pc + pc;
+    plan_i32_ = ((i32 + 1) & ~1ll) + 4 * pc + (pc + 1) + 1;
+    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) k;
+    const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
+    const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
+    const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
+    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
+    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+
+    Bump b;
+    b.base = (uint8_t*) base;
+    tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+    pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
+    ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
+    mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
+    inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
+    lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
+    xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
+    sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
+    xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, 4));
+    qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
+    gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
+    z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
+    qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
+    kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
+    idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
+    scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
+    attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
+    attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
+    tail_snap_ = b.take<float>(nQ * TS);
+    logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
+    shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
+    hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
+    plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
+    staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * max_blob);
+    hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
+    nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+    hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
+        strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+        strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+    head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
+    sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
+    sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
+    head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+    arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
+    one_ = b.take<int32_t>(4);
+    hist_snap_ = b.take<float>(T * HS);
+    ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+    return b.used;
+}
+
+uint64_t Verifier::workspace_bytes(const ModelGeometry& g, int64_t cells, int64_t k, int max_t,
+                                  int64_t vocab, uint64_t max_blob, uint64_t& mapped_bytes) {
+    if (cells <= 0 || cells > 1048576 || k != 10 || max_t < 2 || max_t > 16 ||
+        vocab <= 0 || vocab > 1048576 || max_blob == 0 || max_blob > (1ull << 30) ||
+        g.n_embd != 2560 || g.n_layers != 48 || g.n_expert <= 0 || g.n_expert > 512 ||
+        g.hc != 4 || g.hc_lr != 320 || g.n_ff != 640 || g.qsa_interval != 4 ||
+        g.ssm_conv_channels != 10240 || g.ssm_value_dim != 6144 || g.ssm_v_heads != 48 ||
+        g.n_head != 24 || g.n_head_kv != 2 || g.head_dim != 256 || g.idx_q_heads != 4 || g.idx_key_dim != 128)
+        throw std::invalid_argument("unsupported verifier count geometry");
+    Verifier v;
+    const uint64_t bytes = v.carve_workspace(nullptr, g, cells, k, max_t, vocab, max_blob);
+    const uint64_t t = (uint64_t) max_t, n = (uint64_t) g.n_embd;
+    mapped_bytes = t * 4 + t * strata::kernels::kStepCount * 4 +
+        t * (g.n_head + g.n_head_kv + g.idx_q_heads) * 4 + (2 + t) * 4 + 16 +
+        t * n * 4 + t * 4 + 16 + t * n * 4 + 2 * t * k * 4 + 5 * 64 + t * k * n * 4 +
+        (uint64_t) v.plan_i32_ * 8 + 64;
+    return bytes;
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
@@ -465,15 +548,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
-    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
-    const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
-    const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
-    const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
-    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
-    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
-    const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
-    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
-
+    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, K = (uint64_t) ss.k;
+    const uint64_t NH = (uint64_t) g.n_head, NKV = (uint64_t) g.n_head_kv;
+    const uint64_t IQ = (uint64_t) g.idx_q_heads;
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
@@ -515,47 +592,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
 
     // ---- the device arena: the same sequence counted, then carved
-    auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
-        pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
-        ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
-        mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
-        inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
-        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, 4));
-        qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
-        gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
-        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
-        qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
-        kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
-        idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
-        scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
-        attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
-        attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
-        tail_snap_ = b.take<float>(nQ * TS);
-        logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
-        shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
-        hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
-        plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
-        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
-        head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
-        sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
-        sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
-        head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
-        one_ = b.take<int32_t>(4);
-        hist_snap_ = b.take<float>(T * HS);
-        ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
-    };
     Bump count;
-    carve(count);
+    count.used = carve_workspace(nullptr, g, ss.max_cells, ss.k, max_t, n_vocab_,
+                                 strata::kernels::cpu::expert_layout().max_blob);
     if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
@@ -586,7 +625,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     Bump real;
     real.base = (uint8_t*) arena_;
-    carve(real);
+    real.used = carve_workspace(arena_, g, ss.max_cells, ss.k, max_t, n_vocab_,
+                                strata::kernels::cpu::expert_layout().max_blob);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -596,7 +636,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
-    (void) TS;
     if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: copy stream create failed";
         return false;

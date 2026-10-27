@@ -231,24 +231,15 @@ bool PleTable::open(const std::string& gguf_path, std::string& err) {
     return open(gguf_path, err, PleIoOptions{});
 }
 
-bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
-    close();
-    try {
-        impl_->file = new GgufFile(gguf_path);
-    } catch (const std::exception& e) {
-        err = e.what();
-        return false;
-    }
-    const TensorInfo* t = impl_->file->find("per_layer_token_embd.weight");
+bool PleTable::check_metadata(const GgufFile& file, std::string& err) {
+    const TensorInfo* t = file.find("per_layer_token_embd.weight");
     if (t == nullptr) {
-        err = "per_layer_token_embd.weight is not in " + gguf_path;
-        close();
+        err = "per_layer_token_embd.weight is not in the GGUF";
         return false;
     }
     // [160, 320001536]: ne0 = 160 is the FAST axis, so the ROW index is shape[1] and a row is contiguous.
     if (t->shape.size() != 2 || t->shape[0] != (uint64_t) PLE_HEAD_DIM) {
         err = "per_layer_token_embd.weight has an unexpected shape";
-        close();
         return false;
     }
     // The table's type is looked up in the format list (ple_formats()): IQ4_NL (ISTA-DASLab's shard 2, the original's
@@ -257,25 +248,20 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     const PleFormatInfo* fmt = ple_format_for_type(t->type_name());
     if (fmt == nullptr) {
         err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not " + ple_format_list();
-        close();
         return false;
     }
     if (fmt->needs_scale) {
-        const MetaValue* f = impl_->file->get("strata.ple.format");
-        const MetaValue* s = impl_->file->get("strata.ple.scale");
+        const MetaValue* f = file.get("strata.ple.format");
+        const MetaValue* s = file.get("strata.ple.scale");
         if (f == nullptr || f->s != "f8_e4m3" || s == nullptr || !(s->num() > 0.0)) {
             err = "per_layer_token_embd.weight is I8 without strata.ple.format = f8_e4m3 and a positive strata.ple.scale";
-            close();
             return false;
         }
-        impl_->scale = (float) s->num();
     }
-    impl_->fmt = fmt;
-    impl_->rb = fmt->row_bytes;
     // PleReader's row_bytes has been a runtime parameter since the FP8 table (160 B rows) needed it; Q5_0's
     // 110 B rows go through the exact same generic path (ple_reader_test --selftest covers both 90 and 110 B
     // rows: straddling, caching, in-flight tickets, keep-alive). This refusal was stale.
-    impl_->n_rows = t->shape[1];
+    const uint64_t n_rows = t->shape[1];
 
     // THE CHECK THAT MAKES THE OFFSET FALSIFIABLE.  The manifest's `shard2_tensor.offset` is 0, but that is
     // the offset within the GGUF's DATA SECTION: the file's first 192 bytes are a header, and reading at 0
@@ -287,29 +273,48 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     // then fit inside the file at its own offset; alone in its shard (the original's shard 2) it fills it exactly.
     // The size arithmetic is checked before it is used (#865): a header that claims enough rows to wrap the 64-bit
     // product, or a data section that starts past the end of the file, must be refused, not compared after wrapping.
-    if (impl_->n_rows > std::numeric_limits<uint64_t>::max() / impl_->rb ||
-        impl_->file->data_start() > impl_->file->file_size()) {
-        err = "PLE table size overflow or invalid data offset in " + gguf_path;
-        close();
+    if (n_rows > std::numeric_limits<uint64_t>::max() / fmt->row_bytes ||
+        file.data_start() > file.file_size()) {
+        err = "PLE table size overflow or invalid data offset in the GGUF";
         return false;
     }
-    const uint64_t need = impl_->n_rows * (uint64_t) impl_->rb;
-    const uint64_t have = impl_->file->file_size() - impl_->file->data_start();
-    const bool alone = impl_->file->tensors().size() == 1;
+    const uint64_t need = n_rows * (uint64_t) fmt->row_bytes;
+    const uint64_t have = file.file_size() - file.data_start();
+    const bool alone = file.tensors().size() == 1;
     if (t->offset > have || need > have - t->offset || (alone && (t->offset != 0 || need != have))) {
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
                       "data_start %llu",
-                      (unsigned long long) impl_->n_rows, (int) impl_->rb, (unsigned long long) need,
+                      (unsigned long long) n_rows, (int) fmt->row_bytes, (unsigned long long) need,
                       (unsigned long long) t->offset, (unsigned long long) have,
-                      (unsigned long long) impl_->file->data_start());
+                      (unsigned long long) file.data_start());
         err = buf;
         if (alone && have > need)   // #657: extra bytes after the table: a damaged or wrong file, not a format question
             err += "; the file is longer than its table - delete it and its .done mark and run setup again";
+        return false;
+    }
+    return true;
+}
+
+bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoOptions& io) {
+    close();
+    try {
+        impl_->file = new GgufFile(gguf_path);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    if (!check_metadata(*impl_->file, err)) {
         close();
         return false;
     }
+    const TensorInfo* t = impl_->file->find("per_layer_token_embd.weight");
+    impl_->fmt = ple_format_for_type(t->type_name());
+    impl_->rb = impl_->fmt->row_bytes;
+    impl_->n_rows = t->shape[1];
+    const uint64_t need = impl_->n_rows * (uint64_t)impl_->rb;
+    if (impl_->fmt->needs_scale) impl_->scale = (float) impl_->file->get("strata.ple.scale")->num();
     impl_->data = impl_->file->tensor_data(*t);        // only a table that fits the file is mapped
     if (io.mode == PleIo::Direct) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of

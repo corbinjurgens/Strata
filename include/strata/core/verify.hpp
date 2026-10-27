@@ -58,6 +58,9 @@ struct VerifyHits {
 class Verifier {
 public:
     Verifier() = default;
+    /// Counts the exact init arena and mapped handshakes without a session or GPU.
+    static uint64_t workspace_bytes(const ModelGeometry& g, int64_t cells, int64_t k, int max_t,
+                                    int64_t vocab, uint64_t max_blob, uint64_t& mapped_bytes);
     ~Verifier();
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
@@ -270,6 +273,8 @@ public:
     std::string profile_report();
 
 private:
+    uint64_t carve_workspace(void* base, const ModelGeometry& g, int64_t cells, int64_t k,
+                             int max_t, int64_t vocab, uint64_t max_blob);
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
