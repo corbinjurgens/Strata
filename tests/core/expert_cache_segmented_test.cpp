@@ -94,6 +94,13 @@ int main() {
     strata::core::ExpertCache d;
     std::string err;
     if (!d.open(8, 2, 4, kBlob, err) || d.segmented() || d.shrink(0, err)) return fail("unsegmented", err);
+    // verify_slot compares against the host copy; a null one (blob_stable failed) is an error, not a read
+    if (!fill(d, 0, 1, kBlob)) return fail("fill for verify_slot");
+    const std::vector<uint8_t> host((size_t) kBlob, (uint8_t) 1);
+    if (!d.verify_slot(0, host.data(), err)) return fail("verify_slot matching copy", err);
+    err.clear();
+    if (d.verify_slot(0, nullptr, err) || err.find("no host copy") == std::string::npos)
+        return fail("verify_slot null host copy", err);
     std::puts("expert cache segments: shrink gives VRAM back and keeps the slots, grow maps them again");
     return 0;
 }

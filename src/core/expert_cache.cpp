@@ -753,6 +753,10 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         err = "ExpertCache::verify_slot: slot outside the arena";
         return false;
     }
+    if (host_blob == nullptr) {   // blob_stable() returns null when the source could not read the blob
+        err = "ExpertCache::verify_slot: no host copy of the blob to compare against";
+        return false;
+    }
     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.

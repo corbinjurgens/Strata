@@ -645,7 +645,9 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
         const int64_t r = (ring_cells + s.page_size - 1) / s.page_size;
         if (r < p.pages) { p.mode = 2; p.slots = r; p.pooled_rows = 2; }   // the drafter has no indexer
     } else {
-        const int64_t r = (std::max(g_kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
+        // Rounded up without `+ page_size - 1`: --kv-resident accepts values up to INT64_MAX.
+        const int64_t want = std::max(g_kv_resident, qsa_kv_resident_min());
+        const int64_t r = want / s.page_size + (want % s.page_size != 0);
         if (r < p.pages) { p.mode = 1; p.slots = r; }
     }
     return p;
