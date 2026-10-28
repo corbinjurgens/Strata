@@ -58,6 +58,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from tools import build_provenance
+
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
@@ -2500,6 +2502,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
     engine_ok = meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and has_archs and \
         (meta.get("isa_floor") or "") == floor
+    engine_ok = engine_ok and local_build_current(eng / EXE, meta, llama)
     vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc)
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
@@ -2528,12 +2531,11 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
                  f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
-    shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
             "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {})}
+    meta = build_provenance.copy_engine(ROOT / "build-hip" / EXE, eng / EXE, stamp, meta)
     if vision != "none":
         return build_vision_cpu(eng, stamp, meta, llama, vsrc)
-    stamp.write_text(json.dumps(meta, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -2560,7 +2562,7 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
                     find_vcvars() if WIN else None,
                     "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
-    stamp.write_text(json.dumps({**meta, "vision": "cpu", "vision_src": vsrc}, indent=1))
+    build_provenance.atomic_files({stamp: build_provenance.json_bytes({**meta, "vision": "cpu", "vision_src": vsrc}) + b"\n"})
     ok(f"engine: {eng / EXE}, image encoder (CPU): {eng / VEXE}")
     return eng
 
@@ -3145,19 +3147,24 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
             run(build)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml")
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml", "tools/build_provenance.py")
 VISION_SOURCES = ("tools/vision",)
 
 
 def source_hash(parts) -> str:
     """A fingerprint of the files a compiled engine is built from, kept in engine/BUILD.json: when a `git pull`
     changes them, the engine is compiled again (issue #31)."""
-    h = hashlib.sha256(LLAMA_CPP_COMMIT.encode())
-    for part in parts:
-        base = ROOT / part
-        for f in [base] if base.is_file() else sorted(x for x in base.rglob("*") if x.is_file()):
-            h.update(f.relative_to(ROOT).as_posix().encode() + b"\0" + f.read_bytes().replace(b"\r\n", b"\n"))
-    return h.hexdigest()[:16]
+    return build_provenance.legacy_source_hash(ROOT, parts, LLAMA_CPP_COMMIT)
+
+
+def local_build_current(exe: Path, metadata: dict, llama: Path) -> bool:
+    """Old local receipts trigger rebuilding; never invent provenance for them."""
+    try:
+        record = build_provenance.validate_metadata(exe.read_bytes(), metadata, exe.name)
+        return (all(record[k] == v for k, v in build_provenance.git_state(ROOT).items()) and
+                record["source_sha256"] == build_provenance.source_identity(ROOT, llama))
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def isa_floor_defs(floor: str, bdir: Path, meta: dict) -> list:
@@ -3220,6 +3227,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
         (meta.get("isa_floor") or "") == floor
+    engine_ok = engine_ok and local_build_current(eng / EXE, meta, llama)
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
@@ -3240,7 +3248,6 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
                      *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta)],
                     vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
-        shutil.copy2(bdir / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
         defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
@@ -3253,10 +3260,15 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         shutil.copy2(vdir / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
-    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
-                                 "vision": vision, **({"toolkit": 12} if t12 else {}),
-                                 "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None,
-                                 **({"isa_floor": floor} if floor else {})}, indent=1))
+    package = {"source": "local", "version": source_version(), "archs": archs,
+               "vision": vision, **({"toolkit": 12} if t12 else {}),
+               "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None,
+               **({"isa_floor": floor} if floor else {})}
+    if not engine_ok:
+        build_provenance.copy_engine(bdir / EXE, eng / EXE, stamp, package)
+    else:
+        # A vision-only update retains the engine's original source/time record.
+        build_provenance.atomic_files({stamp: build_provenance.json_bytes({**meta, **package}) + b"\n"})
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -3875,6 +3887,8 @@ def engine_version(exe: Path) -> tuple:
     (issue #49)."""
     try:
         meta = json.loads((Path(exe).parent / "BUILD.json").read_text(encoding="utf-8"))
+        if "build" in meta:
+            build_provenance.validate_metadata(Path(exe).read_bytes(), meta, Path(exe).name)
     except (OSError, ValueError):
         meta = {}
     v = str(meta.get("version") or "")

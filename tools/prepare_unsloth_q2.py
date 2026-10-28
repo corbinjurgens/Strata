@@ -17,6 +17,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import setup
+from tools import build_provenance
 from serve.credentials import create_key_file, key_list, read_key_file, remove_created_key, resolve_credentials
 
 MODEL = "UD-Q2_K_XL"
@@ -479,8 +480,9 @@ def build_engine(jobs: int, bdir: Path, target: Path) -> None:
     if source != setup.source_hash(setup.ENGINE_SOURCES):
         raise ValueError("Engine sources changed during the build; no executable was installed. Build again.")
     built = bdir / "strata.exe"
-    receipt = {"source": "local", "version": setup.source_version(),
-               "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+    native = json.loads((bdir / "BUILD.json").read_bytes())
+    build_provenance.validate_metadata(built.read_bytes(), native, built.name)
+    receipt = {**native, "source": "local",
                "src": source, "ggml": ggml, "cmake_settings": settings,
                "archs": [int(gpu["arch"])], "commands": commands,
                "sha256": hashlib.sha256(built.read_bytes()).hexdigest()}
@@ -497,7 +499,10 @@ def install_engine(bdir: Path, target: Path) -> None:
     check_source_identity(metadata)
     if metadata.get("sha256") != hashlib.sha256(payload).hexdigest():
         raise ValueError("Build receipt does not match the compiled executable; rebuild before installing.")
+    build_provenance.validate_metadata(payload, metadata, built.name)
     metadata["exe"] = str(target)
+    metadata["executable"] = target.name
+    # A custom executable gets its own receipt, never the release BUILD.json.
     atomic_files({target: payload, engine_metadata(target): json_bytes(metadata)})
     print(f"Custom engine installed as {target.name}; SHA-256 {metadata['sha256']}.")
 
@@ -678,6 +683,8 @@ def check_ready(cfg: dict, *, cli_api_key=None) -> None:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
         if metadata.get("sha256") != hashlib.sha256(Path(cfg["exe"]).read_bytes()).hexdigest():
             raise ValueError("Engine SHA-256 differs from its build metadata; rebuild before launching.")
+        if "build" in metadata:
+            build_provenance.validate_metadata(Path(cfg["exe"]).read_bytes(), metadata, Path(cfg["exe"]).name)
         if cfg.get("memory_policy"):
             check_source_identity(metadata)
 

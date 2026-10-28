@@ -25,6 +25,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/build_info.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -1602,6 +1603,14 @@ double pcie_frac_for_gbps(double gbps, double base) {
 }  // namespace
 
 int main(int argc, char **argv) try {
+    // A bounded, no-model build probe, before strict-frame reads, device
+    // discovery, model access, allocations or worker creation.
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--build-info") == 0) {
+            if (argc != 2) { std::fprintf(stderr, "--build-info takes no other arguments\n"); return 2; }
+            std::fputs(strata::build::json, stdout);
+            return 0;
+        }
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -8306,11 +8315,12 @@ int main(int argc, char **argv) try {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            std::printf("BUILD %s", strata::build::json);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s build_schema=1 engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),

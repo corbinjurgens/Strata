@@ -1,0 +1,7 @@
+#pragma once
+
+namespace strata::build {
+// Retain one searchable envelope in the linked executable, including its LF.
+inline constexpr char record[] = "STRATA_BUILD/1:" @STRATA_BUILD_JSON@ "\n";
+inline constexpr const char* json = record + sizeof("STRATA_BUILD/1:") - 1;
+}  // namespace strata::build

@@ -13,6 +13,12 @@ from tools import prepare_unsloth_q2 as prep
 from serve import credentials
 
 
+def provenance_fixture():
+    record = {"schema_version": 1, "commit": "test-commit", "dirty": True,
+              "built_at": "2026-01-01T00:00:00Z", "cuda": "13.4", "version": "test-version", "backend": "cuda"}
+    return b"compiled fixture\0STRATA_BUILD/1:" + prep.build_provenance.json_bytes(record) + b"\n\0"
+
+
 def value(args, flag):
     return args[args.index(flag) + 1]
 
@@ -1217,6 +1223,43 @@ class PortableProfiles(unittest.TestCase):
                 self.assertEqual(prep.main(["--write-config", "--config", str(self.config), *flags]), 1)
         self.assertFalse(self.config.exists())
 
+    def test_install_rejects_hash_valid_receipt_for_another_embedded_build(self):
+        built = self.root / "mismatched-build"
+        built.mkdir()
+        payload = provenance_fixture()
+        (built / "strata.exe").write_bytes(payload)
+        metadata = prep.build_provenance.metadata_for(payload, "strata.exe")
+        metadata["build"] = {**metadata["build"], "built_at": "2025-01-01T00:00:00Z"}
+        (built / "BUILD-strata.json").write_bytes(prep.json_bytes(metadata))
+        target = self.root / "target.exe"
+        target.write_bytes(b"previous binary")
+        sidecar = prep.engine_metadata(target)
+        sidecar.write_bytes(b"previous receipt")
+        with patch.object(prep, "check_source_identity"), self.assertRaisesRegex(ValueError, "embedded build record"):
+            prep.install_engine(built, target)
+        self.assertEqual(target.read_bytes(), b"previous binary")
+        self.assertEqual(sidecar.read_bytes(), b"previous receipt")
+
+    def test_install_copies_embedded_record_and_preserves_unrelated_release_manifest(self):
+        built = self.root / "valid-build"
+        built.mkdir()
+        payload = provenance_fixture()
+        (built / "strata.exe").write_bytes(payload)
+        metadata = prep.build_provenance.metadata_for(payload, "strata.exe", {"src": "fixture", "archs": [89]})
+        (built / "BUILD-strata.json").write_bytes(prep.json_bytes(metadata))
+        target = self.root / "strata-custom.exe"
+        release = self.root / "BUILD.json"
+        release.write_bytes(b"unrelated release")
+        with patch.object(prep, "check_source_identity"), contextlib.redirect_stdout(io.StringIO()):
+            prep.install_engine(built, target)
+        installed = json.loads(prep.engine_metadata(target).read_bytes())
+        self.assertEqual(installed["build"], metadata["build"])
+        self.assertEqual(installed["archs"], [89])
+        self.assertEqual(installed["exe"], str(target))
+        self.assertEqual(installed["executable"], "strata-custom.exe")
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(release.read_bytes(), b"unrelated release")
+
     def test_unauthenticated_lan_profile_is_rejected(self):
         cfg = self.make_config()
         cfg.update(host="0.0.0.0")
@@ -1255,7 +1298,10 @@ class PortableProfiles(unittest.TestCase):
         def run(command, **kwargs):
             self.assertEqual(command[0], "cmake.exe")
             if "--build" in command:
-                (build_dir / "strata.exe").write_bytes(b"compiled fixture")
+                payload = provenance_fixture()
+                (build_dir / "strata.exe").write_bytes(payload)
+                (build_dir / "BUILD.json").write_bytes(prep.json_bytes(
+                    prep.build_provenance.metadata_for(payload, "strata.exe")))
             else:
                 (build_dir / "CMakeCache.txt").write_text(
                     f"STRATA_GGML_DIR:PATH={cmake_file.parents[1]}\nCMAKE_CUDA_ARCHITECTURES:STRING=89\n"
@@ -1270,10 +1316,12 @@ class PortableProfiles(unittest.TestCase):
                 patch.object(prep.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
             prep.build_engine(2, build_dir, target)
         metadata = json.loads(prep.engine_metadata(target).read_text())
-        self.assertEqual(target.read_bytes(), b"compiled fixture")
-        self.assertEqual(metadata["sha256"], hashlib.sha256(b"compiled fixture").hexdigest())
+        self.assertEqual(target.read_bytes(), provenance_fixture())
+        self.assertEqual(metadata["sha256"], hashlib.sha256(provenance_fixture()).hexdigest())
         self.assertEqual(metadata["src"], "current-source")
         self.assertEqual(metadata["commit"], "test-commit")
+        self.assertEqual(metadata["build"]["built_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(metadata["executable"], target.name)
         self.assertEqual(metadata["ggml"]["files"], 1)
         self.assertEqual(metadata["cmake_settings"]["CMAKE_CXX_FLAGS"], "/O2")
         self.assertEqual(metadata["cmake_settings"]["GGML_CUDA"], "ON")

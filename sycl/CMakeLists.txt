@@ -133,6 +133,7 @@ target_link_libraries(strata_kernels_cpu PUBLIC strata_includes Threads::Threads
 
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
+set(STRATA_GGML_SOURCE_DIR "")
 if(STRATA_NATIVE_EXPERTS)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(GGML_STATIC ON CACHE BOOL "" FORCE)
@@ -144,6 +145,7 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   if(STRATA_GGML_DIR)
+    get_filename_component(STRATA_GGML_SOURCE_DIR "${STRATA_GGML_DIR}" ABSOLUTE)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)
@@ -155,7 +157,8 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT strata_llamacpp_POPULATED)
       FetchContent_Populate(strata_llamacpp)
     endif()
-    add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+    set(STRATA_GGML_SOURCE_DIR "${strata_llamacpp_SOURCE_DIR}")
+    add_subdirectory(${STRATA_GGML_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
   strata_resolve(_cpu_native src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp)   # 0.1.31: the Q4_K/Q5_K/Q5_1/Q8_0 expert rows
@@ -218,6 +221,8 @@ target_link_libraries(strata_prefill PUBLIC strata_engine)
 
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
+include(${STRATA_ROOT}/cmake/build_provenance.cmake)
+strata_build_provenance(strata "${STRATA_ROOT}" sycl)
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------

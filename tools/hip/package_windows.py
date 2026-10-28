@@ -73,7 +73,20 @@ def main() -> int:
     ap.add_argument("--rocm-version", required=True)
     ap.add_argument("--out", required=True, type=Path)
     a = ap.parse_args()
+    sys.path.insert(0, str(ROOT))
+    from tools import build_provenance
+    payload = (a.build / "strata.exe").read_bytes()
+    native_meta = json.loads((a.build / "BUILD.json").read_bytes())
+    record = build_provenance.validate_metadata(payload, native_meta, "strata.exe")
+    if record["backend"] != "hip":
+        ap.error("the selected executable was not built for HIP")
+    version = record["version"]
     archs = [x for x in re.split(r"[;, ]+", a.archs) if x]
+    hl = (a.rocm / "include" / "hipblaslt" / "hipblaslt-version.h").read_text(encoding="utf-8")
+    hlv = [int(re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", hl).group(1)) for k in ("MAJOR", "MINOR", "PATCH")]
+    meta = {"source": "prebuilt", "backend": "hip", "platform": "windows-x64", "archs": archs,
+            "rocm": a.rocm_version, "hipblaslt_version": hlv[0] * 100000 + hlv[1] * 100 + hlv[2], "vision": "none",
+            "lib_dirs": ["rocm/bin"]}
     rbin = a.rocm / "bin"
     objdump = a.rocm / "lib" / "llvm" / "bin" / "llvm-objdump.exe"
     stage = a.out / "strata-windows-x64-hip"
@@ -81,7 +94,10 @@ def main() -> int:
     (stage / "rocm" / "bin").mkdir(parents=True)
 
     for p in PROGRAMS:
-        shutil.copy2(a.build / p, stage / p)
+        if p == "strata.exe":
+            build_provenance.copy_engine(a.build / p, stage / p, stage / "BUILD.json", meta)
+        else:
+            shutil.copy2(a.build / p, stage / p)
 
     # the ROCm DLLs: the programs' imports, followed through the ROCm DLLs themselves
     rocm_dlls = {p.name.lower(): p for p in rbin.glob("*.dll")}
@@ -148,14 +164,6 @@ def main() -> int:
     shipped = sorted(p.name for p in (stage / "rocm" / "bin").glob("*.dll"))
     (lic / "NOTICE.txt").write_text(NOTICE.format(rocm=a.rocm_version, dlls="\n".join("  " + d for d in shipped)),
                                     encoding="utf-8")
-
-    version = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")).group(1)
-    hl = (a.rocm / "include" / "hipblaslt" / "hipblaslt-version.h").read_text(encoding="utf-8")
-    hlv = [int(re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", hl).group(1)) for k in ("MAJOR", "MINOR", "PATCH")]
-    meta = {"source": "prebuilt", "backend": "hip", "platform": "windows-x64", "version": version, "archs": archs,
-            "rocm": a.rocm_version, "hipblaslt_version": hlv[0] * 100000 + hlv[1] * 100 + hlv[2], "vision": "none",
-            "lib_dirs": ["rocm/bin"]}
-    (stage / "BUILD.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
 
     z = a.out / ASSET
     z.unlink(missing_ok=True)

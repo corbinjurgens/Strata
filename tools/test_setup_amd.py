@@ -164,7 +164,13 @@ class GpuLists(unittest.TestCase):
             def fake_build(src, bdir, target, defs, vcvars, bat):
                 calls["defs"] = defs
                 (bdir).mkdir(parents=True, exist_ok=True)
-                (bdir / setup.EXE).write_text("engine")
+                bp = setup.build_provenance
+                record = {"schema_version": 1, "version": "0.1.31", "backend": "hip",
+                          **bp.git_state(root), "built_at": "2026-01-01T00:00:00Z", "cuda": None,
+                          "source_sha256": bp.source_identity(root, root)}
+                payload = b"fixture\0" + bp.MARKER + bp.json_bytes(record) + b"\n\0"
+                (bdir / setup.EXE).write_bytes(payload)
+                (bdir / "BUILD.json").write_bytes(bp.json_bytes(bp.metadata_for(payload, setup.EXE)))
 
             class Sh:
                 which = staticmethod(lambda name: "/usr/bin/" + name)
