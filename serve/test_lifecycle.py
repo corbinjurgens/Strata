@@ -1,5 +1,6 @@
 """Model discovery, on-demand loading and safe unloading over the actual HTTP API."""
 import json
+import contextlib
 import errno
 import io
 import os
@@ -53,6 +54,97 @@ class ResidentEngine(StrataEngine):
 
 
 class Lifecycle(unittest.TestCase):
+    def test_shared_failed_lazy_load_releases_active_and_waiting_reservations(self):
+        self.svc.max_queued_requests = 1
+        entered, release = threading.Event(), threading.Event()
+        attempts, replies = [], []
+        def fail():
+            attempts.append(1)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("load gate timed out")
+            raise EngineDied("fixture load failure")
+        chat = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 1}
+        threads = [threading.Thread(target=lambda: replies.append(self.request("/v1/chat/completions", chat)))
+                   for _ in range(2)]
+        try:
+            with mock.patch.object(self.engine, "restart", side_effect=fail):
+                threads[0].start()
+                self.assertTrue(entered.wait(3))
+                threads[1].start()
+                end = time.monotonic() + 3
+                while self.svc.v1_status()["admission"]["reserved"] != 2 and time.monotonic() < end:
+                    time.sleep(.01)
+                before = self.svc.v1_status()["admission"]
+                self.assertEqual((before["reserved"], before["queued"]), (2, 1))
+                status, body = self.request("/v1/chat/completions", chat)
+                self.assertEqual((status, body["error"]["code"]), (429, "busy"))
+                self.assertEqual(self.svc.v1_status()["admission"], before)
+                self.assertEqual(attempts, [1])
+                release.set()
+                for thread in threads:
+                    thread.join(5)
+        finally:
+            release.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual([(code, body["error"]["code"]) for code, body in replies],
+                         [(503, "engine_died"), (503, "engine_died")])
+        self.assertEqual(attempts, [1])
+        self.assertEqual(self.svc.v1_status()["admission"]["reserved"], 0)
+        self.assertEqual(self.request("/v1/chat/completions", chat)[0], 200)
+
+    def test_queue_full_is_429_before_stream_headers_on_every_generation_route(self):
+        self.svc.max_queued_requests = 0
+        entered, release = threading.Event(), threading.Event()
+        generate = self.engine.generate
+        def gated(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("generation gate timed out")
+            yield from generate(*args, **kwargs)
+        self.engine.generate = gated
+        results = []
+        active = threading.Thread(target=lambda: results.append(list(self.svc.run(
+            [11], False, [], 1, {}, threading.Event()))))
+        active.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            before = self.svc.v1_status()["admission"]
+            with mock.patch.object(self.svc, "load", side_effect=AssertionError("rejected request loaded")):
+                for api in ("chat/completions", "messages", "responses"):
+                    for stream in (False, True):
+                        body = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 1,
+                                "stream": stream} if api != "responses" else {"input": "Hi", "stream": stream}
+                        code, answer = self.request("/v1/" + api, body)
+                        self.assertEqual((code, answer["error"]["code"]), (429, "busy"), (api, stream))
+                        self.assertEqual(self.svc.v1_status()["admission"], before)
+            self.assertEqual(self.request("/v1/load", {})[0], 409)
+            self.assertEqual(self.request("/v1/unload", {})[0], 409)
+        finally:
+            release.set()
+            active.join(5)
+        self.assertFalse(active.is_alive())
+        self.assertTrue(results)
+        self.assertEqual(self.svc.v1_status()["admission"]["reserved"], 0)
+
+    def test_reservation_released_after_http_validation_and_lazy_load_failure(self):
+        self.svc.max_queued_requests = 0
+        chat = {"messages": [{"role": "user", "content": "Hi"}], "reasoning_effort": "none", "max_tokens": 1}
+        for api, body in (("chat/completions", {**chat, "max_tokens": "bad"}),
+                          ("messages", {**chat, "max_tokens": "bad"}),
+                          ("responses", {"input": "Hi", "max_output_tokens": "bad"})):
+            self.assertEqual(self.request("/v1/" + api, body)[0], 400)
+            self.assertEqual(self.svc.v1_status()["admission"]["reserved"], 0)
+        self.engine.loaded = False
+        with mock.patch.object(self.engine, "restart", side_effect=EngineDied("load failed")):
+            self.assertEqual(self.request("/v1/chat/completions", chat)[0], 503)
+            self.assertEqual(self.svc.v1_status()["admission"]["reserved"], 0)
+        self.assertEqual(self.request("/v1/chat/completions", chat)[0], 200)
+        self.assertEqual(self.svc.v1_status()["admission"]["reserved"], 0)
+
     def test_close_cleans_up_after_a_broken_stdin_pipe(self):
         for running in (False, True):
             with self.subTest(running=running):
@@ -282,6 +374,7 @@ class Lifecycle(unittest.TestCase):
 
     def test_runtime_codes_match_json_and_started_streams(self):
         for failure, code in ((EngineDied("engine went away"), "engine_died"),
+                              (server.QueueFull("fixture capacity exhausted"), "busy"),
                               (server.NativeFailure("out_of_memory"), "out_of_memory"),
                               (server.NativeFailure("insufficient_resources"), "insufficient_resources")):
             def generate(*args, **kwargs):
@@ -305,7 +398,7 @@ class Lifecycle(unittest.TestCase):
                                       for event in events]
                             self.assertIn(code, [error["code"] for error in errors if error])
                         else:
-                            self.assertEqual((status, answer["error"]["code"]), (503, code))
+                            self.assertEqual((status, answer["error"]["code"]), (429 if code == "busy" else 503, code))
 
     def test_restart_failure_is_json_on_both_control_routes(self):
         def refuse():
@@ -353,6 +446,232 @@ class Lifecycle(unittest.TestCase):
         code, body = self.request("/v1/unload", {})
         self.assertEqual((code, body["status"], body["lifecycle"]), (200, "unloaded", "unloaded"))
         self.assertIsNone(engine.proc)
+
+
+class Admission(unittest.TestCase):
+    def test_startup_uses_queue_capacity_from_final_prepared_config(self):
+        from serve.test_runconfig import Startup
+        from tools import prepare_unsloth_q2 as prep
+        config = Path("C:/synthetic/queue-config.json")
+        initial = {"exe": "C:/synthetic/strata.exe", "args": [],
+                   "memory_policy": {"version": 1}, "max_queued_requests": 0}
+        real_read = Path.read_text
+        for value in (0, 32, None, "absent", -1, True, "32"):
+            valid = value in (0, 32, None, "absent") and type(value) is not bool
+            final = {**initial, "max_queued_requests": value}
+            if value == "absent":
+                final.pop("max_queued_requests")
+            def read_text(path, *args, **kwargs):
+                if path == config:
+                    return json.dumps(initial)
+                if not valid:
+                    self.fail("invalid prepared queue capacity reached tokenizer construction")
+                if path.name == "vocab.json":
+                    return "{}"
+                if path.name == "token_type.json":
+                    return "[]"
+                if path.name == "merges.txt":
+                    return ""
+                if path.name == "chat_template.jinja":
+                    return real_read(server.ROOT / "serve/chat_template.jinja", encoding="utf-8")
+                if path.name.endswith(".shared-settings.json"):
+                    raise FileNotFoundError()
+                raise AssertionError("unexpected read: " + str(path))
+            with self.subTest(prepared=value), mock.patch.object(Path, "read_text", read_text), \
+                    mock.patch.object(Path, "exists", return_value=True), \
+                    mock.patch.object(prep, "prepare_launch", return_value=final), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                if valid:
+                    _, http, _ = Startup().run_main(config)
+                    self.assertEqual(http.call_args.args[0].max_queued_requests,
+                                     None if value == "absent" else value)
+                else:
+                    with self.assertRaises(SystemExit) as caught:
+                        Startup().run_main(config)
+                    self.assertEqual(caught.exception.code, 2)
+
+    def test_bounded_admission_releases_after_real_disconnect_and_confirmed_exit(self):
+        from serve.test_quiet_cancel import CancellationDeadline
+        constructor = Service
+        for batch, mode in ((0, "cooperative"), (0, "stalled"), (2, "cooperative"), (2, "stalled")):
+            services = []
+            def bounded(*args, **kwargs):
+                svc = constructor(*args, **kwargs, max_queued_requests=1)
+                services.append(svc)
+                return svc
+            with self.subTest(batch=batch, mode=mode), mock.patch.object(server, "Service", side_effect=bounded):
+                CancellationDeadline().check_cancel(batch, mode)
+                self.assertEqual(len(services), 1)
+                state = services[0].v1_status()["admission"]
+                self.assertEqual((state["reserved"], state["queued"], state["stopping_slots"]), (0, 0, 0))
+
+    def test_invalid_queue_capacity_refuses_before_engine_construction(self):
+        for value in (True, False, -1, 1.5, "32", 65537, [], {}):
+            with self.subTest(value=value), \
+                    mock.patch.object(sys, "argv", ["server", "--engine", "strata", "--config", "fixture.json"]), \
+                    mock.patch.object(Path, "read_text", return_value=json.dumps({"max_queued_requests": value})), \
+                    mock.patch.object(server, "StrataEngine", side_effect=AssertionError("engine constructed")), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                server.main()
+            self.assertEqual(caught.exception.code, 2)
+
+    def service(self, capacity=None, slots=1):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "Hi", max_context=4096)
+        engine.batch = slots if slots > 1 else 0
+        svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"),
+                      max_queued_requests=capacity)
+        return svc, engine
+
+    def wait_for(self, predicate):
+        end = time.monotonic() + 5
+        while not predicate() and time.monotonic() < end:
+            time.sleep(.01)
+        self.assertTrue(predicate(), "admission fixture did not settle")
+
+    def test_atomic_capacity_races_use_effective_slots_and_waiting_allowance(self):
+        for slots, waiting in ((1, 0), (1, 2), (2, 0), (2, 2)):
+            with self.subTest(slots=slots, waiting=waiting):
+                svc, engine = self.service(waiting, slots)
+                engine.requested_slots = 8                 # requested slots must never grant effective capacity
+                release = threading.Event()
+                native_slots = threading.Semaphore(slots)
+                calls, results = [], []
+                generate = engine.generate
+                def gated(*args, **kwargs):
+                    with native_slots:
+                        calls.append(1)
+                        if not release.wait(8):
+                            raise AssertionError("generation gate timed out")
+                        yield from generate(*args, **kwargs)
+                engine.generate = gated
+                def caller(barrier=None):
+                    if barrier is not None:
+                        barrier.wait(5)
+                    try:
+                        list(svc.run([11], False, [], 1, {}, threading.Event()))
+                        results.append("done")
+                    except Exception as error:
+                        results.append(type(error))
+                accepted = [threading.Thread(target=caller) for _ in range(slots + waiting)]
+                racers = []
+                try:
+                    for thread in accepted:
+                        thread.start()
+                    self.wait_for(lambda: svc.v1_status()["admission"]["reserved"] == slots + waiting)
+                    self.wait_for(lambda: len(calls) == slots)
+                    before = svc.v1_status()["admission"]
+                    self.assertEqual(before, {"max_queued_requests": waiting, "active_slots": slots,
+                                              "reserved": slots + waiting, "stopping_slots": 0, "queued": waiting})
+                    barrier = threading.Barrier(9)
+                    racers = [threading.Thread(target=caller, args=(barrier,)) for _ in range(8)]
+                    for thread in racers:
+                        thread.start()
+                    barrier.wait(5)
+                    for thread in racers:
+                        thread.join(5)
+                        self.assertFalse(thread.is_alive())
+                    self.assertEqual(results, [server.QueueFull] * 8)
+                    self.assertEqual(svc.v1_status()["admission"], before)
+                    self.assertEqual(len(calls), slots)
+                finally:
+                    release.set()
+                    for thread in accepted + racers:
+                        thread.join(5)
+                self.assertFalse(any(thread.is_alive() for thread in accepted))
+                self.assertEqual(results.count("done"), slots + waiting)
+                self.assertEqual(svc.v1_status()["admission"]["reserved"], 0)
+                list(svc.run([11], False, [], 1, {}, threading.Event()))
+                self.assertEqual(svc.v1_status()["admission"]["queued"], 0)
+
+    def test_close_cancel_validation_and_engine_death_release_direct_reservations(self):
+        svc, engine = self.service(0)
+        def tokens(*args, **kwargs):
+            yield 88
+            yield 89
+            raise EngineDied("fixture death")
+        engine.generate = tokens
+        for outcome in ("close", "cancel", "death", "validation"):
+            cancel = threading.Event()
+            items = svc.run([11], False, [], 8, {"stop": 42} if outcome == "validation" else {}, cancel)
+            if outcome == "validation":
+                with self.assertRaises(ValueError):
+                    next(items)
+            else:
+                next(items)
+                self.assertEqual(svc.v1_status()["admission"]["reserved"], 1)
+                # A second suspended generator on this same thread still needs its own reservation.
+                with self.assertRaises(server.QueueFull):
+                    next(svc.run([11], False, [], 1, {}, threading.Event()))
+                if outcome == "cancel":
+                    cancel.set()
+                if outcome == "death":
+                    with self.assertRaises(EngineDied):
+                        list(items)
+                else:
+                    items.close()
+            self.assertEqual(svc.v1_status()["admission"]["reserved"], 0)
+            self.assertEqual(svc.status["queued"], 0)
+
+    def test_legacy_unbounded_and_stopping_native_ownership(self):
+        for cfg in ({}, {"max_queued_requests": None}):
+            svc, engine = self.service(server.max_queued_requests_of(cfg), slots=2)
+            with contextlib.ExitStack() as stack:
+                for _ in range(40):
+                    stack.enter_context(svc.generation_admission())
+                self.assertEqual(svc.v1_status()["admission"]["queued"], 38)
+            self.assertEqual(svc.v1_status()["admission"]["reserved"], 0)
+        svc, engine = self.service(0, slots=2)
+        engine.slot_busy, engine.slot_live = [True, True], [None, None]
+        engine.slot_stopping = [(None,), (None,)]
+        with self.assertRaises(server.QueueFull):
+            next(svc.run([11], False, [], 1, {}, threading.Event()))
+        self.assertEqual(svc.v1_status()["admission"]["reserved"], 0)
+        engine.slot_busy[:] = [False, False]               # the existing native owner acknowledged both stops
+        list(svc.run([11], False, [], 1, {}, threading.Event()))
+
+    def test_detached_stop_counts_once_across_reservation_release(self):
+        svc, engine = self.service(0, slots=2)
+        engine.slot_busy = [True, False]
+        engine.slot_stopping = [None, None]
+        with svc.generation_admission() as owner:
+            engine.slot_stopping[0] = (owner,)
+            with svc.generation_admission():
+                state = svc.v1_status()["admission"]
+                self.assertEqual((state["reserved"], state["stopping_slots"], state["queued"]), (2, 0, 0))
+        state = svc.v1_status()["admission"]
+        self.assertEqual((state["reserved"], state["stopping_slots"], state["queued"]), (0, 1, 0))
+        with svc.generation_admission():
+            with self.assertRaises(server.QueueFull):
+                next(svc.run([11], False, [], 1, {}, threading.Event()))
+        engine.slot_busy[0] = False
+        with svc.generation_admission(), svc.generation_admission():
+            self.assertEqual(svc.v1_status()["admission"]["reserved"], 2)
+
+    def test_native_cleanup_captures_reservation_on_return_and_close(self):
+        for close in (False, True):
+            svc, engine = self.service(0, slots=2)
+            engine.slot_busy, engine.slot_stopping = [True, False], [None, None]
+            def tokens(*args, **kwargs):
+                try:
+                    yield 88
+                    yield 89
+                finally:
+                    engine.slot_stopping[0] = (getattr(server._GENERATION_CLEANUP, "reservation", None),)
+            engine.generate = tokens
+            items = svc.run([11], False, [], 8, {}, threading.Event())
+            if close:
+                next(items)
+            else:
+                for kind, _ in items:
+                    if kind == "done":
+                        break
+                self.assertEqual(svc.v1_status()["admission"]["stopping_slots"], 0)
+            items.close()
+            self.assertIsNotNone(engine.slot_stopping[0][0])
+            self.assertEqual(svc.v1_status()["admission"]["stopping_slots"], 1)
+            self.assertEqual(svc.v1_status()["admission"]["reserved"], 0)
+            self.assertIsNone(getattr(server._GENERATION_CLEANUP, "reservation", None))
 
 
 STARTUP = r'''import sys
@@ -649,6 +968,7 @@ class ReaderCleanup(unittest.TestCase):
 
     def test_public_unload_retains_active_stdout_readers_and_retries_after_eof(self):
         import queue
+        from serve.test_launch_runtime import runtime_frame
         for reader_kind in ('pump', 'ready_reader'):
             for held in (False, True):
                 with self.subTest(reader=reader_kind, held=held):
@@ -667,6 +987,10 @@ class ReaderCleanup(unittest.TestCase):
                     proc = mock.Mock(stdin=io.StringIO(), stdout=stdout, stderr=None)
                     proc.poll.return_value = 0
                     engine = StrataEngine('fixture', [], lazy=True)
+                    predecessor = engine.records
+                    record = io.StringIO(runtime_frame())
+                    self.assertTrue(predecessor.consume(record.readline(), record))
+                    self.assertEqual(predecessor.public()["totals"]["capacity_bytes"], 1024)
                     engine.proc, engine.lines, engine.slot_q, engine.gen, engine.unloaded = proc, queue.Queue(), [], 1, False
                     target = engine._pump if reader_kind == 'pump' else lambda: engine._ready_pump(proc, queue.Queue())
                     reader = threading.Thread(target=target, daemon=True)
@@ -694,6 +1018,12 @@ class ReaderCleanup(unittest.TestCase):
                     try:
                         self.assertTrue(done.wait(3), 'public unload blocked on the stdout reader')
                         code, body = result[0]
+                        record = io.StringIO(runtime_frame(2, 512))
+                        self.assertTrue(predecessor.consume(record.readline(), record))
+                        launch = svc.v1_status()["launch"]
+                        self.assertIsNone(launch["effective"])
+                        self.assertIsNone(launch["current_ownership"]["totals"])
+                        self.assertIsNone(launch["runtime_memory"]["components"])
                         if held:
                             self.assertEqual((code, body['error']['code']), (503, 'engine_died'))
                             self.assertIs(engine.proc, proc)

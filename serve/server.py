@@ -351,6 +351,30 @@ class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
 
+class QueueFull(ModelBusy):
+    """Generation admission has no waiting capacity left (HTTP 429)."""
+
+
+def max_queued_requests_of(cfg):
+    value = cfg.get("max_queued_requests")
+    if value is not None and (type(value) is not int or not 0 <= value <= 65536):
+        raise ValueError('"max_queued_requests" must be null or a whole number from 0 to 65536')
+    return value
+
+
+_GENERATION_CLEANUP = threading.local()
+
+
+@contextlib.contextmanager
+def generation_cleanup_owner(reservation):
+    previous = getattr(_GENERATION_CLEANUP, "reservation", None)
+    _GENERATION_CLEANUP.reservation = reservation
+    try:
+        yield
+    finally:
+        _GENERATION_CLEANUP.reservation = previous
+
+
 class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
@@ -705,7 +729,7 @@ class StrataEngine:
                 build = build_record(exe)
             except (OSError, ValueError):
                 build = None
-        self.records = Records(self.launch_plan, build)
+        self.records = Records(self.launch_plan, build, argv=[exe, "--serve", *args], cwd=cwd)
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
@@ -855,6 +879,7 @@ class StrataEngine:
             self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
             self.slot_used = [0.0] * self.batch
             self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+            self.slot_stopping = [None] * self.batch        # detached STOP drains, with their Service reservation
             # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
             # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
             # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -1018,8 +1043,14 @@ class StrataEngine:
                 return
             if not line:
                 return
+            if (not line.endswith("\n") and records is not None and
+                    any(prefix.startswith(line) or line.startswith(prefix)
+                        for prefix in ("STRATA-RUNTIME", "STRATA-OWNERSHIP", "STRATA-EFFECTIVE", "BUILD "))):
+                records.error = "native output closed in status header"
+                records.quarantined = True
+                return
             if len(line) > 16384:
-                if records is not None and records.plan is None and not line.startswith(("BUILD ", "STRATA-EFFECTIVE", "STRATA-OWNERSHIP")):
+                if records is not None and records.plan is None and not line.startswith(("BUILD ", "STRATA-EFFECTIVE", "STRATA-OWNERSHIP", "STRATA-RUNTIME")):
                     yield line + proc.stdout.readline()
                     continue
                 if records is not None:
@@ -1347,6 +1378,8 @@ class StrataEngine:
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
+        stopping = self.slot_stopping
+        stopping[slot] = (getattr(_GENERATION_CLEANUP, "reservation", None),)
         if getattr(self, "termination_uncertain", False):
             return
         try:
@@ -1388,6 +1421,7 @@ class StrataEngine:
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
+                stopping[slot] = None
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
@@ -2151,6 +2185,7 @@ class StrataEngine:
                     self.log.close()
                 self.proc = None
                 self.termination_uncertain = False
+                self.slot_stopping = [None] * len(getattr(self, "slot_stopping", ()))
                 self.ended = True
                 self.progress, self.last = None, {}
                 self.progress_ms, self.reused = 0, 0
@@ -3118,7 +3153,8 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, launch_memory: dict | None = None):
+                 fit_max_tokens: bool = False, launch_memory: dict | None = None,
+                 max_queued_requests: int | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -3171,6 +3207,9 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.max_queued_requests = max_queued_requests_of({"max_queued_requests": max_queued_requests})
+        self._admitted = {}
+        self._admission_local = threading.local()
         self._lifecycle = "loaded" if self.loaded() else "unloaded"
         self._load_attempt = 0
         self._load_error = None
@@ -3194,6 +3233,50 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
+    def _admission_status(self):
+        """Caller holds status_lock. Native cancellation retains its occupied slots until acknowledgement."""
+        slots = max(1, getattr(self.engine, "batch", 0))
+        stopping = sum(bool(busy and owner is not None and
+                            (owner[0] is None or id(owner[0]) not in self._admitted))
+                       for busy, owner in zip(getattr(self.engine, "slot_busy", ()),
+                                              getattr(self.engine, "slot_stopping", ())))
+        return {"max_queued_requests": self.max_queued_requests, "active_slots": slots,
+                "reserved": len(self._admitted), "stopping_slots": stopping,
+                "queued": max(0, len(self._admitted) + stopping - slots)}
+
+    @contextlib.contextmanager
+    def generation_admission(self, *, request=False):
+        """Reserve once, before loading or preparation, and reuse it for nested run/MCP turns.
+
+        The FIFO and native slot scheduler still own ordering. This owner only bounds their total
+        outstanding reservations, with effective active slots separate from the waiting allowance.
+        """
+        reservation = {"gen": getattr(self.engine, "gen", None),
+                       "cancelled_gen": getattr(self.engine, "cancelled_gen", 0)}
+        with self.status_lock:
+            state = self._admission_status()
+            if (self.max_queued_requests is not None and
+                    len(self._admitted) + state["stopping_slots"] >= state["active_slots"] + self.max_queued_requests):
+                raise QueueFull("the generation queue is full; try again after a request finishes")
+            self._admitted[id(reservation)] = reservation
+        if request:
+            self._admission_local.reservation = reservation
+        try:
+            yield reservation
+        finally:
+            if request:
+                self._admission_local.reservation = None
+            with self.status_lock:
+                del self._admitted[id(reservation)]
+
+    def _check_admission_generation(self, reservation=None):
+        if reservation is None:
+            reservation = getattr(self._admission_local, "reservation", None)
+        cancelled = getattr(self.engine, "cancelled_gen", 0)
+        if (reservation is not None and cancelled > reservation["cancelled_gen"] and
+                (reservation["gen"] is None or reservation["gen"] <= cancelled)):
+            raise EngineDied("the owned engine ended after cancellation while this request waited")
+
     def lifecycle(self) -> str:
         if getattr(self.engine, "termination_uncertain", False):
             return "failed"
@@ -3209,7 +3292,7 @@ class Service:
 
     def _controls_busy(self):
         with self.status_lock:
-            busy = self.status.get("busy") or self.status.get("queued")
+            busy = self._admitted or self.status.get("busy") or self.status.get("queued")
         ctl = getattr(self.engine, "ctl", None)
         return bool(busy or any(getattr(self.engine, "slot_busy", ())) or getattr(self.engine, "waiting", 0)
                     or (ctl is not None and ctl.locked()))
@@ -3443,6 +3526,7 @@ class Service:
 
     def load(self, explicit: bool = False):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+        self._check_admission_generation()
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
         if not explicit and self.loaded() and not self._vision_down():
@@ -3459,6 +3543,7 @@ class Service:
                 raise ModelBusy("a request is running or queued")
             if not explicit and (shared_load or attempt != self._load_attempt) and self._load_error is not None:
                 raise self._load_error
+            self._check_admission_generation()
             loading = time.perf_counter()
             if trace is not None:
                 with self.status_lock:
@@ -3693,6 +3778,7 @@ class Service:
         the APIs, what is running, and the last request's timings in llama.cpp's names.  /metrics has the rest."""
         with self.status_lock:
             s, totals = dict(self.status), dict(self.totals)
+            admission = self._admission_status()
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
         hw, static = tel.get("now") or {}, tel.get("static") or {}
@@ -3720,6 +3806,7 @@ class Service:
                             "requested": max(1, int(getattr(self.engine, "requested_slots", getattr(self.engine, "batch", 0)) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
+            "admission": admission,
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
@@ -3990,6 +4077,22 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        current = getattr(self._admission_local, "reservation", None)
+        with (contextlib.nullcontext(current) if current is not None else self.generation_admission()) as reservation:
+            items = self._run(ids, thinking, tools, max_new, sampling, cancel, force, reservation)
+            try:
+                while True:
+                    with generation_cleanup_owner(reservation):
+                        try:
+                            item = next(items)
+                        except StopIteration:
+                            return
+                    yield item
+            finally:
+                with generation_cleanup_owner(reservation):
+                    items.close()
+
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force, reservation) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -4043,7 +4146,6 @@ class Service:
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
-        queued_gen = getattr(self.engine, "gen", None)
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
@@ -4060,8 +4162,7 @@ class Service:
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
                     with (self.fifo if par else contextlib.nullcontext()):
-                        if queued_gen is not None and queued_gen <= getattr(self.engine, "cancelled_gen", 0):
-                            raise EngineDied("the owned engine ended after cancellation while this request waited")
+                        self._check_admission_generation(reservation)
                         self.ensure_loaded()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
@@ -4158,9 +4259,9 @@ class Service:
                             raise
                         finally:
                             try:
-                                gen.close()             # STOP+drain to THIS request's DONE while still holding the
-                                #                         fifo, so a stop-token break can't leave the shared engine
-                                #                         queue mid-drain for the next request to read as its own DONE
+                                # STOP+drain to this request's DONE while holding the FIFO, so the next
+                                # request cannot read an old DONE as its own.
+                                gen.close()
                             except EngineSilent as e:   # #481: the STOP was never acknowledged: the engine is ended
                                 finish = "error"
                                 self._say_died(e)
@@ -5220,6 +5321,7 @@ def make_handler(svc: Service):
                 except (GpuBusy, EngineStarting, EngineStuck, EngineDied, ModelBusy, PlanError) as e:
                     self._json(409 if isinstance(e, ModelBusy) else 503, runtime_error_body(e))
                 return
+            admission = contextlib.ExitStack()
             try:
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -5255,6 +5357,7 @@ def make_handler(svc: Service):
                         self._json(503, runtime_error_body(e))
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    admission.enter_context(svc.generation_admission(request=True))
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -5283,6 +5386,8 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except QueueFull as e:
+                self._json(429, runtime_error_body(e))
             except ModelBusy as e:
                 self._json(409, runtime_error_body(e, "model_busy"))
             except StructuredOutputError as e:
@@ -5310,6 +5415,7 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
             finally:
+                admission.close()
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
@@ -5571,7 +5677,7 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
-            except (EngineDied, EngineStuck, PlanError) as e: # mid-stream: say so, then end the stream properly
+            except (EngineDied, EngineStuck, PlanError, QueueFull) as e: # mid-stream: say so, then end the stream properly
                 err = runtime_error_body(e)
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
@@ -5672,7 +5778,7 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
-            except (EngineDied, EngineStuck, PlanError) as e: # mid-stream: response.failed, then the stream ends
+            except (EngineDied, EngineStuck, PlanError, QueueFull) as e: # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, runtime_error_body(e)["error"]["message"], error_code(e), send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
@@ -5783,7 +5889,7 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()
                 events.close()
-            except (EngineDied, EngineStuck, PlanError) as e: # mid-stream: Anthropic's error event
+            except (EngineDied, EngineStuck, PlanError, QueueFull) as e: # mid-stream: Anthropic's error event
                 err = {"type": "error", **runtime_error_body(e, "api_error")}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
@@ -6279,6 +6385,10 @@ def main() -> int:
         except (OSError, ValueError) as e:
             ap.error(str(e))
     try:
+        max_queued_requests = max_queued_requests_of(cfg)
+    except ValueError as error:
+        ap.error(str(error))
+    try:
         if saved_plan is None:
             api_key = resolve_credentials(cfg, a.api_key)
     except ValueError as e:
@@ -6404,7 +6514,7 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
-                  launch_memory=launch_memory)
+                  launch_memory=launch_memory, max_queued_requests=max_queued_requests)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default

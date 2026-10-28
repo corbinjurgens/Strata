@@ -528,7 +528,7 @@ def config_for(folder: Path, pack: Path, context: int, key_config: Path | None,
            "tokenizer": str(pack / "tokenizer"), "model_name": "qwen3.8-flash-next-unsloth-ud-q2_k_xl",
            "log": str(ROOT / f"strata-{PROFILE}.log"), "lib_dirs": lib_dirs, "env": env,
            "gpu": gpu["index"], "gpus_asked": True, "parallel": 1, "port": 8080, "host": "127.0.0.1",
-           "fit_max_tokens": True, "open_browser": False,
+           "fit_max_tokens": True, "open_browser": False, "max_queued_requests": 32,
            "memory_policy": {"version": POLICY_VERSION, "generated_args": list(args),
                              "generated_env": dict(env), "overrides": overrides or {}, "sample": plan}}
     if key_config and key_config.is_file():

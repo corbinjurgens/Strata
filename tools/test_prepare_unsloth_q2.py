@@ -406,6 +406,15 @@ class PortableProfiles(unittest.TestCase):
         cfg["api_key"] = "legacy-test-credential-for-profile"
         return cfg
 
+    def test_generated_profiles_bound_generation_queue(self):
+        for context in (8192, 131072):
+            cfg = prep.config_for(self.root / "source", self.root / "pack", context, None)
+            self.assertEqual(cfg["max_queued_requests"], 32)
+            for value in (None, 0, 7):
+                cfg["max_queued_requests"] = value
+                refreshed = prep.refreshed_config(cfg)
+                self.assertEqual(refreshed["max_queued_requests"], value)
+
     def prepared_server(self, command, **kwargs):
         """Simulate the child server's preparation at the subprocess boundary."""
         config = Path(command[command.index("--config") + 1])

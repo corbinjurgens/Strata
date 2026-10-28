@@ -176,6 +176,26 @@ class Plans(unittest.TestCase):
         self.assertEqual(lp.read_plan(saved), a)
         self.assertEqual(lp.validate_inputs(a), a)
 
+    def test_queue_capacity_is_validated_and_frozen_exactly(self):
+        from types import SimpleNamespace
+        from serve import launch_runtime
+        for value in (None, 0, 32, 65536):
+            cfg = {**self.cfg, "max_queued_requests": value}
+            plan = self.plan(cfg)
+            self.assertIn("max_queued_requests", plan["server"])
+            self.assertEqual(plan["server"]["max_queued_requests"], value)
+            self.assertEqual(lp.validate_plan(plan)["server"]["max_queued_requests"], value)
+            saved = self.root / "queue-plan.json"
+            saved.write_bytes(lp.canonical(plan))
+            args = SimpleNamespace(launch_plan=str(saved), config=None, api_key=None)
+            with patch.object(launch_runtime, "admit"):
+                _, replayed, _ = launch_runtime.replay_cli(args, set())
+            self.assertEqual(replayed["max_queued_requests"], value)
+        self.assertNotIn("max_queued_requests", self.plan()["server"])
+        for value in (True, False, -1, 1.5, "32", 65537, [], {}):
+            with self.subTest(value=value), self.assertRaises(lp.PlanError):
+                self.plan({**self.cfg, "max_queued_requests": value})
+
     def test_generated_small_gpu_profiles_use_complete_policy(self):
         for context, kv, resident, budget, recent in ((8192, 1, 0, 22, 10176), (131072, 2, 20480, 21, 9816)):
             with self.subTest(context=context):

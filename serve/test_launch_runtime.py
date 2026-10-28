@@ -4,9 +4,11 @@ from __future__ import annotations
 import base64
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
+import queue
 from pathlib import Path
 import sys
 import socket
@@ -17,6 +19,7 @@ import urllib.request
 from unittest.mock import patch
 
 from serve import launch_plan as lp, server
+from serve import launch_runtime as lr
 from serve.frontend import ChatTemplate
 from serve import test_launch_plan as fixtures
 from tools import build_provenance
@@ -35,6 +38,38 @@ def ownership_frame(sequence=1, held=256, *, unknown=False, shards=1, capacity=1
     return f"STRATA-OWNERSHIP/1\n{sequence}\n{len(payload)}\n{payload}\nSTRATA-OWNERSHIP-END/1 {sequence}\n"
 
 
+def runtime_frame(sequence=1, held=256, *, plan=None, unknown=False, shards=1, settings=None,
+                  components=None, device=None):
+    """Independent synthetic row specimen; its sizes are transport oracles, not fit evidence."""
+    values = dict(context=8192, prefill=64, spec=2, kv=1, kv_resident=0, batch=0, batch_groups=1,
+                  parallel=1, auto_cache=1, per_layer=0, no_prefill_borrow=1, resident_budget=1024,
+                  resident_bytes=0, resident_experts=0, resident_pin=1, file_cache_effective=0,
+                  file_cache_compact=1, host_headroom=4096, vram_reserve=256, cache_slots=2,
+                  cache_bytes=512, shared_stage=0, ring=2, stager_threads=2, stager_ring=16,
+                  stager_batch=1, prefill_borrowed=0)
+    if plan:
+        values.update({k: plan["resolved"][k] for k in values if k in plan["resolved"]})
+    values.update(settings or {})
+    memory = components if components is not None else {
+        "vram": {"expert_cache": [512, 2096640, min(held, 512), 0, 0, 0],
+                 "session_including_resident_kv": [2048, 2095104, 1024, 0, 0, 0],
+                 "overhead_allowance": [0, 0, 0, 0, 0, values["vram_reserve"]]},
+        "ram": {"streamed_kv": [4096, 0, 3072, 4096, 4096, 0],
+                "file_cache_target": [128, 0, 64, 0, 0, 512],
+                "host_headroom_allowance": [0, 0, 0, 0, 0, values["host_headroom"]]}}
+    weights = ownership_frame(held=held, unknown=unknown, shards=shards).split("\n", 3)[3].split("\nSTRATA-OWNERSHIP-END", 1)[0]
+    if device:
+        weights = device + "\n" + weights.split("\n", 1)[1]
+    payload = weights + "total_allocated\tunknown\ndriver_os\tunknown\n"
+    payload += "".join(f"setting\t{k}\t{v}\n" for k, v in sorted(values.items()))
+    for space in ("vram", "ram"):
+        for name, numbers in sorted(memory.get(space, {}).items()):
+            state = "unknown" if unknown or numbers is None else "known"
+            fields = ["-"] * 6 if state == "unknown" else list(map(str, numbers))
+            payload += "\t".join(["component", space, name, state, *fields]) + "\n"
+    return f"STRATA-RUNTIME/1\n{sequence}\n{len(payload)}\n{payload}\nSTRATA-RUNTIME-END/1 {sequence}\n"
+
+
 def fake_runtime_main():
     """A subprocess fixture, including Windows stdout CRLF and raw stdin capture."""
     if "FIXTURE_NATIVE_PATH" in os.environ:
@@ -48,6 +83,7 @@ def fake_runtime_main():
     plan = json.loads((cwd / "approved.json").read_text())
     mode = (cwd / "mode.txt").read_text() if (cwd / "mode.txt").exists() else "ok"
     shards = int((cwd / "shards.txt").read_text()) if (cwd / "shards.txt").exists() else 1
+    runtime_enabled = (cwd / "runtime.txt").exists()
     if mode == "crlf":
         sys.stdout.reconfigure(newline="\r\n")
     frame = b""
@@ -85,15 +121,47 @@ def fake_runtime_main():
             sys.stdout.write(f"STRATA-EFFECTIVE/1\n1\n{len(payload)}\n{payload}")
         if mode != "no-ownership":
             sys.stdout.write(ownership_frame(shards=shards, unknown=mode == "unknown-start"))
+    if runtime_enabled:
+        raw = cwd / "native-runtime.bin"
+        if raw.exists():
+            sys.stdout.flush()
+            sys.stdout.buffer.write(raw.read_bytes())
+        else:
+            sys.stdout.write(runtime_frame(plan=plan, shards=shards, unknown=mode == "unknown-start",
+                                           settings={"prefill": 128} if mode == "bad-runtime" else None))
     print(f"READY {s['context'] + int(mode == 'bad-ready')} stop", flush=True)
     sequence = 1
+    runtime_sequence = 1
     for command in sys.stdin:
         command = command.strip()
         if command == "QUIT":
             if (cwd / "late.txt").exists() and frame:
                 sys.stdout.write(ownership_frame(sequence + 1, 512, shards=shards))
                 sys.stdout.flush()
+            if (cwd / "late.txt").exists() and runtime_enabled:
+                sys.stdout.write(runtime_frame(runtime_sequence + 1, 512, plan=plan, shards=shards))
+                sys.stdout.flush()
             return
+        if command.startswith("RUNTIME_"):
+            runtime_sequence += 2 if command == "RUNTIME_GAP" else 1
+            changed = {"prefill": 128} if command == "RUNTIME_CONTRADICT" else None
+            record = runtime_frame(runtime_sequence, 256 if command == "RUNTIME_SAME" else 512,
+                                   plan=plan, shards=shards, unknown=command == "RUNTIME_UNKNOWN", settings=changed)
+            if command == "RUNTIME_BAD":
+                record = record.replace("shard\t0\t512", "shard\t0\t513")
+            if command == "RUNTIME_TRUNCATED":
+                sys.stdout.write(record[:100])
+                sys.stdout.flush()
+                return
+            sys.stdout.write(record)
+            print("SYNC " + command, flush=True)
+            continue
+        if command.startswith("GEN "):
+            # ByteTokenizer's fixed answer exercises the real HTTP/parser path.
+            for token in b"Hello.":
+                print(f"T {token}")
+            print("DONE 6 1 1 1 stop", flush=True)
+            continue
         if command == "UPDATE":
             sequence += 1
             sys.stdout.write(ownership_frame(sequence, 512, shards=shards))
@@ -123,6 +191,243 @@ def fake_runtime_main():
                 return
             sys.stdout.write(record)
         print("SYNC " + command, flush=True)
+
+
+class RuntimeCodec(unittest.TestCase):
+    def engine(self, records=None):
+        return SimpleNamespace(records=records or lr.Records(), launch_plan=None,
+                               spawn=("fixture", ["--native", "model.gguf"], None, None))
+
+    def consume(self, records, frame):
+        stream = io.StringIO(frame)
+        self.assertTrue(records.consume(stream.readline(), stream))
+        return stream.read()
+
+    def stale_unchanged(self, before, after):
+        expected = copy.deepcopy(before)
+        error = after["current_ownership"]["error"]
+        self.assertIsNotNone(error)
+        self.assertNotIn("SYNTHETIC-SECRET", error)
+        expected["effective_state"] = "stale"
+        expected["effective_reason"] = error
+        expected["current_ownership"].update(freshness="stale", error=error)
+        expected["runtime_memory"].update(freshness="stale", error=error)
+        for space in ("vram", "ram"):
+            for row in expected["runtime_comparison"][space].values():
+                row["freshness"] = "stale"
+        self.assertEqual(after, expected)
+
+    def test_runtime_every_interruption_boundary_preserves_whole_publication(self):
+        good, update = runtime_frame(), runtime_frame(2, 512, settings={"prefill": 128})
+        for boundary in range(len(update)):
+            with self.subTest(boundary=boundary):
+                engine = self.engine()
+                self.consume(engine.records, good)
+                before = lr.status(engine)[0]
+                engine.proc = SimpleNamespace(stdout=io.StringIO(update[:boundary]))
+                engine.lines, engine.slot_q = queue.Queue(), []
+                engine._native_lines = server.StrataEngine._native_lines
+                server.StrataEngine._pump(engine)
+                self.stale_unchanged(before, lr.status(engine)[0])
+                self.assertIsNone(engine.lines.get_nowait())
+                self.assertTrue(engine.lines.empty())
+
+    def test_runtime_closed_rows_bounds_and_reconciliation_are_atomic(self):
+        original = runtime_frame(2, 512).split("\n", 3)[3].split("\nSTRATA-RUNTIME-END", 1)[0]
+        mutations = [
+            original.replace("setting\tkv\t1", "setting\tkv\t4"),
+            original.replace("setting\tauto_cache\t1", "setting\tauto_cache\t2"),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t064"),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t18446744073709551616"),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t+64"),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t64\nsetting\tprefill\t64"),
+            original.replace("setting\tprefill\t64\n", ""),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t64\nsetting\tsecret\t123"),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t64\nsetting\tSYNTHETIC-SECRET\t1"),
+            original.replace("setting\tprefill\t64", "setting\tprefill\t64\textra"),
+            original.replace("setting\tprefill_borrowed\t0", "setting\tprefill_borrowed\t1"),
+            original.replace("setting\tparallel\t1", "setting\tparallel\t2"),
+            original.replace("component\tvram\texpert_cache\tknown", "component\tvram\texpert_cache\tmaybe"),
+            original.replace("component\tvram\texpert_cache", "component\tvram\tunknown_owner"),
+            original.replace("component\tvram\texpert_cache", "component\tdevice\texpert_cache"),
+            original.replace("known\t512\t2096640\t512", "known\t512\t2096640\t513"),
+            original.replace("known\t512\t2096640\t512", "known\t512\t18446744073709551615\t512"),
+            original.replace("known\t4096\t0\t3072\t4096\t4096", "known\t4096\t0\t3072\t4097\t4096"),
+            original.replace("known\t4096\t0\t3072\t4096\t4096", "known\t4096\t0\t3072\t4096\t4097"),
+            original.replace("shard\t0\t512\t496\t16", "shard\t0\t512\t495\t16"),
+            original.replace("shards\t1", "shards\t65"),
+            original.replace("shard\t0", "shard\t1"),
+            original.replace("total_allocated\tunknown", "total_allocated\t0"),
+            original.replace("driver_os\tunknown", "driver_os\tknown"),
+            original.replace("physical\tunavailable", "physical\t0"),
+            original.replace("device\t63756461", "device\t6375646A"),
+            original.replace("303030303a30313a30302e30", "756e617661696c61626c65"),
+            original + "unrecognized\t1\n", original[:-1],
+        ]
+        lines = original.splitlines(keepends=True)
+        settings = [i for i, line in enumerate(lines) if line.startswith("setting\t")]
+        swapped = list(lines)
+        swapped[settings[0]], swapped[settings[1]] = swapped[settings[1]], swapped[settings[0]]
+        mutations.append("".join(swapped))
+        components = [line for line in lines if line.startswith("component\t")]
+        mutations += [original + components[-1], original.replace(components[0], components[-1], 1)]
+        unknown = runtime_frame(2, unknown=True).split("\n", 3)[3].split("\nSTRATA-RUNTIME-END", 1)[0]
+        mutations.append(unknown.replace("unknown\t-\t-\t-\t-\t-\t-", "unknown\t0\t-\t-\t-\t-\t-", 1))
+        for payload in mutations:
+            with self.subTest(payload=payload):
+                engine = self.engine()
+                self.consume(engine.records, runtime_frame())
+                before = lr.status(engine)[0]
+                frame = f"STRATA-RUNTIME/1\n2\n{len(payload)}\n{payload}\nSTRATA-RUNTIME-END/1 2\n"
+                self.assertEqual(self.consume(engine.records, frame + "SYNC\n"), "SYNC\n")
+                self.stale_unchanged(before, lr.status(engine)[0])
+                self.assertEqual(engine.records.runtime_sequence, 1)
+
+    def test_runtime_envelope_sequences_gaps_and_independent_legacy_sequence(self):
+        for bad in (runtime_frame(0), runtime_frame(2), runtime_frame(18446744073709551616),
+                    runtime_frame().replace("\n1\n", "\n01\n", 1),
+                    runtime_frame().replace("STRATA-RUNTIME/1", "STRATA-RUNTIME/2", 1),
+                    "STRATA-RUNTIME/1\n1\n16257\n",
+                    runtime_frame().replace("STRATA-RUNTIME-END/1 1", "STRATA-RUNTIME-END/1 2")):
+            engine = self.engine()
+            self.consume(engine.records, bad)
+            self.assertIsNone(lr.status(engine)[0]["effective"])
+            self.assertEqual(engine.records.runtime_sequence, 0)
+            self.assertIsNotNone(engine.records.error)
+        engine = self.engine()
+        self.consume(engine.records, ownership_frame())
+        self.consume(engine.records, runtime_frame())
+        self.assertEqual((engine.records.sequence, engine.records.runtime_sequence), (1, 1))
+        self.consume(engine.records, runtime_frame(2))  # cache revision with identical byte totals
+        self.assertEqual(lr.status(engine)[0]["runtime_memory"]["sequence"], 2)
+        self.consume(engine.records, ownership_frame(2, 512))
+        self.assertEqual(lr.status(engine)[0]["current_ownership"]["shards"][0]["logical_bytes"], 256)
+        self.consume(engine.records, runtime_frame(4, 512))
+        launch = lr.status(engine)[0]
+        self.assertEqual(launch["current_ownership"]["sequence"], 4)
+        self.assertEqual(launch["current_ownership"]["shards"][0]["logical_bytes"], 512)
+        self.assertEqual(launch["runtime_memory"]["freshness"], "stale")
+        self.assertIn("sequence gap", launch["runtime_memory"]["error"])
+        self.consume(engine.records, runtime_frame(5))
+        self.assertEqual(lr.status(engine)[0]["runtime_memory"]["freshness"], "stale")
+        for bad in (runtime_frame(5), runtime_frame(3), runtime_frame(0)):
+            before = lr.status(engine)[0]
+            self.consume(engine.records, bad)
+            self.stale_unchanged(before, lr.status(engine)[0])
+        engine.records = lr.Records()
+        self.consume(engine.records, runtime_frame())
+        self.consume(engine.records, runtime_frame(lr.U64))
+        self.assertEqual(engine.records.runtime_sequence, lr.U64)
+        self.consume(engine.records, runtime_frame(0))
+        self.assertEqual(engine.records.runtime_sequence, lr.U64)
+
+    def test_runtime_unknown_devices_and_component_overflow(self):
+        engine = self.engine()
+        self.consume(engine.records, runtime_frame())
+        self.consume(engine.records, runtime_frame(2, unknown=True))
+        launch = lr.status(engine)[0]
+        self.assertEqual(launch["current_ownership"]["freshness"], "unknown")
+        self.assertIsNone(launch["current_ownership"]["totals"])
+        self.assertIsNone(launch["current_ownership"]["shards"])
+        self.assertEqual(launch["current_ownership"]["last_valid_snapshot"]["sequence"], 1)
+        self.assertEqual(launch["effective"]["prefill"], 64)
+        self.assertIsNone(launch["runtime_memory"]["components"]["vram"]["expert_cache"]["requested_bytes"])
+        for device in ("device\t63756461\t0\t756e617661696c61626c65",
+                       "device\t686970\t0\t756e617661696c61626c65",
+                       "device\t7379636c\t1\t756e617661696c61626c65",
+                       "device\t63756461\t1\t303030303a30313a30302e30"):
+            records = lr.Records()
+            self.consume(records, runtime_frame(unknown=True, device=device))
+            self.assertIsNone(records.error)
+            self.assertIsNone(records.public()["totals"])
+            self.assertIsNone(records.public()["shards"])
+        for device in ("device\t6f70656e636c\t0\t756e617661696c61626c65",
+                       "device\t63756461\t4294967296\t756e617661696c61626c65",
+                       "device\t63756461\t0\t66616b65"):
+            records = lr.Records()
+            self.consume(records, runtime_frame(unknown=True, device=device))
+            self.assertIsNotNone(records.error)
+            self.assertIsNone(records.public()["totals"])
+        before = lr.status(engine)[0]
+        self.consume(engine.records, runtime_frame(3, device="device\t63756461\t0\t303030303a30323a30302e30"))
+        self.stale_unchanged(before, lr.status(engine)[0])
+        records = lr.Records()
+        self.consume(records, runtime_frame(components={"vram": {
+            "expert_cache": [lr.U64, 0, 0, 0, 0, 0], "decode_auxiliary": [1, 0, 0, 0, 0, 0]}}))
+        self.assertIsNotNone(records.error)
+        self.assertIsNone(records.publication()["components"])
+
+    def test_runtime_status_samples_one_publication_even_during_replacement(self):
+        first, second = lr.Records(), lr.Records()
+        self.consume(first, runtime_frame())
+        self.consume(second, runtime_frame(settings={"prefill": 128}, held=512))
+        engine = self.engine(first)
+        expected = lr.status(engine)
+        original = copy.deepcopy
+        holdings = first._runtime_published[1]["weights"]
+        def replace(value):
+            if value is holdings:
+                first._runtime_published = second._runtime_published
+            return original(value)
+        with patch.object(lr.copy, "deepcopy", side_effect=replace):
+            self.assertEqual(lr.status(engine), expected)
+        self.assertEqual(lr.status(engine)[0]["effective"]["prefill"], 128)
+
+    def test_runtime_component_comparison_bases_unknown_absent_and_extra(self):
+        records = lr.Records()
+        self.consume(records, runtime_frame())
+        estimates = {"vram": {"expert_cache": 2097152, "overhead_allowance": 300, "weights_canonical": 1024},
+                     "ram": {"streamed_kv": 3000, "file_cache_target": 512, "host_headroom_allowance": 4096}}
+        comparison = lr.component_comparison(estimates, records.publication()["components"], "current")
+        cache = comparison["vram"]["expert_cache"]
+        self.assertEqual((cache["state"], cache["basis"], cache["actual_comparable_bytes"], cache["delta_bytes"]),
+                         ("comparable", "allocator_granule_model", 2097152, 0))
+        self.assertEqual(cache["actual"], {"state": "known", "requested_bytes": 512, "rounding_bytes": 2096640,
+                                         "rounded_bytes": 2097152, "logical_bytes": 256, "mapped_bytes": 0,
+                                         "pinned_bytes": 0, "allowance_bytes": 0})
+        self.assertEqual(comparison["vram"]["weights_canonical"]["state"], "absent")
+        self.assertIsNone(comparison["vram"]["weights_canonical"]["delta_bytes"])
+        self.assertEqual(comparison["vram"]["session_including_resident_kv"]["state"], "extra")
+        self.assertIsNone(comparison["vram"]["session_including_resident_kv"]["delta_bytes"])
+        self.assertEqual((comparison["vram"]["overhead_allowance"]["basis"],
+                          comparison["vram"]["overhead_allowance"]["delta_bytes"]), ("policy_allowance", -44))
+        self.assertEqual((comparison["ram"]["streamed_kv"]["basis"], comparison["ram"]["streamed_kv"]["delta_bytes"]),
+                         ("logical_payload", 72))
+        self.assertEqual(comparison["ram"]["file_cache_target"]["actual_comparable_bytes"], 512)
+        self.assertEqual(comparison["ram"]["file_cache_target"]["actual"]["requested_bytes"], 128)
+        self.consume(records, runtime_frame(2, unknown=True))
+        unknown = lr.component_comparison(estimates, records.publication()["components"], "unknown")
+        self.assertEqual(unknown["vram"]["expert_cache"]["state"], "unknown")
+        self.assertIsNone(unknown["vram"]["expert_cache"]["delta_bytes"])
+        unavailable = lr.component_comparison(estimates, None, "unavailable")
+        self.assertEqual(unavailable["ram"]["streamed_kv"]["state"], "unavailable")
+
+    def test_runtime_shard_order_binding_and_unsupported_topology(self):
+        disabled = lr.Records()
+        self.consume(disabled, runtime_frame(settings={"prefill": 0}))
+        self.assertIsNone(disabled.error)
+        self.assertEqual(disabled.publication()["effective"]["prefill"], 0)
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("payload read")):
+            records = lr.Records(argv=["engine", "--serve", "--native", "model-00001-of-00002.gguf"], cwd=str(Path.cwd()))
+            self.consume(records, runtime_frame(shards=2))
+        self.assertIsNone(records.error)
+        self.assertEqual([row["path"] for row in records.public()["shards"]],
+                         [str(Path.cwd() / "model-00001-of-00002.gguf"), str(Path.cwd() / "model-00002-of-00002.gguf")])
+        before = lr.status(self.engine(records))[0]
+        self.consume(records, runtime_frame(2, shards=1))
+        self.stale_unchanged(before, lr.status(self.engine(records))[0])
+        for argv in (["engine", "--native"], ["engine", "--pack", "pack"],
+                     ["engine", "--native", "a", "--native", "b"],
+                     ["engine", "--native", "model-00001-of-00065.gguf"]):
+            records = lr.Records(argv=argv)
+            self.consume(records, runtime_frame())
+            self.assertIsNotNone(records.error)
+            self.assertIsNone(records.public()["totals"])
+        for unknown in (False, True):
+            records = lr.Records()
+            self.consume(records, runtime_frame(unknown=unknown, settings={"batch": 4, "parallel": 4}))
+            self.assertEqual(records.error is None, unknown)
+            self.assertIsNone(records.public()["totals"])
 
 
 class Runtime(unittest.TestCase):
@@ -196,6 +501,165 @@ class Runtime(unittest.TestCase):
         engine.proc.stdin.flush()
         return engine.lines.get(timeout=5)
 
+    def test_runtime_ordinary_public_http_applied_components_and_process_replacement(self):
+        (self.root / "runtime.txt").write_text("enable coherent runtime fixture")
+        with patch.dict(os.environ, {"STRATA_API_KEY": "SYNTHETIC-SECRET"}):
+            engine = self.start(ordinary=True)
+        svc, base = self.service(engine)
+        before = self.get_status(base)["launch"]
+        self.assertEqual((before["mode"], before["plan_digest"], before["effective_state"]), ("ordinary", None, "observed"))
+        self.assertIsNone(before["approved"])
+        self.assertIsNone(before["verified_startup"])
+        self.assertEqual(before["native_argv"], self.spawns[0][0])
+        self.assertEqual({k: before["effective"][k] for k in ("context", "prefill", "kv", "parallel", "cache_slots", "cache_bytes")},
+                         {"context": 8192, "prefill": 64, "kv": 1, "parallel": 1, "cache_slots": 2, "cache_bytes": 512})
+        self.assertNotIn("verified", before["effective"])
+        self.assertEqual(before["runtime_memory"]["protocol"], "STRATA-RUNTIME/1")
+        self.assertEqual(before["runtime_memory"]["components"]["ram"]["streamed_kv"]["mapped_bytes"], 4096)
+        self.assertEqual(before["current_ownership"]["shards"][0]["path"], str(self.root / "model.gguf"))
+        self.assertEqual(self.command(engine, "RUNTIME_UPDATE"), "SYNC RUNTIME_UPDATE\n")
+        after = self.get_status(base)["launch"]
+        self.assertEqual(after["runtime_memory"]["sequence"], 2)
+        self.assertEqual(after["current_ownership"]["shards"][0]["logical_bytes"], 512)
+        self.assertEqual(after["runtime_memory"]["components"]["vram"]["expert_cache"]["logical_bytes"], 512)
+        self.assertEqual(self.command(engine, "RUNTIME_SAME"), "SYNC RUNTIME_SAME\n")
+        self.assertEqual(self.get_status(base)["launch"]["runtime_memory"]["sequence"], 3)
+        self.assertEqual(self.command(engine, "RUNTIME_CONTRADICT"), "SYNC RUNTIME_CONTRADICT\n")
+        self.assertEqual(self.get_status(base)["launch"]["effective"]["prefill"], 128)
+        self.assertEqual(self.get_status(base)["launch"]["effective_state"], "observed")
+        self.assertNotIn("SYNTHETIC-SECRET", json.dumps(self.get_status(base)))
+        predecessor = engine.records
+        old_proc, old_pump = engine.proc, engine.pump
+        (self.root / "late.txt").write_text("late runtime publication")
+        engine.restart()
+        self.assertIsNotNone(old_proc.poll())
+        self.assertFalse(old_pump.is_alive())
+        self.assertEqual(predecessor.runtime_sequence, 5)
+        current = self.get_status(base)["launch"]
+        self.consume_runtime(predecessor, runtime_frame(6, 512, settings={"prefill": 256}))
+        self.assertEqual(self.get_status(base)["launch"], current)
+        self.assertEqual(self.command(engine, "RUNTIME_UNKNOWN"), "SYNC RUNTIME_UNKNOWN\n")
+        unknown = self.get_status(base)["launch"]
+        self.assertIsNone(unknown["current_ownership"]["totals"])
+        self.assertIsNone(unknown["runtime_memory"]["components"]["vram"]["expert_cache"]["requested_bytes"])
+        engine.unload()
+        unloaded = self.get_status(base)["launch"]
+        self.assertIsNone(unloaded["effective"])
+        self.assertIsNone(unloaded["runtime_memory"]["components"])
+        self.assertFalse(svc.loaded())
+        svc.load()
+        self.assertEqual(self.get_status(base)["launch"]["runtime_memory"]["sequence"], 1)
+
+    def consume_runtime(self, records, frame):
+        stream = io.StringIO(frame)
+        self.assertTrue(records.consume(stream.readline(), stream))
+
+    def test_runtime_planned_public_http_strict_startup_and_contradiction_boundary(self):
+        (self.root / "runtime.txt").write_text("enable coherent runtime fixture")
+        engine = self.start()
+        _, base = self.service(engine)
+        before = self.get_status(base)["launch"]
+        self.assertEqual(before["plan_digest"], self.saved["plan_digest"])
+        self.assertEqual({k: before["approved"][k] for k in ("context", "prefill", "cache_slots", "cache_bytes")},
+                         {"context": 8192, "prefill": 64, "cache_slots": 2, "cache_bytes": 512})
+        self.assertNotIn("slots", before["approved"])
+        self.assertNotIn("resident_order", before["approved"])
+        self.assertEqual(before["requested"], self.saved["requested"])
+        self.assert_effective(before["verified_startup"])
+        self.assertEqual(before["effective"]["cache_slots"], 2)
+        self.assertNotIn("verified", before["effective"])
+        cache = before["runtime_comparison"]["vram"]["expert_cache"]
+        self.assertEqual((cache["estimated_bytes"], cache["actual_comparable_bytes"], cache["delta_bytes"]),
+                         (512, 2097152, 2096640))
+        self.assertEqual(before["runtime_comparison"]["vram"]["weights"]["state"], "absent")
+        self.assertEqual(before["runtime_comparison"]["ram"]["streamed_kv"]["state"], "extra")
+        self.assertEqual(self.command(engine, "RUNTIME_UPDATE"), "SYNC RUNTIME_UPDATE\n")
+        self.assertEqual((engine.records.sequence, engine.records.runtime_sequence), (1, 2))
+        before = self.get_status(base)["launch"]
+        self.assertEqual(self.command(engine, "RUNTIME_CONTRADICT"), "SYNC RUNTIME_CONTRADICT\n")
+        RuntimeCodec.stale_unchanged(self, before, self.get_status(base)["launch"])
+        engine.close()
+        (self.root / "mode.txt").write_text("bad-runtime")
+        with self.startup_handles() as (processes, readers, _), self.assertRaisesRegex(RuntimeError, "invalid_launch_plan"):
+            self.start()
+        self.assertTrue(processes[0].stdin.closed)
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(all(not reader.is_alive() for reader in readers))
+
+    def test_runtime_native_cpp_emitter_decoder_and_public_status(self):
+        producer = os.environ.get("PAIR_TEST_RUNTIME_CODEC")
+        if not producer:
+            self.skipTest("PAIR_TEST_RUNTIME_CODEC absent: real native producer is unverified")
+        child_env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
+        result = subprocess.run([producer, "--runtime-fixture"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=15, env=child_env, cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertEqual(result.stderr, b"")
+        self.assertLessEqual(len(result.stdout), 16384)
+        text = result.stdout.decode("ascii")
+        records = lr.Records()
+        stream = io.StringIO(text)
+        self.assertTrue(records.consume(stream.readline(), stream))
+        self.assertEqual(stream.read(), "")
+        self.assertIsNone(records.error)
+        self.assertEqual(records.runtime_sequence, 1)
+        (self.root / "runtime.txt").write_text("forward exact native producer bytes")
+        (self.root / "native-runtime.bin").write_bytes(result.stdout)
+        engine = self.start(ordinary=True)
+        _, base = self.service(engine)
+        launch = self.get_status(base)["launch"]
+        self.assertEqual((launch["effective"]["context"], launch["effective"]["cache_slots"], launch["effective"]["cache_bytes"]),
+                         (8192, 3, 768))
+        self.assertEqual(launch["current_ownership"]["totals"]["capacity_bytes"], 768)
+        self.assertEqual(launch["current_ownership"]["shards"][0]["logical_bytes"], 56)
+        self.assertEqual(launch["runtime_memory"]["components"]["vram"]["expert_cache"], {
+            "state": "known", "requested_bytes": 768, "rounding_bytes": 2096384, "rounded_bytes": 2097152,
+            "logical_bytes": 56, "mapped_bytes": 0, "pinned_bytes": 0, "allowance_bytes": 0})
+        self.assertEqual(launch["runtime_memory"]["components"]["ram"]["streamed_kv"], {
+            "state": "known", "requested_bytes": 75498496, "rounding_bytes": 0, "rounded_bytes": 75498496,
+            "logical_bytes": 75497472, "mapped_bytes": 75498496, "pinned_bytes": 75498496, "allowance_bytes": 0})
+        self.assertIsNone(launch["runtime_memory"]["total_allocated_bytes"])
+        self.assertIsNone(launch["runtime_comparison"]["physical_residency_bytes"])
+        print(f"native-runtime-codec executed=True bytes={len(result.stdout)} decoder=True ordinary-public-status=True")
+
+    def test_runtime_process_corruption_unknown_and_gap_public_outcomes(self):
+        (self.root / "runtime.txt").write_text("enable coherent runtime fixture")
+        for command in ("RUNTIME_BAD", "RUNTIME_TRUNCATED", "RUNTIME_GAP", "RUNTIME_UNKNOWN"):
+            with self.subTest(command=command):
+                engine = self.start()
+                _, base = self.service(engine)
+                before = self.get_status(base)["launch"]
+                engine.proc.stdin.write(command + "\n")
+                engine.proc.stdin.flush()
+                if command == "RUNTIME_TRUNCATED":
+                    engine.pump.join(5)
+                    self.assertFalse(engine.pump.is_alive())
+                    self.assertIsNone(engine.lines.get(timeout=5))
+                    self.assertTrue(engine.lines.empty())
+                else:
+                    self.assertEqual(engine.lines.get(timeout=5), "SYNC " + command + "\n")
+                after = self.get_status(base)["launch"]
+                if command in ("RUNTIME_BAD", "RUNTIME_TRUNCATED"):
+                    RuntimeCodec.stale_unchanged(self, before, after)
+                elif command == "RUNTIME_GAP":
+                    self.assertEqual(after["runtime_memory"]["sequence"], 3)
+                    self.assertEqual(after["current_ownership"]["shards"][0]["logical_bytes"], 512)
+                    self.assertEqual(after["runtime_memory"]["components"]["vram"]["expert_cache"]["logical_bytes"], 512)
+                    self.assertEqual(after["runtime_memory"]["freshness"], "stale")
+                    self.assertIn("sequence gap", after["runtime_memory"]["error"])
+                else:
+                    self.assertEqual(after["runtime_memory"]["sequence"], 2)
+                    self.assertEqual(after["current_ownership"]["freshness"], "unknown")
+                    self.assertIsNone(after["current_ownership"]["totals"])
+                    self.assertIsNone(after["current_ownership"]["shards"])
+                    self.assertIsNone(after["runtime_memory"]["components"]["vram"]["expert_cache"]["requested_bytes"])
+                    self.assertEqual(after["current_ownership"]["last_valid_snapshot"]["sequence"], 1)
+                    self.assertEqual(engine.records.sequence, 1)
+                engine.close()
+                self.http.shutdown()
+                self.http.server_close()
+
     def captures(self):
         return [json.loads(line) for line in (self.root / "capture.jsonl").read_text().splitlines()]
 
@@ -212,6 +676,129 @@ class Runtime(unittest.TestCase):
             self.saved = self.original_producer(cfg, hardware=fixtures.HARDWARE, inherited=self.env,
                                                query=query or self.query, source_config=cfg, config_path=self.config_path)
         self.saved_path.write_bytes(lp.canonical(self.saved))
+
+    def test_documented_first_use_cli_http_and_cleanup(self):
+        """PAIR_INTEGRATION.md sequence, with synthetic hardware/artifacts only."""
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        cfg = copy.deepcopy(self.cfg)
+        cfg.update(host="127.0.0.1", port=port, lazy_load=True, aliases=["approved-alias"])
+        tokenizer = Path(cfg["tokenizer"])
+        tokenizer.mkdir()
+        for name, value in (("vocab.json", "{}"), ("merges.txt", ""), ("token_type.json", "[]")):
+            (tokenizer / name).write_text(value)
+        self.config_path.write_bytes(lp.canonical(cfg))
+        before = self.state()
+        outputs = []
+        for mode in ("--print-launch-plan", "--print-launch-plan", "--estimate-memory"):
+            output = io.StringIO()
+            with patch.dict(os.environ, self.env, clear=True), \
+                    patch.object(sys, "argv", ["server", "--engine", "strata", "--config",
+                                               str(self.config_path), "--port", str(port), mode]), \
+                    patch.object(lp, "produce_plan", self.original_producer), \
+                    patch.object(fixtures.prep, "refreshed_config", self.original_refresh), \
+                    patch.object(server, "Server", side_effect=AssertionError("dry-run bind")), \
+                    patch.object(server, "Service", side_effect=AssertionError("dry-run service")), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(server.main(), 0)
+            outputs.append(output.getvalue())
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.spawns, [])
+        self.saved = json.loads(outputs[0])
+        independent = json.dumps({k: v for k, v in self.saved.items() if k != "plan_digest"},
+                                 sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                                 allow_nan=False).encode("ascii")
+        self.assertEqual(self.saved["schema"], 1)
+        self.assertEqual(self.saved["plan_digest"], hashlib.sha256(independent).hexdigest())
+        estimate = json.loads(outputs[2])
+        self.assertEqual(estimate["kind"], "strata_memory_estimate")
+        self.assertEqual(estimate["plan_digest"], self.saved["plan_digest"])
+        self.assertEqual(estimate["estimates"], self.saved["estimates"])
+        self.saved_path.write_bytes(outputs[0].encode("ascii"))
+        guide = (server.ROOT / "docs/PAIR_INTEGRATION.md").read_text(encoding="utf-8")
+        recipe = guide.split("@'\n", 1)[1].split("\n'@ | python -B -", 1)[0]
+        verified = subprocess.run([sys.executable, "-B", "-", str(self.saved_path)], input=recipe,
+                                  text=True, capture_output=True, timeout=10)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(verified.stdout.strip(), self.saved["plan_digest"])
+        real_serve, services, processes, readers, servers = server.serve, [], [], [], []
+
+        def ready(svc, host, port):
+            self.assertEqual((host, port), ("127.0.0.1", self.saved["server"]["port"]))
+            services.append(svc)
+            self.addCleanup(svc.engine.close)
+            http = real_serve(svc, host, port)
+            servers.append(http)
+            self.addCleanup(self.close_http, http)
+            base = f"http://127.0.0.1:{port}"
+
+            def request(path, body=None):
+                req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    return json.load(response)
+
+            self.assertEqual(request("/v1/models")["data"][0]["status"], {"value": "unloaded"})
+            self.assertIsNone(svc.engine.proc)
+            loaded = request("/v1/load", {"model": "approved-alias"})
+            self.assertEqual((loaded["status"], loaded["lifecycle"], loaded["loaded"]), ("loaded", "loaded", True))
+            processes.append(svc.engine.proc)
+            readers.append(svc.engine.pump)
+            current = request("/v1/status")
+            self.assertEqual(current["launch"]["plan_digest"], self.saved["plan_digest"])
+            self.assertEqual(current["launch"]["native_argv"], self.saved["launch"]["argv"])
+            self.assert_effective(current["launch"]["effective"])
+            self.assertEqual(current["launch"]["current_ownership"]["shards"][0]["logical_bytes"], 256)
+            self.assertEqual(current["engine_build"], {"status": "current", "reason": None,
+                             "commit": "synthetic", "dirty": True, "built_at": "2026-01-01T00:00:00Z",
+                             "cuda": "synthetic", "version": "test", "backend": "cuda"})
+            self.assertEqual([m["id"] for m in request("/v1/models")["data"]], ["synthetic", "approved-alias"])
+            answer = request("/v1/chat/completions", {"model": "approved-alias", "messages": [
+                             {"role": "user", "content": "Hello"}], "max_tokens": 32, "reasoning_effort": "none"})
+            self.assertEqual(answer["choices"][0]["message"]["content"], "Hello.")
+            self.assertEqual(answer["model"], "approved-alias")
+            unloaded = request("/v1/unload", {})
+            self.assertEqual((unloaded["status"], unloaded["loaded"], unloaded["lifecycle"]),
+                             ("unloaded", False, "unloaded"))
+            self.assertEqual(request("/v1/unload", {})["status"], "not loaded")
+            self.assertEqual(request("/v1/models")["data"][0]["status"], {"value": "unloaded"})
+            self.assertIsNone(unloaded["launch"]["effective"])
+            self.assertEqual(unloaded["engine_build"]["status"], "unavailable")
+            return http
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(sys, "argv", ["server", "--launch-plan", str(self.saved_path)]), \
+                patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=lambda *a: server.ByteTokenizer())}), \
+                patch.object(server, "serve", side_effect=ready), \
+                patch.object(server, "engine_args", side_effect=AssertionError("recomposed argv")), \
+                patch.object(server.signal, "signal"), \
+                patch.object(server.time, "sleep", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server.main(), 0)
+        self.assertEqual(len(services), 1)
+        self.assertEqual(len(self.spawns), 1)
+        capture = self.captures()[0]
+        self.assertEqual(capture["argv"], self.saved["launch"]["argv"][1:])
+        self.assertEqual(capture["cwd"], self.saved["launch"]["cwd"])
+        self.assertEqual(capture["environment"], self.saved["launch"]["environment"]["set"])
+        self.assertFalse(capture["credential_present"])
+        self.assertEqual(base64.b64decode(capture["frame"]), lp.strict_frame(self.saved))
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(processes[0].stdin.closed and processes[0].stdout.closed)
+        self.assertFalse(readers[0].is_alive())
+        self.assertEqual(servers[0].socket.fileno(), -1)
+        with socket.socket() as released:
+            released.bind(("127.0.0.1", port))
+        # A now-impossible saved plan refuses before any bind or engine spawn.
+        self.hardware.return_value["ram_available_bytes"] = 1
+        self.assertEqual(self.main_refusal([])["code"], "insufficient_resources")
+        self.assertEqual(len(self.spawns), 1)
+        print("first-use-fixture schema=1 repeatable=True documented_digest=True exact_replay=True "
+              "models/load/status/build/chat/unload=200 impossible_plan=insufficient_resources "
+              "child_exited=True pipes_closed=True reader_stopped=True listener_released=True")
 
     def test_public_main_eager_lazy_frozen_settings_and_original_credential_source(self):
         for lazy in (False, True):

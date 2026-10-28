@@ -56,7 +56,7 @@ SERVER_KEYS = {
     "idle_unload_s", "engine_silence_s", "api_monitor", "open_browser", "min_free_vram_mib",
     "allowed_hosts", "cors_origins", "trusted_origins", "anthropic_thinking", "effort_position",
     "tool_call_recovery", "reasoning_close_retry", "codex_thread_titles", "codex_compaction_cache",
-    "launch_memory_metrics", "slot_save_path",
+    "launch_memory_metrics", "slot_save_path", "max_queued_requests",
 }
 CONFIG_KEYS = SERVER_KEYS | {"exe", "args", "cwd", "env", "lib_dirs", "backend", "gpu", "gpus_asked",
                              "parallel", "memory_policy", "build_metadata", "log", "api_key", "api_key_file"}
@@ -139,9 +139,11 @@ def _keys(value, keys):
 def server_settings(cfg, cwd):
     """Freeze effective server fields through their ordinary pure validation owners."""
     from serve.server import (allowed_hosts_of, engine_silence_s, model_aliases, normalized_slot_save_dir,
-                              origins_of, sampling_defaults_from_config)
+                              origins_of, sampling_defaults_from_config, max_queued_requests_of)
     out = {k: copy.deepcopy(v) for k, v in cfg.items() if k in SERVER_KEYS}
     try:
+        if "max_queued_requests" in out:
+            out["max_queued_requests"] = max_queued_requests_of(out)
         if "engine_silence_s" in out:
             out["engine_silence_s"] = engine_silence_s(out)
         if "sampling" in out:
