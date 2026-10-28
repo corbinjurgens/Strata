@@ -51,6 +51,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TOKENIZER = str(ROOT / "pack/full/tokenizer")
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
@@ -602,7 +603,16 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False):
+                 env: dict | None = None, lazy: bool = False, launch_plan: dict | None = None):
+        from serve.launch_runtime import Records, admit, build_record
+        import copy
+        self.launch_plan = copy.deepcopy(launch_plan)
+        if self.launch_plan:
+            from serve.launch_plan import validate_plan
+            validate_plan(self.launch_plan)
+            exe, args, cwd = (self.launch_plan["launch"]["executable"], self.launch_plan["launch"]["argv"][3:],
+                              self.launch_plan["launch"]["cwd"])
+        self.records = Records(self.launch_plan)
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -625,6 +635,16 @@ class StrataEngine:
             self.info["version"] = None
         if lazy:
             return
+        if self.launch_plan:
+            build = admit(self.launch_plan)
+            from serve.launch_plan import replay_environment
+            env = replay_environment(self.launch_plan["launch"]["environment"])
+        else:
+            try:
+                build = build_record(exe)
+            except (OSError, ValueError):
+                build = None
+        self.records = Records(self.launch_plan, build)
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
@@ -645,113 +665,155 @@ class StrataEngine:
             except OSError:
                 pass
         self.max_context = 0                             # before the new process is visible: never its predecessor's
-        self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
-        contain(self.proc)                               # ends with the server, however it ends (Windows)
-        # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
-        # stays for _pump (one reader at a time)
-        ready_q: queue.Queue = queue.Queue()
-        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
-        ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
-        timed_out = False
-        while True:
-            left = None if ready_deadline is None else ready_deadline - time.monotonic()
-            if left is not None and left <= 0:
-                timed_out = True
-                break
-            try:
-                line = ready_q.get(timeout=left)
-            except queue.Empty:
-                continue
-            if line is None:
-                break
-            if line.startswith("INFO "):
-                for kv in line.split()[1:]:
-                    k, _, v = kv.partition("=")
-                    self.info[k] = int(v) if v.lstrip("-").isdigit() else v
-            if line.startswith("READY"):
-                f = line.split()
-                self.max_context = int(f[1])
-                self.can_stop = "stop" in f[2:]
-                break
-        loading.set()
-        if self.max_context <= 0:
-            if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
+        argv = self.launch_plan["launch"]["argv"] if self.launch_plan else [exe, "--serve", *args]
+        try:
+            self.proc = popen("the Strata engine", argv, cwd=cwd, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        except (OSError, SystemExit):
+            loading.set()
+            if self.log not in (None, subprocess.DEVNULL):
+                self.log.close()
+            raise
+        ready_reader = None
+        try:
+            contain(self.proc)                               # ends with the server, however it ends (Windows)
+            # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
+            # stays for _pump (one reader at a time)
+            ready_q: queue.Queue = queue.Queue()
+            from serve.launch_plan import strict_frame
+            frame = strict_frame(self.launch_plan) if self.launch_plan else None
+            ready_reader = threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.records, frame), daemon=True)
+            ready_reader.start()
+            ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
+            timed_out = False
+            while True:
+                left = None if ready_deadline is None else ready_deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    timed_out = True
+                    break
                 try:
-                    self.proc.kill()
-                except OSError:
+                    line = ready_q.get(timeout=left)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
+                if line.startswith("INFO "):
+                    for kv in line.split()[1:]:
+                        k, _, v = kv.partition("=")
+                        numeric = v.lstrip("-").isdigit()
+                        if numeric and len(v.lstrip("-")) > 20:
+                            raise ValueError("native INFO integer exceeds supported size")
+                        self.info[k] = int(v) if numeric else v
+                if line.startswith("READY"):
+                    try:
+                        f = line.split()
+                        context = int(f[1])
+                        self.records.ready(context, self.info)
+                        self.max_context = context
+                        self.can_stop = "stop" in f[2:]
+                    except (ValueError, IndexError):
+                        self.max_context = 0
+                    break
+            loading.set()
+            if self.max_context <= 0:
+                if self.launch_plan or self.records.error:
+                    if timed_out:
+                        try:
+                            self.proc.kill()
+                        except OSError:
+                            pass
+                    raise RuntimeError("invalid_launch_plan: native startup records missing, malformed or disagree")
+                if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
+                    try:
+                        self.proc.kill()
+                    except OSError:
+                        pass
+                try:                                        # its pipes and our handle on its log (the log stays)
+                    self.proc.wait(timeout=5)
+                    self.proc.stdin.close()
+                    self.proc.stdout.close()
+                    if log:
+                        self.log.close()
+                except (OSError, subprocess.TimeoutExpired):
                     pass
-            try:                                        # its pipes and our handle on its log (the log stays)
-                self.proc.wait(timeout=5)
-                self.proc.stdin.close()
-                self.proc.stdout.close()
-                if log:
-                    self.log.close()
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
-                   "the engine exited before it was ready")
-            raise RuntimeError(why + (f" (see {log})" if log else "") +
-                               start_failure_hint(log, log_start) + start_log_tail(log, log_start))
-        self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
-        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
-        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
-        if self.info.get("engine"):
-            self.info["version"] = str(self.info["engine"])
-        self.ended = False                              # READY: alive from here (restart() set it True, #344)
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.lines: queue.Queue = queue.Queue()
-        # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
-        # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
-        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
-        self.batch = int(self.info.get("batch_slots") or 0)
-        if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
-                  "(its log says why)", flush=True)
-        _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
-        # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
-        # (INFO batch_groups=G); a number is the group count asked for (1 = off)
-        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
-        groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
-        gs = self.batch // groups if self.batch else 0
-        # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
-        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
-        self.slot_groups = groups
-        # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
-        # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
-        # conversation cache - see pick_slot
-        groups_run = int(self.info.get("batch_groups") or groups)
-        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
-        self.slot_q = [queue.Queue() for _ in range(self.batch)]
-        self.slot_busy = [False] * self.batch
-        # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
-        # the slot that has its start (the engine checks it again); when the slot was last used
-        self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
-        self.slot_used = [0.0] * self.batch
-        self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
-        # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
-        # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
-        # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
-        # new lists.
-        if "slot_cv" not in self.__dict__:
-            self.slot_cv = threading.Condition()
-            self.waiting = 0                            # requests waiting for the control lines (ctl)
-            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
-            self.ctl_epoch = 0                          # how often the control lines were taken
-            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
-        self._ctl_erred = False                         # #1059: the control lines ended on an ERR
-        self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.wlock = threading.Lock()                   # stdin writes from several request threads
-        self.pump = threading.Thread(target=self._pump, daemon=True)
-        self.pump.start()
+                why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+                       "the engine exited before it was ready")
+                raise RuntimeError(why + (f" (see {log})" if log else "") +
+                                   start_failure_hint(log, log_start) + start_log_tail(log, log_start))
+            self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
+            # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
+            # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
+            if self.info.get("engine"):
+                self.info["version"] = str(self.info["engine"])
+            self.ended = False                              # READY: alive from here (restart() set it True, #344)
+            # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
+            self.lines: queue.Queue = queue.Queue()
+            # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
+            # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
+            asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+            self.batch = int(self.info.get("batch_slots") or 0)
+            if asked and self.batch != asked:
+                print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+                      "(its log says why)", flush=True)
+            _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
+            # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
+            # (INFO batch_groups=G); a number is the group count asked for (1 = off)
+            groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
+            groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
+            gs = self.batch // groups if self.batch else 0
+            # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
+            self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+            self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
+            self.slot_groups = groups
+            # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
+            # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
+            # conversation cache - see pick_slot
+            groups_run = int(self.info.get("batch_groups") or groups)
+            self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+            self.slot_q = [queue.Queue() for _ in range(self.batch)]
+            self.slot_busy = [False] * self.batch
+            # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
+            # the slot that has its start (the engine checks it again); when the slot was last used
+            self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+            self.slot_used = [0.0] * self.batch
+            self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+            # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
+            # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
+            # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
+            # new lists.
+            if "slot_cv" not in self.__dict__:
+                self.slot_cv = threading.Condition()
+                self.waiting = 0                            # requests waiting for the control lines (ctl)
+                self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+                self.ctl_epoch = 0                          # how often the control lines were taken
+                self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+            self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+            self._ctl_erred = False                         # #1059: the control lines ended on an ERR
+            self._yielded = None                            # (slot, tokens read): the last request on them gave way
+            self.wlock = threading.Lock()                   # stdin writes from several request threads
+            self.pump = threading.Thread(target=self._pump, daemon=True)
+            self.pump.start()
+        except BaseException:
+            loading.set()
+            try:
+                self.close()
+            finally:
+                if ready_reader is not None and ready_reader.ident is not None:
+                    ready_reader.join(timeout=2)
+            raise
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+        records = getattr(self, "records", None)
         slot_q = self.slot_q
         line = None
-        for line in proc.stdout:
+        for line in self._native_lines(proc, records):
+            if records is not None and records.consume(line, proc.stdout):
+                continue
+            if records is not None and line.startswith("INFO "):
+                records.info_line(line)
+                if records.error and getattr(self, "launch_plan", None):
+                    continue
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -773,6 +835,8 @@ class StrataEngine:
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
+            if records is not None:
+                records.error = records.error or "native output closed"
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
@@ -828,11 +892,49 @@ class StrataEngine:
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
     @staticmethod
-    def _ready_pump(proc, out: queue.Queue) -> None:
+    def _native_lines(proc, records):
+        if not hasattr(proc.stdout, "readline"):
+            yield from proc.stdout
+            return
+        while True:
+            try:
+                line = proc.stdout.readline(16385)
+            except (OSError, ValueError):
+                if records is not None:
+                    records.error = "native output closed or could not be decoded"
+                return
+            if not line:
+                return
+            if len(line) > 16384:
+                if records is not None and records.plan is None and not line.startswith(("BUILD ", "STRATA-EFFECTIVE", "STRATA-OWNERSHIP")):
+                    yield line + proc.stdout.readline()
+                    continue
+                if records is not None:
+                    records.error = "native output line exceeds status bound"
+                    records.quarantined = True
+                return
+            yield line
+
+    @staticmethod
+    def _ready_pump(proc, out: queue.Queue, records=None, frame=None) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
         done = False
         try:
-            for line in proc.stdout:
+            if frame is not None:
+                # The existing startup reader also delivers the initial bytes,
+                # under the READY deadline. Bypass Windows text newline rewriting;
+                # subsequent commands keep their ordinary text pipe semantics.
+                proc.stdin.buffer.write(frame)
+                proc.stdin.buffer.flush()
+            for line in StrataEngine._native_lines(proc, records):
+                if records is not None and records.consume(line, proc.stdout):
+                    if records.error:
+                        return
+                    continue
+                if records is not None and line.startswith("INFO "):
+                    records.info_line(line)
+                    if records.error and records.plan:
+                        return
                 out.put(line)
                 if line.startswith("READY"):
                     done = True
@@ -858,11 +960,19 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
+                    if getattr(self, "launch_plan", None):
+                        self.__init__(*self.spawn, launch_plan=self.launch_plan)
+                    else:
+                        self.__init__(*self.spawn)
                     break
+                except EngineStuck:
+                    raise
                 except RuntimeError:
+                    if getattr(self, "launch_plan", None):
+                        raise
                     try:
-                        self.proc.wait(timeout=60)
+                        if self.proc is not None:
+                            self.proc.wait(timeout=60)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
                     if i == tries - 1:
@@ -872,8 +982,9 @@ class StrataEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
-            with self.slot_cv:                   # #1012: wake the requests that waited through it: they go on with the
-                self.slot_cv.notify_all()        # new engine, or (it did not start) end with a clean EngineDied
+            if hasattr(self, "slot_cv"):
+                with self.slot_cv:               # lazy first load may fail before admission state exists
+                    self.slot_cv.notify_all()
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -1742,7 +1853,9 @@ class StrataEngine:
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while), then terminate, then kill, each given 20 s. Raises EngineStuck if exit cannot be confirmed."""
+        from serve.launch_runtime import Records
+        self.records = Records(getattr(self, "launch_plan", None))
         if self.proc is None:
             return
         try:
@@ -1756,15 +1869,19 @@ class StrataEngine:
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
             try:
+                self.proc.kill()
                 self.proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         except OSError:
             pass
         finally:
-            if self.proc.poll() is not None:
+            try:
+                exited = self.proc.poll() is not None
+            except OSError:
+                exited = False
+            if exited:
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:
@@ -1778,6 +1895,8 @@ class StrataEngine:
                 self.ended = True
                 self.progress, self.last = None, {}
                 self.progress_ms, self.reused = 0, 0
+            else:
+                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
 
 
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
@@ -3262,12 +3381,15 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
+        from serve.launch_runtime import status as launch_status
+        launch, engine_build = launch_status(self.engine)
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+            "launch": launch, "engine_build": engine_build,
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
@@ -5731,6 +5853,7 @@ def main() -> int:
                           help="print a resolved read-only launch plan as JSON and exit")
     planning.add_argument("--estimate-memory", action="store_true",
                           help="print the launch plan's qualified memory estimate as JSON and exit")
+    planning.add_argument("--launch-plan", metavar="PATH", help="replay an approved saved launch plan exactly")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -5740,7 +5863,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
                                   "(\"0,2\"; also \"gpu\" in the config)")
-    ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
+    ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER,
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
@@ -5781,10 +5904,27 @@ def main() -> int:
             raise SystemExit(2)
         ap.error = planning_error
     a = ap.parse_args()
+    explicit = set()
+    for value in sys.argv[1:]:
+        if value.startswith("--"):
+            name = value.split("=", 1)[0]
+            actions = [action for action in ap._actions if any(option.startswith(name) for option in action.option_strings)]
+            if len(actions) == 1:
+                explicit.add(actions[0].dest)
     if a.print_launch_plan or a.estimate_memory:
         from serve.launch_plan import planning_main
         return planning_main(a)
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    saved_plan = None
+    if a.launch_plan:
+        from serve.launch_runtime import replay_cli
+        try:
+            saved_plan, cfg, api_key = replay_cli(a, explicit)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            code = "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
+            print(json.dumps({"error": {"code": code, "message": "Saved launch refused: invalid, changed, conflicting or insufficient inputs."}}))
+            return 2
+    else:
+        cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     diagnostic = cfg.get("launch_memory_metrics", False)
     if type(diagnostic) is not bool:
         ap.error('config "launch_memory_metrics" must be true or false')
@@ -5800,7 +5940,8 @@ def main() -> int:
         except (OSError, ValueError) as e:
             ap.error(str(e))
     try:
-        api_key = resolve_credentials(cfg, a.api_key)
+        if saved_plan is None:
+            api_key = resolve_credentials(cfg, a.api_key)
     except ValueError as e:
         print(f"[strata] {e}", file=sys.stderr)
         return 2
@@ -5831,7 +5972,11 @@ def main() -> int:
         if not cfg:
             ap.error("--engine strata needs --config")
         vision = None
-        env = child_env(cfg)
+        if saved_plan:
+            from serve.launch_plan import replay_environment
+            env = replay_environment(saved_plan["launch"]["environment"])
+        else:
+            env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -5848,7 +5993,8 @@ def main() -> int:
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
+        warn_budget_over_ram(saved_plan["launch"]["argv"][3:] if saved_plan else
+                             (engine_args(cfg) if "args" in cfg else []))      # #1080
         if layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
@@ -5866,14 +6012,21 @@ def main() -> int:
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            effort_end = None if saved_plan else effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        args = engine_args(cfg) + (effort_end or [])
+        args = list(saved_plan["launch"]["argv"][3:]) if saved_plan else engine_args(cfg) + (effort_end or [])
         if diagnostic:
             launch_memory = launch_memory_evidence(cfg, args, env, automatic=automatic)
-        engine = StrataEngine(exe, args, cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
+        try:
+            engine = StrataEngine(exe, args, cwd=cfg.get("cwd"), log=cfg.get("log"),
+                                  env=env, lazy=lazy, launch_plan=saved_plan)
+        except (RuntimeError, ValueError, OSError) as error:
+            if saved_plan is None:
+                raise
+            code = "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
+            print(json.dumps({"error": {"code": code, "message": "Saved native startup refused."}}))
+            return 2
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
@@ -5907,7 +6060,7 @@ def main() -> int:
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
-        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
+        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), "" if saved_plan else os.environ.get("STRATA_ALLOWED_HOSTS", ""))
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
     if svc.allowed_hosts:

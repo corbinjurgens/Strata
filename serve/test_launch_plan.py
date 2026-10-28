@@ -512,6 +512,18 @@ class Plans(unittest.TestCase):
         self.assertEqual(estimate["admission"], plan["admission"])
         self.assertEqual(estimate["plan_digest"], plan["plan_digest"])
 
+    def test_public_plan_freezes_the_actual_browser_action(self):
+        for configured, cli_open, expected in ((True, False, False), (False, True, False),
+                                                (True, True, True), (None, True, True)):
+            with self.subTest(configured=configured, cli_open=cli_open):
+                cfg = copy.deepcopy(self.cfg)
+                if configured is not None:
+                    cfg["open_browser"] = configured
+                self.config_path.write_bytes(lp.canonical(cfg))
+                code, output = self.cli("--print-launch-plan", *(["--open"] if cli_open else []))
+                self.assertEqual(code, 0, output)
+                self.assertIs(json.loads(output)["server"]["open_browser"], expected)
+
     def test_public_faults_are_secret_free_read_only_and_never_start(self):
         for contents in (b'{"api_key":"synthetic-secret",', b'[]', b'{"exe":"synthetic-secret"}'):
             self.config_path.write_bytes(contents)

@@ -283,7 +283,7 @@ def validate_hardware(h):
               "devices", "commit_basis"})
     for key in ("gpu_index", "vram_total_bytes", "vram_free_bytes", "ram_total_bytes",
                 "ram_available_bytes", "commit_available_bytes", "devices"):
-        _uint(h[key], positive=key != "gpu_index")
+        _uint(h[key], positive=key in ("vram_total_bytes", "ram_total_bytes", "devices"))
     if (h["devices"] != 1 or type(h["windows_commit"]) is not bool or
             h["vram_free_bytes"] > h["vram_total_bytes"] or h["ram_available_bytes"] > h["ram_total_bytes"] or
             h["commit_basis"] != ("available_commit" if h["windows_commit"] else "available_ram") or
@@ -487,6 +487,18 @@ def _flags(args):
     return flags
 
 
+def main_shard_paths(native):
+    native = Path(native)
+    match = re.fullmatch(r"(.*)-[0-9]{5}-of-([0-9]{5})\.gguf", native.name)
+    shards = [native]
+    if match:
+        count = int(match[2])
+        if not 1 <= count <= 1024:
+            raise PlanError("invalid_launch_plan: unsupported shard family")
+        shards = [native.with_name(f"{match[1]}-{i:05}-of-{count:05}.gguf") for i in range(1, count + 1)]
+    return shards
+
+
 def allocation_inputs(flags):
     pack, native = Path(flags["--pack"]), Path(flags["--native"])
     paths = [(Path(flags["--expert-profile"]), True, False)]
@@ -495,13 +507,7 @@ def allocation_inputs(flags):
     for name in ("dense.bin", "embd.bin", "experts.bin", "extra.bin"):
         if (pack / name).exists():
             paths.append((pack / name, False, False))
-    match = re.fullmatch(r"(.*)-[0-9]{5}-of-([0-9]{5})\.gguf", native.name)
-    shards = [native]
-    if match:
-        count = int(match[2])
-        if not 1 <= count <= 1024:
-            raise PlanError("invalid_launch_plan: unsupported shard family")
-        shards = [native.with_name(f"{match[1]}-{i:05}-of-{count:05}.gguf") for i in range(1, count + 1)]
+    shards = main_shard_paths(native)
     if not (pack / "experts.bin").exists():
         # The native layout owner's final column names per-layer or per-role
         # sources. Include these even when they are outside the main split family.
@@ -758,11 +764,18 @@ def _validate_inputs(plan):
     if allocation_inputs(_flags(plan["launch"]["argv"][3:])) != plan["inputs"]["files"]:
         raise PlanError("invalid_launch_plan: allocation input identity changed")
     exe = Path(plan["launch"]["executable"])
-    if hashlib.sha256(_executable_bytes(exe)).hexdigest() != plan["inputs"]["executable_sha256"]:
+    binary = _executable_bytes(exe)
+    if hashlib.sha256(binary).hexdigest() != plan["inputs"]["executable_sha256"]:
         raise PlanError("invalid_launch_plan: executable identity changed")
+    cfg = {}
     if plan["inputs"]["config_path"] is not None:
-        if config_digest(parse_json(_read(Path(plan["inputs"]["config_path"])))) != plan["inputs"]["config_sha256"]:
+        cfg = parse_json(_read(Path(plan["inputs"]["config_path"])))
+        if config_digest(cfg) != plan["inputs"]["config_sha256"]:
             raise PlanError("invalid_launch_plan: configuration identity changed")
+    receipt_path = _path(cfg.get("build_metadata") or str(exe.parent / "BUILD.json"), Path(plan["launch"]["cwd"]))
+    build = build_provenance.validate_metadata(binary, parse_json(_read(receipt_path)), exe.name)
+    if {k: v for k, v in build.items() if k != "built_at"} != plan["native"]["build"]:
+        raise PlanError("invalid_launch_plan: native build identity changed")
     return plan
 
 
@@ -919,7 +932,12 @@ def planning_main(args):
         cfg["port"] = args.port
         if not cfg.get("tokenizer"):
             cfg["tokenizer"] = args.tokenizer
-        for flag, key in (("lazy", "lazy_load"), ("open", "open_browser"), ("api_monitor", "api_monitor"),
+        # Ordinary startup opens only for --open, and an explicit config false
+        # still wins. Freeze the resulting action rather than the source hint.
+        if "open_browser" in cfg and type(cfg["open_browser"]) is not bool:
+            raise PlanError("invalid_launch_plan: invalid server settings")
+        cfg["open_browser"] = bool(args.open and cfg.get("open_browser") is not False)
+        for flag, key in (("lazy", "lazy_load"), ("api_monitor", "api_monitor"),
                            ("fit_max_tokens", "fit_max_tokens"), ("launch_memory_metrics", "launch_memory_metrics")):
             if getattr(args, flag):
                 cfg[key] = True
