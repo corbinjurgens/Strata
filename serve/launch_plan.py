@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 
 from tools import build_provenance
 from tools.gguf_reader import GGUFFile
@@ -67,6 +68,14 @@ SWITCHES = {"--no-prefill-borrow", "--expert-cache-per-layer"}
 
 class PlanError(ValueError):
     """Bounded diagnostics must not contain untrusted values or native stderr."""
+
+
+class ProbeCleanupError(RuntimeError):
+    """A failed query whose exact process/readers still require owned cleanup."""
+
+    def __init__(self, process, readers):
+        super().__init__("Native query cleanup could not be confirmed.")
+        self.process, self.readers = process, tuple(readers)
 
 
 def canonical(value) -> bytes:
@@ -194,12 +203,11 @@ def bounded_query(argv, *, cwd, env, timeout=20, limit=MAX_JSON) -> bytes:
     """
     from serve.server import popen
     from serve.winjob import contain
-    proc = popen("native metadata query", argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    contain(proc)
+    cleanup_deadline = time.monotonic() + timeout + 5
     output = bytearray()
     errors = bytearray()
     failed = threading.Event()
+    readers = []
 
     def drain(pipe, retain):
         seen = 0
@@ -219,20 +227,27 @@ def bounded_query(argv, *, cwd, env, timeout=20, limit=MAX_JSON) -> bytes:
                     errors.extend(block[:4096 - len(errors)])
         except (OSError, ValueError):
             failed.set()
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                failed.set()
 
-    readers = [threading.Thread(target=drain, args=(proc.stdout, True)),
-               threading.Thread(target=drain, args=(proc.stderr, False))]
-    for reader in readers:
-        reader.start()
+    proc = popen("native metadata query", argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
+        contain(proc)
+        for pipe, retain in ((proc.stdout, True), (proc.stderr, False)):
+            reader = threading.Thread(target=drain, args=(pipe, retain), daemon=True)
+            readers.append(reader)
+            reader.start()
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             failed.set()
-            proc.kill()
-            code = proc.wait(timeout=5)
+            raise PlanError("invalid_launch_plan: bounded metadata query timed out") from None
         for reader in readers:
-            reader.join(timeout=5)
+            reader.join(timeout=min(5, max(0, cleanup_deadline - time.monotonic())))
         if any(reader.is_alive() for reader in readers):
             raise PlanError("invalid_launch_plan: metadata pipe did not close")
         if code and not failed.is_set() and (errors.startswith(b"invalid_launch_plan: insufficient ") or
@@ -243,12 +258,35 @@ def bounded_query(argv, *, cwd, env, timeout=20, limit=MAX_JSON) -> bytes:
         if b"READY" in output:
             raise PlanError("invalid_launch_plan: metadata query entered startup")
         return bytes(output)
+    except RuntimeError:
+        raise PlanError("invalid_launch_plan: native query setup refused") from None
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        for pipe in (proc.stdout, proc.stderr):
-            pipe.close()
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        complete = True
+        for index, pipe in enumerate((proc.stdout, proc.stderr)):
+            reader = readers[index] if index < len(readers) else None
+            if reader is not None and reader.ident is not None:
+                reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+            if reader is not None and reader.is_alive():
+                # The reader closes its own pipe when it unblocks. Closing a
+                # buffered pipe here could wait indefinitely for its read lock.
+                complete = False
+            else:
+                try:
+                    pipe.close()
+                except OSError:
+                    complete = False
+        try:
+            complete = complete and proc.poll() is not None
+        except OSError:
+            complete = False
+        if not complete:
+            raise ProbeCleanupError(proc, readers) from None
 
 
 def observe_hardware(gpu=None) -> dict:
@@ -955,6 +993,9 @@ def planning_main(args):
                   "estimates": plan["estimates"], "admission": plan["admission"]}
         sys.stdout.write(canonical(result).decode("ascii") + "\n")
         return 0
+    except ProbeCleanupError:
+        sys.stdout.write('{"error":{"code":"invalid_launch_plan","message":"Native query cleanup could not be confirmed.","cleanup":"unconfirmed"}}\n')
+        return 2
     except PlanError as error:
         code = "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
         sys.stdout.write(canonical({"error": {"code": code, "message": str(error)}}).decode("ascii") + "\n")

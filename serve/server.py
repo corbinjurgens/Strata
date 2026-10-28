@@ -54,17 +54,27 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TOKENIZER = str(ROOT / "pack/full/tokenizer")
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+
+
+def cli_mode_requested(options):
+    return any(len(value) > 2 and value.startswith("--") and
+               any(option.startswith(value.split("=", 1)[0]) for option in options) for value in sys.argv[1:])
+
+
+# An installation check must still produce JSON when optional packages are
+# missing. Their imports run in the bounded child probe instead of this process.
+if not cli_mode_requested(("--check-install",)):
+    from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,
+                                forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
+                                tool_choice_of, unmark_think_literals)
+    from serve import responses as responses_api
+    from serve.responses import ResponsesError, error_body as responses_error_body
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.credentials import (api_key_of as api_key_of, key_list as key_list,
                                key_matches, resolve_credentials)
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
-from serve import responses as responses_api  # noqa: E402
-from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -2488,7 +2498,7 @@ def config_environment(cfg: dict, inherited: dict) -> dict:
     return env
 
 
-def child_env(cfg: dict, *, inherited: dict | None = None) -> dict:
+def child_env(cfg: dict, *, inherited: dict | None = None, read_only: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ if inherited is None else inherited)
@@ -2503,7 +2513,7 @@ def child_env(cfg: dict, *, inherited: dict | None = None) -> dict:
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
-    if cfg.get("backend") == "hip":
+    if cfg.get("backend") == "hip" and not read_only:
         hip_env_guard(env, cfg)
     return env
 
@@ -5854,6 +5864,8 @@ def main() -> int:
     planning.add_argument("--estimate-memory", action="store_true",
                           help="print the launch plan's qualified memory estimate as JSON and exit")
     planning.add_argument("--launch-plan", metavar="PATH", help="replay an approved saved launch plan exactly")
+    planning.add_argument("--check-install", action="store_true",
+                          help="check imports, native build and driver/runtime usability without a model; print JSON and exit")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -5895,14 +5907,16 @@ def main() -> int:
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     planning_options = [option for action in planning._group_actions for option in action.option_strings]
-    if any(len(value) > 2 and value.startswith("--") and any(option.startswith(value.split("=", 1)[0])
-           for option in planning_options) for value in sys.argv[1:]):
+    if cli_mode_requested(planning_options):
         def planning_error(_message):
             # argparse errors may repeat arbitrary supplied values, including a
             # credential accidentally supplied as another option's argument.
-            print('{"error":{"code":"invalid_launch_plan","message":"Invalid planning command arguments."}}')
+            code = "installation_error" if cli_mode_requested(("--check-install",)) else "invalid_launch_plan"
+            print(json.dumps({"error": {"code": code, "message": "Invalid planning command arguments."}}))
             raise SystemExit(2)
         ap.error = planning_error
+        if cli_mode_requested(("--check-install",)) and any(value in ("-h", "--help") for value in sys.argv[1:]):
+            ap.error("conflicting help mode")
     a = ap.parse_args()
     explicit = set()
     for value in sys.argv[1:]:
@@ -5911,14 +5925,21 @@ def main() -> int:
             actions = [action for action in ap._actions if any(option.startswith(name) for option in action.option_strings)]
             if len(actions) == 1:
                 explicit.add(actions[0].dest)
+    if a.check_install:
+        from serve.install_check import check_main
+        return check_main(a, explicit)
     if a.print_launch_plan or a.estimate_memory:
         from serve.launch_plan import planning_main
         return planning_main(a)
     saved_plan = None
     if a.launch_plan:
         from serve.launch_runtime import replay_cli
+        from serve.launch_plan import ProbeCleanupError
         try:
             saved_plan, cfg, api_key = replay_cli(a, explicit)
+        except ProbeCleanupError:
+            print('{"error":{"code":"invalid_launch_plan","message":"Native query cleanup could not be confirmed.","cleanup":"unconfirmed"}}')
+            return 2
         except (OSError, ValueError, TypeError, KeyError) as error:
             code = "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
             print(json.dumps({"error": {"code": code, "message": "Saved launch refused: invalid, changed, conflicting or insufficient inputs."}}))
@@ -6024,6 +6045,10 @@ def main() -> int:
         except (RuntimeError, ValueError, OSError) as error:
             if saved_plan is None:
                 raise
+            from serve.launch_plan import ProbeCleanupError
+            if isinstance(error, ProbeCleanupError):
+                print('{"error":{"code":"invalid_launch_plan","message":"Native query cleanup could not be confirmed.","cleanup":"unconfirmed"}}')
+                return 2
             code = "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
             print(json.dumps({"error": {"code": code, "message": "Saved native startup refused."}}))
             return 2
