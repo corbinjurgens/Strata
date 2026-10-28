@@ -1,5 +1,6 @@
 """Model discovery, on-demand loading and safe unloading over the actual HTTP API."""
 import json
+import errno
 import io
 import os
 import subprocess
@@ -845,6 +846,34 @@ class ListenerLifetime(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             self.assertIn(f"port {port} is already in use", err.getvalue())
             self.assertEqual(listener.getsockname()[1], port)
+
+    def test_saved_plan_bind_failures_report_safe_specific_json(self):
+        from serve import launch_runtime
+        for final in (False, True):
+            for error_number, code, phrase in ((errno.EADDRINUSE, "port_in_use", "already in use"),
+                                               (errno.EACCES, "listen_failed", "Cannot listen")):
+                with self.subTest(final=final, errno=error_number):
+                    engine = ResidentEngine(ByteTokenizer())
+                    engine.restart()
+                    error = OSError(error_number, "SYNTHETIC_SECRET")
+                    output = io.StringIO()
+                    with mock.patch.object(sys, "argv", ["server", "--engine", "mock", "--launch-plan", "synthetic.json"]), \
+                            mock.patch.object(launch_runtime, "replay_cli", return_value=({"schema": 1}, {}, "")), \
+                            mock.patch.object(server, "Server", side_effect=None if final else error) as preflight, \
+                            mock.patch.object(server, "MockEngine", return_value=engine) as constructor, \
+                            mock.patch.object(server, "serve", side_effect=error) as bind, \
+                            mock.patch.object(sys, "stdout", output), mock.patch.object(sys, "stderr", io.StringIO()):
+                        with self.assertRaises(SystemExit) as caught:
+                            server.main()
+                    self.assertEqual(caught.exception.code, 2)
+                    body = json.loads(output.getvalue())
+                    self.assertEqual(body["error"]["code"], code)
+                    self.assertIn(phrase, body["error"]["message"])
+                    self.assertNotIn("SYNTHETIC_SECRET", output.getvalue())
+                    preflight.assert_called_once()
+                    self.assertEqual(constructor.call_count, int(final))
+                    self.assertEqual(bind.call_count, int(final))
+                    self.assertEqual(engine.closes, int(final))
 
     def test_final_bind_race_closes_owned_engine_and_preserves_winning_listener(self):
         real_popen = server.popen

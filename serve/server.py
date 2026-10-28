@@ -6287,10 +6287,21 @@ def main() -> int:
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
+
+    def refuse_listen(error):
+        if saved_plan is None:
+            ap.error(listen_problem(a.host, a.port, error))
+        import errno
+        collision = (getattr(error, "winerror", None) or error.errno) in (errno.EADDRINUSE, 10048)
+        code = "port_in_use" if collision else "listen_failed"
+        message = f"Configured port {a.port} is already in use." if collision else "Cannot listen on the configured host and port."
+        print(json.dumps({"error": {"code": code, "message": message}}))
+        raise SystemExit(2)
+
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
-        ap.error(listen_problem(a.host, a.port, e))
+        refuse_listen(e)
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
@@ -6495,7 +6506,7 @@ def main() -> int:
                                    hub.close if hub is not None else None)):
             close()
         if isinstance(error, OSError):
-            ap.error(listen_problem(a.host, a.port, error))
+            refuse_listen(error)
         raise
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
