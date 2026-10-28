@@ -2752,7 +2752,7 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, -1, strict_launch.has_value())) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -4040,7 +4040,7 @@ int main(int argc, char** argv) {
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err, strict_launch.has_value())) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
         }
@@ -4751,6 +4751,7 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
+    if (strict_launch) xcache.track_ownership(srcp);
     if (!profile.empty() && srcp != nullptr) {
         std::vector<std::pair<int32_t,int32_t>> saved_pairs;
         if (strict_launch) for (auto slot:strict_launch->slots) saved_pairs.emplace_back((int32_t)slot.layer,(int32_t)slot.expert);
@@ -7620,8 +7621,42 @@ int main(int argc, char** argv) {
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        const auto adapt_event_status = cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        if (strict_launch && adapt_event_status != cudaSuccess) {
+            std::fprintf(stderr, "ERROR ownership_accounting: adaptive completion event unavailable\n"); return 1;
+        }
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
+        uint64_t ownership_sequence = 0;
+        bool ownership_ready = false;
+        std::optional<strata::core::WeightSnapshot> last_ownership;
+        uint64_t last_ownership_revision = 0;
+        // This is the existing stdout owner, on the serving thread. No worker
+        // writes frames, and no second stream reader or allocation registry exists.
+        auto publish_ownership = [&]() -> bool {
+            if (!strict_launch || !ownership_ready) return true;
+            const auto cache = xcache.weight_ownership();
+            strata::core::WeightSnapshot current;
+            std::string error, frame;
+            if (!strata::core::aggregate_weight_ownership({&wt.weight_ownership(), &native_dense.weight_ownership(),
+                    &native_head.weight_ownership(), &native_embed.weight_ownership(), &cache},
+                    o.native_shards, current, error)) {
+                std::fprintf(stderr, "ERROR ownership_accounting: %s\n", error.c_str()); return false;
+            }
+            if (ownership_sequence == 0 && !current.known) {
+                std::fprintf(stderr, "ERROR ownership_accounting: startup holdings are unknown\n"); return false;
+            }
+            if (last_ownership && *last_ownership == current && last_ownership_revision == xcache.ownership_revision()) return true;
+            int device = 0; char pci[64]{};
+            if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetPCIBusId(pci, sizeof pci, device) != cudaSuccess ||
+                !strata::core::frame_weight_ownership(current, "cuda", (unsigned)device, pci,
+                                                       ownership_sequence, frame, error)) {
+                std::fprintf(stderr, "ERROR ownership_accounting: device identity or frame failed: %s\n", error.c_str()); return false;
+            }
+            if (std::fwrite(frame.data(), 1, frame.size(), stdout) != frame.size() || std::fflush(stdout) != 0) return false;
+            last_ownership = std::move(current);
+            last_ownership_revision = xcache.ownership_revision();
+            return true;
+        };
         auto res_upload = [&]() {
             if (d_res != nullptr)
                 res_put(d_res);
@@ -7629,11 +7664,18 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(st->dev);
                 res_put(st->d_res);
             }
+            if (!publish_ownership()) std::_Exit(1);
         };
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
+            if (wait) {
+                if (cudaEventSynchronize(adapt_ev) != cudaSuccess) {
+                    xcache.fail_ownership();
+                    if (!publish_ownership()) std::_Exit(1);
+                    return;
+                }
+            }
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
                 if (st->adapt_live) {
@@ -7641,6 +7683,7 @@ int main(int argc, char** argv) {
                     else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
+            xcache.complete_ownership();
             unpin_blobs(pin_live);
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
@@ -7727,6 +7770,7 @@ int main(int argc, char** argv) {
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
+                if (slot >= 0 && b != nullptr && !(gs ? gs->cache : xcache).prepare_ownership(slot, s.layer, s.in)) return false;
                 if (dma_mode != 0 && slot >= 0 && b != nullptr) {
                     cp_dst.push_back(xcache.device_slot(slot));
                     cp_src.push_back(b);
@@ -7757,7 +7801,12 @@ int main(int argc, char** argv) {
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) {
+                const auto recorded = cudaEventRecord(adapt_ev, adapt_stream);
+                if (strict_launch && recorded != cudaSuccess) {
+                    xcache.fail_ownership(); return false;
+                }
+            }
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
@@ -7926,6 +7975,7 @@ int main(int argc, char** argv) {
         auto a_in_one = [&](const ASwap& w, const uint8_t* b) {   // step 2: one copy in (H2D), on its home's stream
             AHome& h = ahomes[(size_t) w.home];
             const strata::core::OnDevice on(h.dev);
+            if (!h.cache->prepare_ownership(w.slot, w.layer, w.in)) { a_err = true; return; }
             if (const cudaError_t e = cudaMemcpyAsync(h.cache->device_slot(w.slot), b,
                                                       (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
                                                       cudaMemcpyHostToDevice, h.stream); e != cudaSuccess) {
@@ -8066,6 +8116,7 @@ int main(int argc, char** argv) {
                     if (a_due(a_in_due)) return true;   // (pipelined) a card not seen idle since step 2
                     if (!a_ready(drain)) return true;
                     if (a_err.load()) return false;
+                    xcache.complete_ownership();
                     for (const ASwap& w : aswaps) {
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
                         srcp->release(w.layer, w.in);
@@ -8309,6 +8360,8 @@ int main(int argc, char** argv) {
             }
             const auto frame=strata::plan::frame_effective_launch(effective,1);
             if (std::fwrite(frame.data(),1,frame.size(),stdout)!=frame.size()) return 1;
+            ownership_ready = true;
+            if (!publish_ownership()) return 1;
         }
         // No startup rejection may unwind the reader's captured locals after this point.
         std::thread([&] {
@@ -9872,6 +9925,9 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    if (!p.cache->prepare_ownership(slot, i / g.n_expert, i % g.n_expert)) {
+                        e = "invalid cache restoration attribution"; return false;
+                    }
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
@@ -9882,6 +9938,7 @@ int main(int argc, char** argv) {
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
                 const strata::core::OnDevice on(p.dev);
                 if (!p.cache->sync_queued(e)) return false;
+                p.cache->end_borrow_ownership();
 #if defined(_WIN32)
                 // The copies have landed: the file pages touched by the loan need not stay in the working set.
                 for (const auto& [i, slot] : p.lent)
@@ -9950,8 +10007,11 @@ int main(int argc, char** argv) {
                     }
                     const strata::core::OnDevice on(p.dev);
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                    p.cache->borrow_ownership(first);
                     if (want != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) {
+                            p.cache->fail_ownership(); return false;
+                        }
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
@@ -10490,6 +10550,7 @@ int main(int argc, char** argv) {
                         host_res[(size_t) i] = slot;
                         pl_landed.push_back(i);
                     }
+                    xcache.complete_ownership();
                     pending.clear();
                     pending_age = 0;
                     res_upload();
@@ -11248,6 +11309,12 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            if (strict_launch) {
+                // The final window may have submitted copies after its last completion check.
+                // Settle and publish before DONE lets the serving loop wait indefinitely for input.
+                apply_pending(true);
+                if (!publish_ownership()) std::_Exit(1);
+            }
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,

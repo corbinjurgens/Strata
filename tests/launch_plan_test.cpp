@@ -218,6 +218,10 @@ int main(int argc, char** argv) {
         require(a.ram.at("streamed_kv")==0,"8K fully resident KV");
         require(a.settings.slots.size()>1 && a.settings.slots[0].bytes!=a.settings.slots[1].bytes,"variable aligned ordered slots");
         require(resolve_launch(r,resources,b,error) && a.payload==b.payload,"fixed inputs resolve deterministically");
+        auto too_many_shards = r;
+        too_many_shards.shards.assign(core::ownership_shard_limit + 1, r.shards.front());
+        require(refusal(too_many_shards,resources,"ownership shard bound refuses before reading files").find("shard bound")!=std::string::npos,
+                "resolver uses shared ownership transport bound");
         const auto index_path = root / "index.txt";
         std::ifstream index_input(index_path);
         const std::string original_index((std::istreambuf_iterator<char>(index_input)), {});

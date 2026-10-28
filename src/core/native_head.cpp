@@ -18,8 +18,10 @@ NativeHead::~NativeHead() {
     if (weights_) cudaFree(weights_);
 }
 
-bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
+bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err,
+                      bool track_ownership) {
     if (loaded()) { err = "native head is already loaded"; return false; }
+    ownership_.known = false;
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
         return false;
@@ -52,6 +54,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status == cudaSuccess)
             status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+        if (track_ownership && status == cudaSuccess) status = cudaStreamSynchronize(nullptr);
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
@@ -64,6 +67,12 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
+        if (track_ownership) {
+            ownership_.capacity = bytes + strata::kernels::native_q8_1_bytes((int)n_in, 1);
+            ownership_.scratch = strata::kernels::native_q8_1_bytes((int)n_in, 1);
+            ownership_.slices = {{0, bytes, gguf.path(), gguf.data_start() + tensor->offset}};
+            ownership_.known = true;
+        }
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         return true;
@@ -111,6 +120,8 @@ NativeEmbed::~NativeEmbed() {
 }
 
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err, bool strict) {
+    if (host_ || dev_) { err = "native embedding is already loaded"; return false; }
+    ownership_.known = false;
     try {
         const strata::GgufModel model(shards);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
@@ -187,8 +198,19 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             dev_ = d;
         }
         type_ = (int) t->type;
+        if (strict && !host_ && cudaStreamSynchronize(nullptr) != cudaSuccess) {
+            err = "native embedding upload synchronization failed"; return false;
+        }
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
+        if (strict) {
+            if (host_) ownership_.mapped_host = bytes_;
+            else {
+                ownership_.capacity = bytes_;
+                ownership_.slices = {{0, bytes_, gguf.path(), gguf.data_start() + t->offset}};
+            }
+            ownership_.known = true;
+        }
         return true;
     } catch (const std::exception& e) {
         err = std::string("native embedding: ") + e.what();

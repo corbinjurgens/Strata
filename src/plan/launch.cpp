@@ -353,6 +353,7 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
                            const LaunchSettings* approved, std::string& error) {
     try {
         if (!resources.cuda || resources.devices != 1) throw std::invalid_argument("planned metadata supports one CUDA device only");
+        if (r.shards.size() > core::ownership_shard_limit) throw std::invalid_argument("planned ownership shard bound exceeded");
         if (!resources.vram_free || !resources.ram_available || !resources.commit_available)
             throw std::invalid_argument("required resource snapshot is unavailable");
         if (!r.context || r.context > 1048576 || !r.prefill || r.prefill > 32768 || r.prefill > r.context || r.spec != 2 ||
@@ -633,7 +634,9 @@ int launch_metadata_main(int argc, char** argv) {
         LaunchResolution out;
         if (!resolve_launch(r,resources,out,error)) throw std::invalid_argument(error);
         std::cout << "{\"schema\":1,\"native_schema\":" << launch_schema
-                  << ",\"kind\":\"native_metadata\",\"strict_consumer\":true,\"ownership_telemetry\":false,"
+                  << ",\"kind\":\"native_metadata\",\"strict_consumer\":true,\"ownership_telemetry\":true,"
+                  << "\"ownership_protocol\":\"STRATA-OWNERSHIP/1\",\"ownership_frame_limit\":" << core::ownership_frame_limit
+                  << ",\"ownership_shard_limit\":" << core::ownership_shard_limit << ','
                   << "\"effective_protocol\":\"STRATA-EFFECTIVE/1\",\"effective_payload\":" << quote(encode_effective_launch(out.settings))
                   << ",\"native_payload\":" << quote(out.payload)
                   << ",\"settings\":{";

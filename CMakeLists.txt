@@ -233,6 +233,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_cache_retry_test.cpp")
 endif()
 
 # ---- strata_artifact -------------------------------------------------------
+add_library(strata_weight_ownership STATIC src/core/weight_ownership.cpp)
+target_include_directories(strata_weight_ownership PUBLIC include)
+target_link_libraries(strata_weight_ownership PUBLIC strata_warnings)
+
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
 # scalar dequantizers hold no state worth hiding, and a header-only boundary cannot introduce a
 # duplicate-symbol or missing-declaration bug into code that is already validated against the real artifact.
@@ -287,7 +291,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_core PUBLIC strata_plan strata_weight_ownership strata_warnings ${_strata_gpu_runtime_target})
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)
@@ -575,6 +579,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   add_library(strata_launch STATIC src/plan/launch.cpp)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/weight_ownership_test.cpp")
+    add_executable(weight_ownership_test tests/core/weight_ownership_test.cpp)
+    target_link_libraries(weight_ownership_test PRIVATE strata_engine)
+    enable_testing()
+    add_test(NAME weight_ownership_test COMMAND weight_ownership_test "${CMAKE_CURRENT_BINARY_DIR}/ownership-fixtures")
+    set_tests_properties(weight_ownership_test PROPERTIES TIMEOUT 30)
+  endif()
   target_include_directories(strata_launch PUBLIC include)
   target_link_libraries(strata_launch PUBLIC strata_prefill strata_warnings)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/launch_plan_test.cpp")

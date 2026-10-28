@@ -20,6 +20,7 @@
 //      internal offsets are compile-time constants and reading a 640-wide expert as a 2560-wide one walks off
 //      the end into the next expert's bytes without faulting.
 #pragma once
+#include "strata/core/weight_ownership.hpp"
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/exchange_storage.hpp"
@@ -153,6 +154,9 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 class ExpertSource {
 public:
     virtual ~ExpertSource() = default;
+    // Actual source roles recorded by the successful source open, independent of
+    // RAM compaction/staging. Canonical experts.bin has no proved shard mapping.
+    std::vector<WeightSlice> weight_slices(int64_t layer, int64_t expert) const;
 
     /// The expert-layout blob for `(layer, expert)`, or nullptr if it cannot be produced.
     ///
@@ -224,6 +228,8 @@ protected:
     void record_inputs(const std::string& pack_experts, const std::string& gguf,
                        const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf);
     std::vector<std::pair<std::string, std::string>> inputs_;
+    std::vector<std::vector<WeightSlice>> weight_roles_;
+    int64_t weight_experts_ = 0;
 };
 
 /// CS-T, routing-aware prefetch of the file tier: when the CPU pool starts layer `l`, a worker thread applies layer

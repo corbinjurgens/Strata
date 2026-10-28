@@ -25,13 +25,28 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "strata/core/vmm.hpp"
+#include "strata/core/weight_ownership.hpp"
 
 namespace strata::core {
 namespace detail { struct ExpertCacheTestAccess; }
+class ExpertSource;
+namespace detail {
+// CPU fault injection at the existing cache's I/O decisions; null in production.
+struct ExpertCacheIo {
+    void* context = nullptr;
+    bool (*allocate)(void*, void**, size_t) = nullptr;
+    bool (*touch)(void*, void*, size_t) = nullptr;
+    bool (*copy)(void*, void*, const void*, size_t) = nullptr;
+    bool (*sync)(void*) = nullptr;
+    bool (*release)(void*, void*) = nullptr;
+};
+}
 
 /// Where one expert's VRAM lives, or -1.  `int32_t` and not a bool because the slot index is what the kernel
 /// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
@@ -196,6 +211,18 @@ public:
     bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
     bool sync_queued(std::string& err);
 
+    // Opt-in attribution. prepare precedes an external slot write; complete is
+    // called ONLY after that writer's stream/event has confirmed completion.
+    // Pending/error state suppresses successful numeric snapshots.
+    void track_ownership(const ExpertSource* source) { ownership_source_ = source; ownership_on_ = true; }
+    bool prepare_ownership(int32_t slot, int64_t layer, int64_t expert);
+    void complete_ownership();
+    void fail_ownership() { if (ownership_on_) ownership_error_ = true; }
+    void borrow_ownership(int32_t first);
+    void end_borrow_ownership();
+    WeightOwnership weight_ownership() const;
+    uint64_t ownership_revision() const { return ownership_revision_; }
+
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS
     /// THE CACHE HOLDS THE EXPERT IT CLAIMS TO.**  A slot table that is right about indices and wrong about
     /// bytes produces a plausible token, which is exactly the failure this project has paid for most often.
@@ -221,7 +248,7 @@ private:
     friend struct detail::ExpertCacheTestAccess;
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
     bool open_segmented(uint64_t want, std::string& err);
-    void release_segmented();
+    bool release_segmented();
     uint8_t* base_ = nullptr;
     int64_t live_slots_ = 0;            ///< #533: slots() - all of them unless shrunk
     int64_t seg_req_ = 0;               ///< #533: the segment size asked for (0: one cudaMalloc)
@@ -244,6 +271,15 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    bool prepare_fill_ownership(int32_t slot, uint64_t bytes);
+    const ExpertSource* ownership_source_ = nullptr;
+    bool ownership_on_ = false, ownership_error_ = false;
+    std::map<int32_t, std::vector<WeightSlice>> held_ownership_, pending_ownership_;
+    std::set<int32_t> borrowed_ownership_;
+    std::set<int32_t> legacy_ownership_;
+    uint64_t uncertain_capacity_ = 0;
+    uint64_t ownership_revision_ = 0;
+    detail::ExpertCacheIo* test_io_ = nullptr;
 };
 
 }  // namespace strata::core

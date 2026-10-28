@@ -430,6 +430,9 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     int cur_file = -1;
     table_.clear();
     report_ = LoadReport{};
+    ownership_ = {};
+    ownership_.capacity = arena_bytes;
+    ownership_.known = false;
 
     const double t_read0 = now_ms();
     double upload_ms = 0;
@@ -579,6 +582,10 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    for (const auto& [name, ref] : table_)
+        if (ref.resident && ref.bytes)
+            ownership_.slices.push_back({(uint64_t)((const uint8_t*)ref.data - dst_base), ref.bytes, {}, 0});
+    ownership_.known = true;
     return true;
 }
 

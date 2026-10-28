@@ -173,7 +173,7 @@ endif()
 
 # --- the GPU engine ------------------------------------------------------------------------------------------------
 strata_resolve(_core src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp
-                     src/core/weights.cpp src/core/layout.cpp)
+                     src/core/weights.cpp src/core/weight_ownership.cpp src/core/layout.cpp)
 add_library(strata_core STATIC ${_core})
 target_link_libraries(strata_core PUBLIC strata_includes)
 # zeMemAllocHost for the host memory a kernel polls (include/strata/sycl_queue.hpp, host_malloc_polled): only when libze-dev's header is there

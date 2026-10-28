@@ -116,10 +116,15 @@ struct Pending {
     size_t offset;
     size_t packed_offset;
     bool packed;
+    std::string shard;
+    uint64_t source_offset;
 };
 struct PendingHc {
     WeightRef* ref;
     DevicePtr data;
+    uint64_t bytes;
+    std::string shard;
+    uint64_t source_offset;
 };
 // Registration may allocate on the host. Undo partial registration if that fails,
 // before the candidate arena is freed; no WeightRef has been published yet.
@@ -218,7 +223,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, bool track_ownership) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -226,6 +231,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     };
     if (arena_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+    ownership_.known = false;
     try {
         std::vector<Pending> pending;
         std::vector<PendingHc> pending_hc;
@@ -337,7 +343,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1);
                 const size_t packed_offset = packed ? slice(bytes) : 0;
                 pending.push_back(Pending{&ref, tensor.name, (int) tensor.type, bytes, gguf.tensor_data(tensor),
-                                           offset, packed_offset, packed});
+                                           offset, packed_offset, packed, path, gguf.data_start() + tensor.offset});
             }
             if (hc_q8_requested())
                 for (const auto& tensor : gguf.tensors()) {
@@ -365,7 +371,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     if (status != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
-                    pending_hc.push_back(PendingHc{&ref, std::move(data)});
+                    // A converted F32 HC copy has no byte-identical GGUF source span.
+                    pending_hc.push_back(PendingHc{&ref, std::move(data), bytes, f32_inject ? std::string() : path,
+                                                   gguf.data_start() + tensor.offset});
                     hc_q8_bytes += bytes;
                     allocated += alloc_bytes(bytes);
                 }
@@ -395,7 +403,21 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
             }
         }
+        if (track_ownership && cudaStreamSynchronize(nullptr) != cudaSuccess) { err = "native dense upload synchronization failed"; return false; }
         PackedRegistrations registrations;
+        WeightOwnership holding;
+        if (track_ownership) {
+            holding.capacity = arena_bytes;
+            holding.shared = strata::kernels::native_q8_1_bytes(max_in);
+            for (const auto& item : pending) {
+                holding.slices.push_back({item.offset, item.bytes, item.shard, item.source_offset});
+                if (item.packed) holding.slices.push_back({item.packed_offset, item.bytes, item.shard, item.source_offset});
+            }
+            for (const auto& item : pending_hc) {
+                holding.slices.push_back({holding.capacity, item.bytes, item.shard, item.source_offset});
+                holding.capacity += item.bytes;
+            }
+        }
         registrations.keys.reserve(pending.size());
         weights_.reserve(pending_hc.size());
         uint64_t packed_bytes = 0;
@@ -429,6 +451,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         tensor_count_ = pending.size() + pending_hc.size();
         bytes_ = total + hc_q8_bytes;
         allocated_ = alloc_bytes(arena_bytes) + allocated;
+        if (track_ownership) ownership_ = std::move(holding);
         if (hc_q8_requested())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);

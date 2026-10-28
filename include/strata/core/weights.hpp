@@ -26,6 +26,7 @@
 // whose failure mode is a wrong byte offset - which decodes to a plausible weight and produces plausible
 // logits.  Python wrote the manifest and already parses it correctly.
 #pragma once
+#include "strata/core/weight_ownership.hpp"
 
 #include <cstdint>
 #include <map>
@@ -139,11 +140,13 @@ public:
     const WeightRef* find(const std::string& name) const;
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
+    const WeightOwnership& weight_ownership() const { return ownership_; }
 
 private:
     friend class NativeDense;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
+    WeightOwnership ownership_;
 };
 
 }  // namespace strata::core

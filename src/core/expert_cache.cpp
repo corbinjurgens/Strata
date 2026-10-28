@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_source.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -336,6 +337,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
                           "segmented cache could not be allocated", i + 1, segs_.size(),
                           (double) seg_size_[i] / 1073741824.0);
             err = buf;   // "cudaMalloc failed": the auto cache's smaller-retry path reads it as an allocation failure
+            fail_ownership();   // map_segment's rollback does not expose a confirmed aggregate outcome
             release_segmented();
             return false;
         }
@@ -345,23 +347,25 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 #endif
 }
 
-void ExpertCache::release_segmented() {
+bool ExpertCache::release_segmented() {
+    bool released = true;
 #if !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
-    if (base_ != nullptr) cudaDeviceSynchronize();
+    if (base_ != nullptr && cudaDeviceSynchronize() != cudaSuccess) released = false;
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     for (size_t i = 0; i < segs_.size(); ++i)
         if (segs_[i] != 0) {
-            v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]);
-            v.release((CUmemGenericAllocationHandle) segs_[i]);
+            if (v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]) != CUDA_SUCCESS) released = false;
+            if (v.release((CUmemGenericAllocationHandle) segs_[i]) != CUDA_SUCCESS) released = false;
         }
-    if (base_ != nullptr && reserved_ > 0) v.address_free(va, (size_t) reserved_);
+    if (base_ != nullptr && reserved_ > 0 && v.address_free(va, (size_t) reserved_) != CUDA_SUCCESS) released = false;
 #endif
     segs_.clear();
     seg_size_.clear();
     mapped_segs_ = 0;
     reserved_ = 0;
     base_ = nullptr;
+    return released;
 }
 
 int64_t ExpertCache::mapped_bytes() const {
@@ -393,6 +397,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
     if (cudaDeviceSynchronize() != cudaSuccess) {
+        fail_ownership();
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -402,6 +407,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         if (v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS ||
             v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
             err = "the driver refused to release an expert-cache segment";
+            fail_ownership();
             live_slots_ = slots_within(mapped_bytes());
             return false;
         }
@@ -409,6 +415,14 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         mapped_segs_ = i;
     }
     live_slots_ = slots_within(mapped_bytes());
+    if (ownership_on_) {
+        held_ownership_.erase(held_ownership_.lower_bound((int32_t)live_slots_), held_ownership_.end());
+        pending_ownership_.erase(pending_ownership_.lower_bound((int32_t)live_slots_), pending_ownership_.end());
+        borrowed_ownership_.erase(borrowed_ownership_.lower_bound((int32_t)live_slots_), borrowed_ownership_.end());
+        legacy_ownership_.erase(legacy_ownership_.lower_bound((int32_t)live_slots_), legacy_ownership_.end());
+        if (ownership_revision_ == UINT64_MAX) fail_ownership();
+        else ++ownership_revision_;
+    }
     return true;
 #endif
 }
@@ -433,6 +447,7 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
                          segs_[i])) {
             (void) cudaGetLastError();
             err = "the driver has no VRAM for another expert-cache segment";
+            fail_ownership();
             live_slots_ = slots_within(mapped_bytes());
             return false;
         }
@@ -469,6 +484,7 @@ void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
     close();
+    if (ownership_on_ && ownership_error_) { err = "ExpertCache: prior release outcome is unknown"; return false; }
     if (n_slots <= 0) {
         err = "ExpertCache: n_slots must be positive";
         return false;
@@ -487,7 +503,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+    if (!test_io_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         free_b = device_free_bytes();   // unified memory: what the OS can give back counts (see the header)
         if ((uint64_t) free_b < want) {
             char buf[320];
@@ -502,7 +518,11 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
+    if (test_io_) {
+        if (!test_io_->allocate(test_io_->context, (void**)&base_, (size_t)want)) {
+            err = "ExpertCache: injected allocation failure"; return false;
+        }
+    } else if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
@@ -526,7 +546,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+    if (ownership_on_) uncertain_capacity_ = want;
+    if (test_io_ ? !test_io_->touch(test_io_->context, base_, (size_t)want)
+                 : cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
         err = "ExpertCache: cudaMemset of the slot arena failed";
         close();
         return false;
@@ -604,6 +626,8 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 }
 
 void ExpertCache::close() {
+    const uint64_t old_capacity = (std::max)(base_ ? (uint64_t)mapped_bytes() : uint64_t{0}, uncertain_capacity_);
+    bool released = !ownership_error_ && uncertain_capacity_ == 0;
 #if defined(STRATA_USE_HIP)
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
     blocking_staging_ = nullptr;
@@ -611,12 +635,13 @@ void ExpertCache::close() {
 #endif
     off_.clear();
     if (!segs_.empty()) {
-        release_segmented();
+        released = release_segmented();
     } else if (vmm_) {
+        released = false;
         vmm_.reset();   // unmaps and frees every chunk it still holds
         base_ = nullptr;
     } else if (base_ != nullptr) {
-        cudaFree(base_);
+        released = test_io_ ? test_io_->release(test_io_->context, base_) : cudaFree(base_) == cudaSuccess;
         base_ = nullptr;
     }
     residency_.clear();
@@ -629,6 +654,13 @@ void ExpertCache::close() {
     fills_ = 0;
     admitted_ = 0;
     layer_next_.clear();
+    if (released) {
+        held_ownership_.clear(); pending_ownership_.clear(); borrowed_ownership_.clear();
+        legacy_ownership_.clear();
+        uncertain_capacity_ = 0; ownership_error_ = false;
+    } else if (ownership_on_) {
+        ownership_error_ = true; uncertain_capacity_ = old_capacity;
+    }
 }
 
 /// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
@@ -691,10 +723,13 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
-                                          (cudaStream_t) stream);
+    if (!prepare_fill_ownership(slot, n)) { err = "ExpertCache: invalid ownership for copy"; return false; }
+    const cudaError_t e = test_io_ ? (test_io_->copy(test_io_->context, dst, host_blob, n) ? cudaSuccess : cudaErrorUnknown)
+        : cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    if (ownership_on_ && stream == nullptr) legacy_ownership_.insert(slot);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
+        fail_ownership();
         return false;
     }
     ++fills_;
@@ -712,6 +747,8 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
+    if (!prepare_fill_ownership(slot, n)) { err = "ExpertCache: invalid ownership for copy"; return false; }
+    if (ownership_on_) legacy_ownership_.insert(slot);
 #if defined(STRATA_USE_HIP)
     // Bound HIP's pageable-source staging to one expert instead of repeatedly
     // registering regions of the mmap. The blocking copy completes before reuse.
@@ -722,12 +759,17 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     std::memcpy(blocking_staging_, host_blob, n);
     const cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
 #else
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    const cudaError_t e = test_io_ ? (test_io_->copy(test_io_->context, dst, host_blob, n) ? cudaSuccess : cudaErrorUnknown)
+        : cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
 #endif
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
+        fail_ownership();
         return false;
     }
+    // Pageable H2D may return before the copy lands. Only the opt-in accounting
+    // path pays this wait; the ordinary upload path retains its ordering.
+    if (ownership_on_ && !sync_queued(err)) return false;
     ++fills_;
     return true;
 }
@@ -740,9 +782,13 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    if (!prepare_fill_ownership(slot, n)) { err = "ExpertCache: invalid ownership for copy"; return false; }
+    if (ownership_on_) legacy_ownership_.insert(slot);
+    const cudaError_t e = test_io_ ? (test_io_->copy(test_io_->context, dst, host_blob, n) ? cudaSuccess : cudaErrorUnknown)
+        : cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+        fail_ownership();
         return false;
     }
     ++fills_;
@@ -750,12 +796,102 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
 }
 
 bool ExpertCache::sync_queued(std::string& err) {
-    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) 0);
+    const cudaError_t e = test_io_ ? (test_io_->sync(test_io_->context) ? cudaSuccess : cudaErrorUnknown)
+        : cudaStreamSynchronize((cudaStream_t) 0);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::sync_queued: ") + cudaGetErrorString(e);
+        fail_ownership();
         return false;
     }
+    if (ownership_on_ && !ownership_error_ && !legacy_ownership_.empty()) {
+        if (ownership_revision_ == UINT64_MAX) {
+            fail_ownership(); err = "ExpertCache: ownership revision exhausted"; return false;
+        }
+        for (auto slot : legacy_ownership_) {
+            auto at = pending_ownership_.find(slot);
+            if (at == pending_ownership_.end()) { fail_ownership(); err = "ExpertCache: missing queued attribution"; return false; }
+            held_ownership_[slot] = std::move(at->second);
+            pending_ownership_.erase(at);
+            borrowed_ownership_.erase(slot);
+        }
+        legacy_ownership_.clear();
+        ++ownership_revision_;
+    }
     return true;
+}
+
+bool ExpertCache::prepare_ownership(int32_t slot, int64_t layer, int64_t expert) {
+    if (!ownership_on_) return true;
+    if (!ownership_source_ || !device_slot(slot)) { fail_ownership(); return false; }
+    auto slices = ownership_source_->weight_slices(layer, expert);
+    if (slices.empty()) { fail_ownership(); return false; }
+    WeightOwnership candidate;
+    candidate.capacity = slot_offset(slot + 1) - slot_offset(slot);
+    candidate.slices = slices;
+    WeightSnapshot check; std::string err;
+    if (!aggregate_weight_ownership({&candidate}, {}, check, err)) { fail_ownership(); return false; }
+    pending_ownership_[slot] = std::move(slices);
+    return true;
+}
+
+bool ExpertCache::prepare_fill_ownership(int32_t slot, uint64_t bytes) {
+    if (!ownership_on_) return true;
+    if (bytes > slot_offset(slot+1) - slot_offset(slot)) { fail_ownership(); return false; }
+    if (!pending_ownership_.count(slot)) {
+        int64_t index = -1;
+        for (size_t i = 0; i < residency_.size(); ++i) if (residency_[i] == slot) { index = (int64_t)i; break; }
+        if (index < 0 || !prepare_ownership(slot, index / n_expert_, index % n_expert_)) { fail_ownership(); return false; }
+    }
+    uint64_t total = 0;
+    for (const auto& s : pending_ownership_[slot]) total += s.bytes;
+    if (total != bytes) { fail_ownership(); return false; }
+    return true;
+}
+
+void ExpertCache::complete_ownership() {
+    if (!ownership_on_ || ownership_error_) return;
+    if (!pending_ownership_.empty()) {
+        if (ownership_revision_ == UINT64_MAX) { fail_ownership(); return; }
+        ++ownership_revision_;
+    }
+    for (auto& [slot, slices] : pending_ownership_) {
+        held_ownership_[slot] = std::move(slices);
+        borrowed_ownership_.erase(slot);
+    }
+    pending_ownership_.clear();
+    legacy_ownership_.clear();
+}
+
+void ExpertCache::borrow_ownership(int32_t first) {
+    if (!ownership_on_) return;
+    if (first < 0 || first > live_slots_ || !pending_ownership_.empty()) { fail_ownership(); return; }
+    if (ownership_revision_ == UINT64_MAX) { fail_ownership(); return; }
+    ++ownership_revision_;
+    for (int32_t slot = first; slot < live_slots_; ++slot) {
+        held_ownership_.erase(slot);
+        borrowed_ownership_.insert(slot);
+    }
+}
+
+void ExpertCache::end_borrow_ownership() {
+    if (!ownership_on_ || borrowed_ownership_.empty()) return;
+    if (!pending_ownership_.empty() || ownership_revision_ == UINT64_MAX) { fail_ownership(); return; }
+    borrowed_ownership_.clear();
+    ++ownership_revision_;
+}
+
+WeightOwnership ExpertCache::weight_ownership() const {
+    WeightOwnership out;
+    out.capacity = base_ ? (uint64_t)mapped_bytes() : uncertain_capacity_;
+    out.known = !ownership_error_ && pending_ownership_.empty();
+    if (!out.known) return out;
+    for (const auto& [slot, slices] : held_ownership_) {
+        if (slot >= live_slots_) continue;
+        for (auto s : slices) { s.offset += slot_offset(slot); out.slices.push_back(std::move(s)); }
+    }
+    for (auto slot : borrowed_ownership_)
+        if (slot < live_slots_) out.shared += slot_offset(slot+1) - slot_offset(slot);
+    return out;
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
@@ -773,9 +909,11 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
-    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
+    const cudaError_t e = test_io_ ? (test_io_->copy(test_io_->context, got.data(), src, (size_t)nb) ? cudaSuccess : cudaErrorUnknown)
+        : cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);
+        fail_ownership();
         return false;
     }
     if (std::memcmp(got.data(), host_blob, (size_t) nb) != 0) {
@@ -786,6 +924,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
                       "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
                       (int) slot, (unsigned long long) first, (long long) blob_);
         err = buf;
+        fail_ownership();
         return false;
     }
     return true;

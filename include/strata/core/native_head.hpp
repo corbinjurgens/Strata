@@ -1,4 +1,5 @@
 #pragma once
+#include "strata/core/weight_ownership.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,10 +20,13 @@ public:
     NativeHead(const NativeHead&) = delete;
     NativeHead& operator=(const NativeHead&) = delete;
 
-    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// track_ownership adds completion checking and source attribution for planned startup.
+    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err,
+              bool track_ownership = false);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
+    const WeightOwnership& weight_ownership() const { return ownership_; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
@@ -35,6 +39,7 @@ private:
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
+    WeightOwnership ownership_;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
@@ -53,6 +58,7 @@ public:
     void gather_one(int64_t token, float* out, void* stream) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
+    const WeightOwnership& weight_ownership() const { return ownership_; }
 
 private:
     void* host_ = nullptr;
@@ -61,6 +67,7 @@ private:
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
+    WeightOwnership ownership_;
 };
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();

@@ -946,6 +946,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    weight_roles_.clear(); weight_experts_ = 0;
     io_stop();
     report_copy_stats("close");
     copy_ready_ = copy_stats_ = false;
@@ -4098,11 +4099,38 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
                                  const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf) {
     static const char* roles[3] = {"gate", "up", "down"};
     inputs_.clear();
+    weight_experts_ = lay.n_expert;
+    weight_roles_.assign((size_t)lay.n_layers, {});
+    for (int64_t l = 0; l < lay.n_layers; ++l) {
+        const uint64_t bytes = lay.blob_bytes(l);
+        auto& slices = weight_roles_[(size_t)l];
+        if (!from_gguf) slices.push_back({0, bytes, {}, 0});
+        else {
+            const auto& fm = lay.fmt[(size_t)l];
+            const uint64_t offsets[4] = {0, fm.up_off, fm.down_off, bytes};
+            for (int r = 0; r < 3; ++r)
+                slices.push_back({offsets[r], offsets[r+1] - offsets[r], expert_gguf_file(gguf, lay, l, r),
+                                  lay.gguf_off[(size_t)(3*l+r)]});
+        }
+    }
     if (!from_gguf) { inputs_.push_back({"pack experts.bin", pack_experts}); return; }
     // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
     for (int64_t l = 0; l < lay.n_layers; ++l)
         for (int r = 0; r < 3; ++r)
             inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
+}
+
+std::vector<WeightSlice> ExpertSource::weight_slices(int64_t layer, int64_t expert) const {
+    if (layer < 0 || (size_t)layer >= weight_roles_.size() || expert < 0 || expert >= weight_experts_)
+        return {};
+    auto out = weight_roles_[(size_t)layer];
+    for (auto& s : out) {
+        if (!s.shard.empty()) {
+            if (s.bytes && (uint64_t)expert > (UINT64_MAX - s.source_offset) / s.bytes) return {};
+            s.source_offset += (uint64_t)expert * s.bytes;
+        }
+    }
+    return out;
 }
 
 bool check_expert_file_size(const std::string& path, uint64_t actual, uint64_t required, std::string& err) {
@@ -4605,6 +4633,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
+    weight_roles_.clear(); weight_experts_ = 0;
 #if !defined(_WIN32)
     if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
 #endif
