@@ -96,3 +96,30 @@ profiles, engines and diagnostic artifacts are separate evidence, not part of th
   4.407 GiB, Windows commit 16.028 GiB and logged CUDA-free VRAM 677 MiB; CUDA readings are stages.
 
 See [conditions, measurements and limits](docs/UNSLOTH_Q2.md#ready-copy-reuse-and-remaining-optimization-routes-2026-10-16).
+
+## 2026-10-29 - PAIR managed-engine integration (unreleased)
+
+Implementation range: `c71fb5b2cd5f0affa716e395c2d254b57a6800e3..550d7c3e5c583d5c8281989dfeb6af1857db467f`.
+This range covers Strata source, tests and product documentation. Private runtime
+profiles, engines and project-note evidence are separate and are not committed here.
+
+- **What changed:** private file credentials, native resolved-plan transport and exact
+  replay, build provenance, current settings/shard/component status, bounded generation
+  queue admission, typed failures, lifecycle/cancellation ownership and installation checks.
+- **What worked:** on Windows RTX 4050 Laptop GPU 6 GiB, UD-Q2_K_XL with an explicit
+  small-cache 8K profile passed saved and ordinary startup, current status, a two-token
+  HTTP chat, streaming disconnect settlement and confirmed unload. Comparable memory
+  components matched except an 8 MiB conservative prefill guard. A bounded real CUDA
+  allocation refusal reached the public `out_of_memory` classifier.
+- **What did not or remains open:** the generated automatic profile was safely refused
+  because its NVIDIA free-memory input exceeded later CUDA-context availability. That
+  discrepancy is deferred; reserve floors are unchanged. HIP/SYCL, physical residency,
+  broad profile fit, real OS-denial timing and performance remain unverified. Historical
+  wrapper-format failures, ResourceWarnings and baseline qualifications remain recorded.
+- **Verification:** API 539 tests and tools 173 tests pass, alongside CUDA build, native
+  CPU gates, real Windows key ACL, selected installation, lint and whitespace checks.
+  The final independent audit confirms the stager-event error-cause repair at its
+  source/CPU/parser seam; its broader missing-evidence qualifications are preserved.
+  The first tools run lacked build tools on its child PATH; the environment-corrected
+  rerun passed without a product change. No speedup, remote validation or PAIR acceptance
+  is claimed. See [the integration contract](docs/PAIR_INTEGRATION.md).
