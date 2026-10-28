@@ -217,6 +217,8 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
+CANCEL_GRACE_S = 5.0       # STOP/BSTOP must be acknowledged before reusing the request's native state.
+CANCEL_CLOSE_S = 1.0       # each phase of the existing owned close after cancellation grace
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
@@ -297,6 +299,47 @@ class MockEngine:
 
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+
+
+class NativeFailure(EngineDied):
+    """A bounded, typed native ERROR record, without guessing from arbitrary stderr."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(f"{code}: native engine refused the operation")
+
+
+NATIVE_ERROR = re.compile(r"^(?:ERROR|ERR) (out_of_memory|insufficient_resources|invalid_launch_plan):(?: |$)")
+
+
+def native_failure(line):
+    if len(line) > 16384:
+        return None
+    match = NATIVE_ERROR.match(line)
+    return NativeFailure(match[1]) if match else None
+
+
+def error_code(error):
+    """The same runtime cause on JSON and each streaming API."""
+    from serve.launch_plan import PlanError
+    if isinstance(error, NativeFailure):
+        return error.code
+    if isinstance(error, PlanError):
+        return "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
+    if isinstance(error, ModelBusy):
+        return "busy"
+    if isinstance(error, GpuBusy):
+        return "insufficient_resources"
+    if isinstance(error, EngineStarting):
+        return "model_not_loaded"
+    return "engine_died"
+
+
+def runtime_error_body(error, kind="server_error"):
+    message = str(error)
+    if isinstance(error, EngineDied) and not isinstance(error, NativeFailure):
+        message += "; the next request restarts it after confirmed engine exit"
+    return {"error": {"type": kind, "code": error_code(error), "message": message}}
 
 
 class EngineStarting(RuntimeError):
@@ -628,9 +671,17 @@ class StrataEngine:
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
+        self.stderr_reader = None
+        self.ready_reader = None
+        self.ready_write_done = None
+        self.input_cleanup = None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.requested_slots = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+        self.batch = 0
+        self.termination_uncertain = False
+        self.native_error = None
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -678,7 +729,8 @@ class StrataEngine:
         argv = self.launch_plan["launch"]["argv"] if self.launch_plan else [exe, "--serve", *args]
         try:
             self.proc = popen("the Strata engine", argv, cwd=cwd, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+                              stdout=subprocess.PIPE, stderr=self.log if log else subprocess.PIPE,
+                              text=True, encoding="utf-8", bufsize=1, env=env)
         except (OSError, SystemExit):
             loading.set()
             if self.log not in (None, subprocess.DEVNULL):
@@ -686,16 +738,23 @@ class StrataEngine:
             raise
         ready_reader = None
         try:
+            if not log and getattr(self.proc, "stderr", None) is not None:
+                self.stderr_reader = threading.Thread(target=self._stderr_pump, args=(self.proc,), daemon=True)
+                self.stderr_reader.start()
             contain(self.proc)                               # ends with the server, however it ends (Windows)
             # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
             # stays for _pump (one reader at a time)
             ready_q: queue.Queue = queue.Queue()
             from serve.launch_plan import strict_frame
             frame = strict_frame(self.launch_plan) if self.launch_plan else None
-            ready_reader = threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.records, frame), daemon=True)
+            self.ready_write_done = threading.Event() if frame is not None else None
+            ready_reader = threading.Thread(target=self._ready_pump,
+                                            args=(self.proc, ready_q, self.records, frame, self.ready_write_done), daemon=True)
+            self.ready_reader = ready_reader
             ready_reader.start()
             ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
             timed_out = False
+            saw_ready = False
             while True:
                 left = None if ready_deadline is None else ready_deadline - time.monotonic()
                 if left is not None and left <= 0:
@@ -707,6 +766,9 @@ class StrataEngine:
                     continue
                 if line is None:
                     break
+                failure = native_failure(line)
+                if failure is not None:
+                    self.native_error = failure
                 if line.startswith("INFO "):
                     for kv in line.split()[1:]:
                         k, _, v = kv.partition("=")
@@ -715,6 +777,7 @@ class StrataEngine:
                             raise ValueError("native INFO integer exceeds supported size")
                         self.info[k] = int(v) if numeric else v
                 if line.startswith("READY"):
+                    saw_ready = True
                     try:
                         f = line.split()
                         context = int(f[1])
@@ -726,24 +789,29 @@ class StrataEngine:
                     break
             loading.set()
             if self.max_context <= 0:
+                tail = start_log_tail(log, log_start)
+                failure = self.native_error or next((failure for row in reversed(tail.splitlines())
+                                                     if (failure := native_failure(row.strip()))), None)
+                if failure is not None:
+                    raise failure
                 if self.launch_plan or self.records.error:
                     if timed_out:
                         try:
                             self.proc.kill()
                         except OSError:
                             pass
-                    raise RuntimeError("invalid_launch_plan: native startup records missing, malformed or disagree")
+                    error = RuntimeError("invalid_launch_plan: native startup records missing, malformed or disagree")
+                    # Keep the existing startup exception readable to CLI callers. A child that simply
+                    # exited has no evidence of a plan mismatch or an allocation failure.
+                    error.runtime_code = "invalid_launch_plan" if self.records.error or saw_ready or timed_out else "engine_died"
+                    raise error
                 if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
                     try:
                         self.proc.kill()
                     except OSError:
                         pass
-                try:                                        # its pipes and our handle on its log (the log stays)
+                try:                                        # pipe/log closure belongs to the outer cleanup owner
                     self.proc.wait(timeout=5)
-                    self.proc.stdin.close()
-                    self.proc.stdout.close()
-                    if log:
-                        self.log.close()
                 except (OSError, subprocess.TimeoutExpired):
                     pass
                 why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
@@ -760,7 +828,7 @@ class StrataEngine:
             self.lines: queue.Queue = queue.Queue()
             # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
             # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
-            asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+            asked = self.requested_slots
             self.batch = int(self.info.get("batch_slots") or 0)
             if asked and self.batch != asked:
                 print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
@@ -803,55 +871,91 @@ class StrataEngine:
             self.wlock = threading.Lock()                   # stdin writes from several request threads
             self.pump = threading.Thread(target=self._pump, daemon=True)
             self.pump.start()
-        except BaseException:
+        except BaseException as error:
             loading.set()
-            try:
-                self.close()
-            finally:
-                if ready_reader is not None and ready_reader.ident is not None:
-                    ready_reader.join(timeout=2)
+            self.close()                                 # includes the tracked readiness reader
+            if isinstance(error, RuntimeError) and self.native_error is not None:
+                raise self.native_error from error
             raise
+
+    def _stderr_pump(self, proc):
+        """Without a log, discard stderr except bounded typed refusals. No native stdout is read here."""
+        partial = False
+        pipe = proc.stderr
+        try:
+            while True:
+                try:
+                    line = pipe.readline(16385)
+                except UnicodeError:
+                    partial = True
+                    continue
+                except (OSError, ValueError):
+                    return
+                if not isinstance(line, str) or not line:
+                    return
+                oversized = partial or len(line) > 16384
+                partial = not line.endswith("\n")
+                if not oversized:
+                    failure = native_failure(line)
+                    if failure is not None and self.proc is proc:
+                        self.native_error = failure
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         records = getattr(self, "records", None)
         slot_q = self.slot_q
         line = None
-        for line in self._native_lines(proc, records):
-            if records is not None and records.consume(line, proc.stdout):
-                continue
-            if records is not None and line.startswith("INFO "):
-                records.info_line(line)
-                if records.error and getattr(self, "launch_plan", None):
+        try:
+            for line in self._native_lines(proc, records):
+                if records is not None and records.consume(line, proc.stdout):
                     continue
-            # checked before batch routing: a fatal line is never a slot's own
-            if line.startswith(FATAL_PREFIXES):
-                # release_gpu_waits invalidates the verifier, even if the native
-                # process stays alive and prints DONE afterwards.
-                if self.proc is proc:
-                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
-                    self.ended = True
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-                break                           # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
-                try:
-                    slot_q[int(line.split()[1])].put(line)
-                    continue
-                except (IndexError, ValueError):
-                    pass
-            lines.put(line)
-        if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
-            self.ended = True                           # its output closed: it is gone, even before the OS says so
-            if records is not None:
-                records.error = records.error or "native output closed"
-            if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
-                self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
-        lines.put(None)
-        for q in slot_q:
-            q.put(None)
+                if records is not None and line.startswith("INFO "):
+                    records.info_line(line)
+                    if records.error and getattr(self, "launch_plan", None):
+                        continue
+                failure = native_failure(line)
+                if failure is not None and self.proc is proc:
+                    self.native_error = failure
+                # checked before batch routing: a fatal line is never a slot's own
+                if line.startswith(FATAL_PREFIXES):
+                    # release_gpu_waits invalidates the verifier, even if the native
+                    # process stays alive and prints DONE afterwards.
+                    if self.proc is proc:
+                        self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                        self.ended = True
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    break                           # publish EOF, never the trailing DONE
+                if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
+                    try:
+                        slot_q[int(line.split()[1])].put(line)
+                        continue
+                    except (IndexError, ValueError):
+                        pass
+                lines.put(line)
+        finally:
+            try:
+                close = getattr(proc.stdout, "close", None)
+                if close is not None:
+                    close()
+            except OSError:
+                pass
+            if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
+                self.ended = True                           # its output closed: it is gone, even before the OS says so
+                if records is not None:
+                    records.error = records.error or "native output closed"
+                if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
+                    self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
+            lines.put(None)
+            for q in slot_q:
+                q.put(None)
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -878,20 +982,19 @@ class StrataEngine:
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
                     "report it at github.com/Niko1221/Strata/issues with the log.")
-        return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
-                "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
-                "smaller model (Q2_0 / IQ2_XS).")
+        return "The engine stopped without a typed cause; check its log and the operating system's process logs."
 
     def alive(self) -> bool:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
     def exit_code(self):
-        if self.proc is None:
+        proc = self.proc
+        if proc is None or getattr(self, "termination_uncertain", False):
             return None
         try:
-            return self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+            return proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
             return None
 
     def unload(self):
@@ -926,7 +1029,7 @@ class StrataEngine:
             yield line
 
     @staticmethod
-    def _ready_pump(proc, out: queue.Queue, records=None, frame=None) -> None:
+    def _ready_pump(proc, out: queue.Queue, records=None, frame=None, write_done=None) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
         done = False
         try:
@@ -934,8 +1037,12 @@ class StrataEngine:
                 # The existing startup reader also delivers the initial bytes,
                 # under the READY deadline. Bypass Windows text newline rewriting;
                 # subsequent commands keep their ordinary text pipe semantics.
-                proc.stdin.buffer.write(frame)
-                proc.stdin.buffer.flush()
+                try:
+                    proc.stdin.buffer.write(frame)
+                    proc.stdin.buffer.flush()
+                finally:
+                    if write_done is not None:
+                        write_done.set()
             for line in StrataEngine._native_lines(proc, records):
                 if records is not None and records.consume(line, proc.stdout):
                     if records.error:
@@ -953,6 +1060,13 @@ class StrataEngine:
             pass
         finally:
             if not done:
+                try:
+                    # Failed startup retains the pipe with an unconfirmed child.
+                    # Once exit is known, this reader can finish its own closure.
+                    if proc.poll() is not None:
+                        proc.stdout.close()
+                except (OSError, AttributeError):
+                    pass
                 out.put(None)
 
     def restart(self, tries: int = 3):
@@ -960,6 +1074,8 @@ class StrataEngine:
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
+        if getattr(self, "termination_uncertain", False):
+            raise EngineStuck("engine exit is unconfirmed; unload it successfully before restarting")
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
@@ -1114,7 +1230,7 @@ class StrataEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
+        except (OSError, ValueError, AttributeError):    # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _control(self, cancel, on_token, stop_when=None):
@@ -1122,8 +1238,16 @@ class StrataEngine:
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE)."""
         stopped = False
+        stopped_at = None
+        proc, born = getattr(self, "proc", None), getattr(self, "gen", None)
         beat = time.monotonic()
         while True:
+            if cancel.is_set() and not stopped:
+                self._send("STOP")
+                stopped = True
+                stopped_at = time.monotonic()
+            if stopped_at is not None and time.monotonic() - stopped_at >= CANCEL_GRACE_S:
+                self._cancel_timeout(proc, born)
             try:
                 # A client can leave before the first PP/token.  Poll its Event as often as _take_control does;
                 # the ten-second HTTP heartbeat is independent of how promptly STOP reaches the engine.
@@ -1132,13 +1256,15 @@ class StrataEngine:
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
+                    stopped_at = time.monotonic()
                 if time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
                     yield None
                 continue
             beat = time.monotonic()
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                raise getattr(self, "native_error", None) or EngineDied(
+                    f"the engine stopped unexpectedly (exit code {self.exit_code()})")
             if not line.startswith(("PP ", "INFO")):
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
@@ -1146,6 +1272,7 @@ class StrataEngine:
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
                     stopped = True
+                    stopped_at = time.monotonic()
                 yield False                              # a token is pending (not a heartbeat)
             elif line.startswith("PP "):
                 f = line.split()
@@ -1158,6 +1285,7 @@ class StrataEngine:
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
                     self._send("STOP")
                     stopped = True
+                    stopped_at = time.monotonic()
                 yield None
             elif line.startswith("DONE"):
                 self._parse_done(line)
@@ -1172,31 +1300,45 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise native_failure(line) or ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
 
-    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
+    def _cancel_timeout(self, proc, born):
+        """Only the captured child's confirmed exit can substitute for DONE/BDONE."""
+        with self.__dict__.setdefault("_close_lock", threading.RLock()):
+            if self.proc is proc and getattr(self, "gen", None) == born:
+                self.cancelled_gen = born               # monotonic: older pending requests stay invalidated too
+                self.ended = True
+                self.silent_note = "The engine did not acknowledge cancellation within five seconds."
+                self._wake_dead()
+                self.close(timeout=CANCEL_CLOSE_S)
+        raise EngineSilent("the engine did not acknowledge cancellation; the server ended the owned engine")
+
+    def _drain_control(self, until: str, timeout: float | None = None, born: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
         `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
         drain - its end line was read already (by the request's own EngineDied), and waiting for another one held
         a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it."""
-        end = time.monotonic() + timeout
+        proc = self.proc
+        end = time.monotonic() + (CANCEL_GRACE_S if timeout is None else timeout)
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
-                return None
+                break
             try:
                 line = self.lines.get(timeout=max(0.1, min(1.0, end - time.monotonic())))
             except queue.Empty:
                 continue
             if line is None:
-                return None
+                break
             if line.startswith("DONE"):
                 self._parse_done(line)
             if line.startswith(until) or line.startswith("ERR"):
                 return line
+        if proc is not None and proc.poll() is None:
+            self._cancel_timeout(proc, born if born is not None else getattr(self, "gen", None))
         return None
 
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
@@ -1205,18 +1347,22 @@ class StrataEngine:
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
+        if getattr(self, "termination_uncertain", False):
+            return
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+        proc, born = self.proc, self.gen
 
         def wait():
-            end = time.monotonic() + 600.0
+            end = time.monotonic() + CANCEL_GRACE_S
             tail = list(stream or [])
+            acknowledged = False
             while time.monotonic() < end:
                 try:
-                    line = q.get(timeout=5.0)
+                    line = q.get(timeout=min(0.5, max(0.001, end - time.monotonic())))
                 except queue.Empty:
                     continue
                 if line is None:
@@ -1228,7 +1374,17 @@ class StrataEngine:
                     except (IndexError, ValueError):
                         tail = []
                 if line.startswith("BDONE "):
+                    acknowledged = True
                     break
+            if not acknowledged and proc is not None and proc.poll() is None:
+                try:
+                    self._cancel_timeout(proc, born)
+                except EngineSilent:
+                    pass
+                except EngineStuck:
+                    return                              # ownership and the occupied slot remain until confirmed exit
+            if not acknowledged and proc is not None and proc.poll() is None:
+                return
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
@@ -1241,12 +1397,15 @@ class StrataEngine:
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
         entry = [plen]
+        born = self.gen
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
         beat = time.monotonic()
         try:
             while True:
+                if born <= getattr(self, "cancelled_gen", 0):
+                    raise EngineDied("the engine ended after cancellation while this request waited; it was not sent")
                 if not self.alive() and not getattr(self, "starting", False):
                     # #1012: the engine is gone and nobody is starting it again: this request was not sent, so it
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
@@ -1255,6 +1414,9 @@ class StrataEngine:
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                 if turn and self.ctl.acquire(timeout=0.5):
+                    if born <= getattr(self, "cancelled_gen", 0):
+                        self.ctl.release()
+                        raise EngineDied("the engine ended after cancellation while this request waited; it was not sent")
                     if self.alive():
                         break
                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
@@ -1321,6 +1483,7 @@ class StrataEngine:
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
+        stop_at = None
         yields, solo_again = 0, 0
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
@@ -1452,19 +1615,27 @@ class StrataEngine:
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
+                stop_sent, stop_at = False, None
+                beat = time.monotonic()
                 while True:
+                    if cancel.is_set() and not stop_sent:
+                        self._send(f"BSTOP {slot}")
+                        stop_sent, stop_at = True, time.monotonic()
+                    if stop_at is not None and time.monotonic() - stop_at >= CANCEL_GRACE_S:
+                        self._cancel_timeout(self.proc, born)
                     try:
-                        line = self.slot_q[slot].get(timeout=10.0)
+                        line = self.slot_q[slot].get(timeout=0.5)
                     except queue.Empty:
-                        if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
-                            stop_sent = True
-                        yield None
+                        if time.monotonic() - beat >= 10.0:
+                            beat = time.monotonic()
+                            yield None
                         continue
                     if line is None:
                         phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                        raise getattr(self, "native_error", None) or EngineDied(
+                            f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                     if line.startswith("BT "):
+                        beat = time.monotonic()
                         t = int(line.split()[2])
                         out.append(t)
                         live["generated"] = len(out)
@@ -1472,12 +1643,14 @@ class StrataEngine:
                             if not stop_sent:
                                 self._send(f"BSTOP {slot}")
                                 stop_sent = True
+                                stop_at = time.monotonic()
                             continue
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
+                            stop_at = time.monotonic()
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
@@ -1507,6 +1680,8 @@ class StrataEngine:
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             try:
+                if self.gen == born and not self.alive() and self.proc is not None and self.proc.poll() is None:
+                    self._cancel_timeout(self.proc, born)
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
                 if phase in ("solo", "admit") and self._ctl_erred:
@@ -1515,27 +1690,28 @@ class StrataEngine:
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
+                    self._send("STOP")
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
-            except EngineDied:
+            except (EngineDied, EngineStuck):
                 pass
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if holding:
                 self.ctl.release()
-            if reserved is not None:
+            if reserved is not None and self.gen == born and not getattr(self, "termination_uncertain", False):
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
-            if slot is not None:
+            if slot is not None and self.gen == born:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                else:
+                elif not getattr(self, "termination_uncertain", False):
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
@@ -1582,7 +1758,8 @@ class StrataEngine:
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "stopping" if self.slot_busy[b] else "idle",
+                             "held_tokens": len(self.slot_held[b])})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -1646,7 +1823,8 @@ class StrataEngine:
                     continue
                 if line is None:
                     done = True
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    raise getattr(self, "native_error", None) or EngineDied(
+                        f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
                 beat = heard
                 if stall_state:
@@ -1680,35 +1858,20 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    raise native_failure(line) or ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
-                    except OSError:
+                        # Use the same serialized pipe writer as batched cancellation.
+                        if hasattr(self, "wlock"):
+                            self._send("STOP")
+                        else:
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
+                    except (OSError, EngineDied):
                         pass
-                # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
-                # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
-                # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
-                heard = time.monotonic()
-                while True:
-                    left = allow - (time.monotonic() - heard) if allow > 0 else None
-                    try:
-                        if left is not None and left <= 0:
-                            raise queue.Empty
-                        line = self.lines.get(timeout=left)
-                    except queue.Empty:
-                        raise self._silent("the engine did not finish the request after it was stopped (STOP) "
-                                           f"within {allow:.0f} s") from None
-                    if line is None or line.startswith("ERR"):
-                        break
-                    if line.startswith("DONE"):
-                        self._parse_done(line)
-                        break
-                    if not self.can_stop:
-                        heard = time.monotonic()
+                self._drain_control("DONE", born=getattr(self, "gen", None))
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
@@ -1861,27 +2024,92 @@ class StrataEngine:
                 continue
             raise out_of_step(line)
 
-    def close(self):
-        """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s. Raises EngineStuck if exit cannot be confirmed."""
+    def close(self, timeout: float = 20):
+        """End a ready engine with QUIT, then terminate and kill with bounded waits.
+        Retain ownership until process exit and pipe cleanup are confirmed."""
+        lock = self.__dict__.setdefault("_close_lock", threading.RLock())
+        with lock:
+            StrataEngine._close_owned(self, timeout)
+
+    def _wake_dead(self):
+        lines = getattr(self, "lines", None)
+        if lines is not None:
+            lines.put(None)
+        for q in getattr(self, "slot_q", ()):
+            q.put(None)
+        cv = getattr(self, "slot_cv", None)
+        if cv is not None and not getattr(self, "starting", False):
+            with cv:
+                cv.notify_all()
+
+    def _start_input_cleanup(self, send_quit, write_done):
+        cleanup = getattr(self, "input_cleanup", None)
+        if cleanup is not None and (cleanup[0].is_alive() or self.proc.stdin.closed):
+            return cleanup
+        proc, errors = self.proc, []
+        def finish():
+            if write_done is not None:
+                write_done.wait()
+            try:
+                if send_quit:
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+            except (OSError, ValueError):
+                errors.append(True)
+            finally:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    errors.append(True)
+        worker = threading.Thread(target=finish, daemon=True)
+        try:
+            worker.start()
+        except (OSError, RuntimeError):
+            startup = getattr(self, "ready_reader", None)
+            if not send_quit and write_done is None and getattr(self, "max_context", None) == 0 and (startup is None or startup.ident is None):
+                finish()                  # never-started startup has an untouched, empty stdin
+            else:
+                raise
+        self.input_cleanup = worker, errors
+        return self.input_cleanup
+
+    def _close_owned(self, timeout):
         from serve.launch_runtime import Records
         self.records = Records(getattr(self, "launch_plan", None))
+        self.ended = True
         if self.proc is None:
             return
+        startup_reader = getattr(self, "ready_reader", None)
+        write_done = getattr(self, "ready_write_done", None)
+        if startup_reader is None or startup_reader.ident is None:
+            write_done = None                       # the startup worker never began
+        input_waited = False
         try:
             if self.proc.poll() is None:
-                try:
-                    self.proc.stdin.write("QUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
+                if write_done is not None and not write_done.is_set():
+                    # The strict-frame writer can hold stdin's buffered lock.
+                    # Termination must not depend on writing or closing that pipe.
                     self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=timeout)
+                else:
+                    try:
+                        deadline = time.monotonic() + timeout
+                        worker, errors = StrataEngine._start_input_cleanup(self, getattr(self, "max_context", 0) > 0, write_done)
+                        if worker.ident is not None:
+                            worker.join(timeout=min(2, max(0, deadline - time.monotonic())))
+                        input_waited = True
+                        if worker.is_alive() or errors:
+                            raise OSError("native stdin cleanup pending")
+                        # Failed startup never sends another command. Runtime QUIT
+                        # or startup EOF and the exit wait share the graceful budget.
+                        self.proc.wait(timeout=max(0, deadline - time.monotonic()))
+                    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+                        self.proc.terminate()
+                        self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
                 self.proc.kill()
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=timeout)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         except OSError:
@@ -1892,20 +2120,43 @@ class StrataEngine:
             except OSError:
                 exited = False
             if exited:
-                if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
-                    self.pump.join(timeout=2)
                 try:
-                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
-                except OSError:
-                    pass
+                    worker, _ = StrataEngine._start_input_cleanup(self, False, write_done)
+                    if worker.ident is not None:
+                        worker.join(timeout=0 if input_waited else 2)
+                    input_done = not worker.is_alive() and self.proc.stdin.closed
+                except (OSError, RuntimeError):
+                    input_done = False
+                if not input_done:
+                    self.termination_uncertain = True
+                    StrataEngine._wake_dead(self)
+                    raise EngineStuck("native stdin cleanup is still pending; retry unloading after it completes")
+                # Confirm stdin EOF before waiting for output readers, including
+                # a child launched through a wrapper. Only its worker closes stdin.
+                for reader, stream in ((self.pump, "stdout"), (getattr(self, "ready_reader", None), "startup stdout"),
+                                       (getattr(self, "stderr_reader", None), "stderr")):
+                    if reader is not None and reader.ident is not None:
+                        reader.join(timeout=2)
+                    if reader is not None and reader.is_alive():
+                        # Each reader closes its captured stream after EOF. A
+                        # cross-thread close could block on its buffered read lock.
+                        self.termination_uncertain = True
+                        StrataEngine._wake_dead(self)
+                        raise EngineStuck(f"native {stream} cleanup is still pending; retry unloading after it completes")
                 self.proc.stdout.close()
+                stderr = getattr(self.proc, "stderr", None)
+                if stderr is not None:
+                    stderr.close()
                 if self.log not in (None, subprocess.DEVNULL):
                     self.log.close()
                 self.proc = None
+                self.termination_uncertain = False
                 self.ended = True
                 self.progress, self.last = None, {}
                 self.progress_ms, self.reused = 0, 0
             else:
+                self.termination_uncertain = True
+                StrataEngine._wake_dead(self)
                 raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
 
 
@@ -2920,6 +3171,10 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self._lifecycle = "loaded" if self.loaded() else "unloaded"
+        self._load_attempt = 0
+        self._load_error = None
+        self.stopping = threading.Event()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -2938,6 +3193,26 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    def lifecycle(self) -> str:
+        if getattr(self.engine, "termination_uncertain", False):
+            return "failed"
+        if self._lifecycle in ("loading", "unloading"):
+            return self._lifecycle
+        if getattr(self.engine, "starting", False):
+            return "loading"
+        if self.loaded():
+            return "loaded"
+        if self._lifecycle == "failed" or not getattr(self.engine, "unloaded", False):
+            return "failed"
+        return "unloaded"
+
+    def _controls_busy(self):
+        with self.status_lock:
+            busy = self.status.get("busy") or self.status.get("queued")
+        ctl = getattr(self.engine, "ctl", None)
+        return bool(busy or any(getattr(self.engine, "slot_busy", ())) or getattr(self.engine, "waiting", 0)
+                    or (ctl is not None and ctl.locked()))
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -3058,6 +3333,26 @@ class Service:
             return None
 
     def ensure_loaded(self):
+        """The FIFO owns each shared load attempt, including failure publication to its waiters."""
+        if self.loaded() and not self._vision_down():
+            return
+        if getattr(self.engine, "termination_uncertain", False):
+            raise EngineStuck("engine exit is unconfirmed; unload it successfully before restarting")
+        self._lifecycle = "loading"
+        self._load_attempt += 1
+        self._load_error = None
+        try:
+            self._ensure_loaded()
+        except Exception as error:
+            if isinstance(error, (RuntimeError, OSError)) and not isinstance(error, (EngineDied, EngineStuck, GpuBusy)):
+                code = getattr(error, "runtime_code", "engine_died")
+                error = NativeFailure(code) if code != "engine_died" else EngineDied("the engine failed to start; check its log")
+            self._lifecycle = "failed"
+            self._load_error = error
+            raise error
+        self._lifecycle = "loaded"
+
+    def _ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
@@ -3146,15 +3441,24 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
+    def load(self, explicit: bool = False):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        if not explicit and self.loaded() and not self._vision_down():
             return
+        if getattr(self.engine, "termination_uncertain", False):
+            raise EngineStuck("engine exit is unconfirmed; unload it successfully before restarting")
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
-        with self.fifo:
+        attempt, shared_load = self._load_attempt, self.lifecycle() == "loading"
+        if not self.fifo.acquire(blocking=not explicit):
+            raise ModelBusy("a request is running or queued")
+        try:
+            if explicit and self._controls_busy():
+                raise ModelBusy("a request is running or queued")
+            if not explicit and (shared_load or attempt != self._load_attempt) and self._load_error is not None:
+                raise self._load_error
             loading = time.perf_counter()
             if trace is not None:
                 with self.status_lock:
@@ -3167,6 +3471,8 @@ class Service:
                     with self.status_lock:
                         trace["load_s"] += round(time.perf_counter() - loading, 3)
                         trace["state"] = "queued"
+        finally:
+            self.fifo.release()
 
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
@@ -3176,16 +3482,22 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            if not self.engine.alive():
+            if self._controls_busy() and not getattr(self.engine, "termination_uncertain", False):
+                return "busy"
+            if not self.engine.alive() and getattr(self.engine, "proc", None) is None:
                 return "not loaded"
-            with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
-                    return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
-            self.engine.unload()
-            if self.vision is not None and hasattr(self.vision, "unload"):
-                self.vision.unload()
+            self._lifecycle = "unloading"
+            try:
+                self.engine.unload()
+                if self.vision is not None and hasattr(self.vision, "unload"):
+                    self.vision.unload()
+            except Exception:
+                self._lifecycle = "failed"
+                raise
+            self._lifecycle = "unloaded"
+            self._load_error = None
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
@@ -3198,8 +3510,7 @@ class Service:
         print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
         def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+            while not self.stopping.wait(max(1.0, min(30.0, self.idle_unload_s / 4))):
                 try:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
@@ -3393,9 +3704,10 @@ class Service:
         images = self.vision is not None
         from serve.launch_runtime import status as launch_status
         launch, engine_build = launch_status(self.engine)
+        lifecycle = self.lifecycle()
         return {
             "service": "strata", "model": self.model,
-            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "loaded": lifecycle == "loaded", "lifecycle": lifecycle, "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -3404,8 +3716,8 @@ class Service:
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
-            "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
-                            "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
+            "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)) if lifecycle == "loaded" else 0,
+                            "requested": max(1, int(getattr(self.engine, "requested_slots", getattr(self.engine, "batch", 0)) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
@@ -3731,6 +4043,7 @@ class Service:
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
+        queued_gen = getattr(self.engine, "gen", None)
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
@@ -3747,6 +4060,8 @@ class Service:
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
                     with (self.fifo if par else contextlib.nullcontext()):
+                        if queued_gen is not None and queued_gen <= getattr(self.engine, "cancelled_gen", 0):
+                            raise EngineDied("the owned engine ended after cancellation while this request waited")
                         self.ensure_loaded()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
@@ -4473,6 +4788,8 @@ class BadBody(Exception):
 
 
 def make_handler(svc: Service):
+    from serve.launch_plan import PlanError
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
@@ -4822,18 +5139,16 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
+                    lifecycle = svc.lifecycle()
+                    value = lifecycle if lifecycle in ("loaded", "loading") else "unloaded"
+                    model = {"id": svc.model, "object": "model", "status": {"value": value},
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
-                    if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
-                        loaded = True
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    self._json(200, {"object": "list", "data": data if loaded else []})
+                    self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -4869,6 +5184,7 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
+            from serve.launch_plan import PlanError
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -4892,16 +5208,17 @@ def make_handler(svc: Service):
                 try:
                     r = svc.unload()
                 except EngineStuck as e:
-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    self._json(503, runtime_error_body(e))
                     return
-                self._json(409 if r == "busy" else 200, {"status": r})
+                self._json(409 if r == "busy" else 200,
+                           {"status": r, **(runtime_error_body(ModelBusy("a request is running or queued")) if r == "busy" else {})})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
-                    svc.load()
+                    svc.load(explicit=True)
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                except (GpuBusy, EngineStarting, EngineStuck, EngineDied, ModelBusy, PlanError) as e:
+                    self._json(409 if isinstance(e, ModelBusy) else 503, runtime_error_body(e))
                 return
             try:
                 req = json.loads(self._body() or b"{}")
@@ -4914,7 +5231,7 @@ def make_handler(svc: Service):
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
-                    if req.get("model") not in (None, svc.model):
+                    if req.get("model") is not None and req["model"] not in svc.model_names():
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     if path == "/v1/unload":
@@ -4922,16 +5239,7 @@ def make_handler(svc: Service):
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
                     else:
-                        if not svc.fifo.acquire(blocking=False):
-                            raise ModelBusy("a request is running or queued")
-                        try:
-                            with svc.status_lock:
-                                if svc.status.get("busy") or svc.status.get("queued"):
-                                    raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
-                            svc.last_request_at = time.time()
-                        finally:
-                            svc.fifo.release()
+                        svc.load(explicit=True)
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
@@ -4944,7 +5252,7 @@ def make_handler(svc: Service):
                     try:
                         self._json(200, svc.vram(r))
                     except EngineDied as e:
-                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                        self._json(503, runtime_error_body(e))
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
@@ -4967,6 +5275,8 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except PlanError as e:
+                self._json(503, runtime_error_body(e))
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -4974,12 +5284,12 @@ def make_handler(svc: Service):
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:
-                self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+                self._json(409, runtime_error_body(e, "model_busy"))
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                self._json(503, runtime_error_body(e))
             except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
                 # says so, with the traceback in the log, instead of a dropped connection - unless the answer began
@@ -4992,9 +5302,9 @@ def make_handler(svc: Service):
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
                 self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, runtime_error_body(e))
             except EngineStuck as e:                         # an unload or restart that could not end the engine
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                self._json(503, runtime_error_body(e))
 
             except OSError:
                 self._note(outcome="disconnected")
@@ -5261,8 +5571,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+            except (EngineDied, EngineStuck, PlanError) as e: # mid-stream: say so, then end the stream properly
+                err = runtime_error_body(e)
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -5290,6 +5600,7 @@ def make_handler(svc: Service):
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
+            from serve.launch_plan import PlanError
             try:
                 title = (responses_api.thread_title_events(req, svc.model_for(req))
                          if svc.codex_thread_titles else None)
@@ -5302,9 +5613,9 @@ def make_handler(svc: Service):
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
-                return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
-            except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                return self._json(409, responses_error_body(str(e), "server_error", code=error_code(e)))
+            except (GpuBusy, EngineStarting, EngineStuck, EngineDied, PlanError) as e:
+                return self._json(503, responses_error_body(str(e), "server_error", code=error_code(e)))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
 
@@ -5330,9 +5641,9 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
-                except EngineDied as e:
+                except (EngineDied, EngineStuck, PlanError) as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
-                                                                code="server_error"))
+                                                                code=error_code(e)))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -5361,8 +5672,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
-            except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except (EngineDied, EngineStuck, PlanError) as e: # mid-stream: response.failed, then the stream ends
+                self._responses_failed(asm, runtime_error_body(e)["error"]["message"], error_code(e), send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -5472,8 +5783,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()
                 events.close()
-            except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+            except (EngineDied, EngineStuck, PlanError) as e: # mid-stream: Anthropic's error event
+                err = {"type": "error", **runtime_error_body(e, "api_error")}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -5501,6 +5812,9 @@ class Server(ThreadingHTTPServer):
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
         # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
+        stopping = getattr(getattr(self, "svc", None), "stopping", None)
+        if stopping is not None:
+            stopping.set()
         if tel is not None and hasattr(tel, "close"):
             tel.close()
         super().server_close()
@@ -5706,10 +6020,14 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
-    svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        svc.start_telemetry()
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    except BaseException:
+        httpd.server_close()
+        raise
     return httpd
 
 
@@ -6044,12 +6362,16 @@ def main() -> int:
                                   env=env, lazy=lazy, launch_plan=saved_plan)
         except (RuntimeError, ValueError, OSError) as error:
             if saved_plan is None:
-                raise
+                code = "installation_error" if isinstance(error, OSError) else error_code(error)
+                print(json.dumps({"error": {"code": code, "message": "Native startup failed; check the engine log."}}))
+                return 2
             from serve.launch_plan import ProbeCleanupError
             if isinstance(error, ProbeCleanupError):
                 print('{"error":{"code":"invalid_launch_plan","message":"Native query cleanup could not be confirmed.","cleanup":"unconfirmed"}}')
                 return 2
-            code = "insufficient_resources" if str(error).startswith("insufficient_resources:") else "invalid_launch_plan"
+            from serve.launch_plan import PlanError
+            code = error_code(error) if isinstance(error, (PlanError, NativeFailure, EngineStuck)) else \
+                getattr(error, "runtime_code", "invalid_launch_plan")
             print(json.dumps({"error": {"code": code, "message": "Saved native startup refused."}}))
             return 2
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
@@ -6164,7 +6486,17 @@ def main() -> int:
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
-    httpd = serve(svc, host=a.host, port=a.port)
+    try:
+        httpd = serve(svc, host=a.host, port=a.port)
+    except BaseException as error:
+        # The preflight cannot reserve this port while the model loads. Close only
+        # resources started by this invocation when another listener wins the race.
+        for close in filter(None, (getattr(engine, "close", None), vision.shutdown if vision else None,
+                                   hub.close if hub is not None else None)):
+            close()
+        if isinstance(error, OSError):
+            ap.error(listen_problem(a.host, a.port, error))
+        raise
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
@@ -6203,7 +6535,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [httpd.shutdown, httpd.server_close, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

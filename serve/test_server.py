@@ -22,7 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
@@ -217,7 +217,7 @@ class FitMaxTokens(unittest.TestCase):
         self.assertIn("no room to answer", b["error"]["message"])
 
 
-class VisionTempFiles(unittest.TestCase):
+class VisionRequestTempFiles(unittest.TestCase):
     """A request's combined image file (req-*.sve, ~10 MB a picture) goes with the request: one refused after prepare()
     wrote it (the engine starting, no room) or whose answer never started left it in the vision directory for good."""
 
@@ -853,7 +853,7 @@ class _Reached(Exception):
 
 
 class ConfigApiKey(unittest.TestCase):
-    """#569 (and #213): the key in the config, through main(): empty is a warning, a blank one is refused."""
+    """Explicit empty credentials refuse before serving, matching the shared credential owner."""
 
     def run_main(self, cfg):
         """-> (return code, the API key the service got or None when main() stopped before serving, stderr)."""
@@ -877,10 +877,10 @@ class ConfigApiKey(unittest.TestCase):
                     code = 0
         return code, seen.get("key"), err.getvalue()
 
-    def test_an_empty_key_is_a_warning(self):
+    def test_an_empty_key_is_refused(self):
         code, key, err = self.run_main({"api_key": ""})
-        self.assertEqual((code, key), (0, ""))
-        self.assertIn("api_key in the config is empty", err)
+        self.assertEqual((code, key), (2, None))
+        self.assertIn("empty", err)
 
     def test_a_blank_key_is_refused(self):
         for value in ("   ", "\r\n"):
@@ -2615,7 +2615,8 @@ class WebApp(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, r.headers.get("Content-Type", ""), r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.headers.get("Content-Type", ""), e.read()
+            with e:
+                return e.code, e.headers.get("Content-Type", ""), e.read()
 
     def test_page_and_files(self):
         code, ctype, body = self.get("/")
@@ -2637,8 +2638,9 @@ class WebApp(unittest.TestCase):
 
     def test_metrics(self):
         data = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}).encode()
-        urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data,
-                                                      headers={"Content-Type": "application/json"}), timeout=10).read()
+        with urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=data,
+                                                           headers={"Content-Type": "application/json"}), timeout=10) as response:
+            response.read()
         code, ctype, body = self.get("/metrics")
         self.assertEqual(code, 200)
         m = json.loads(body)
@@ -2836,7 +2838,9 @@ class WebApp(unittest.TestCase):
             for path in ("/models", "/v1/models"):
                 code, _, body = self.get(path)
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body)["data"], [])
+                models = json.loads(body)["data"]
+                self.assertEqual([model["id"] for model in models], [self.svc.model])
+                self.assertEqual([model["status"]["value"] for model in models], ["unloaded"])
             self.assertEqual(self.get("/props")[0], 503)
             self.assertEqual(json.loads(self.get("/slots")[2]), [])
         finally:
@@ -3967,15 +3971,23 @@ class SilentEngine(unittest.TestCase):
         engine.proc.kill.assert_not_called()
 
     def test_a_stop_never_acknowledged(self):
+        import subprocess
         from serve.server import EngineSilent
         engine = self.bare(0.3, can_stop=True)
+        proc = engine.proc
+        proc.stdin = mock.Mock(wraps=proc.stdin)
+        proc.wait.side_effect = [subprocess.TimeoutExpired("engine", 1), 0]
+        proc.terminate.side_effect = lambda: setattr(proc.poll, "return_value", 0)
+        engine.pump, engine.log = None, None
         engine.lines.put("T 5")
         gen = engine.generate([1], 10, {}, threading.Event())
         self.assertEqual(next(gen), 5)
-        with self.assertRaises(EngineSilent):
+        with mock.patch("serve.server.CANCEL_GRACE_S", .1), self.assertRaises(EngineSilent):
             gen.close()                                           # the consumer stopped: STOP, then the drain
-        self.assertIn("STOP", engine.proc.stdin.getvalue())
-        engine.proc.kill.assert_called_once()
+        self.assertIn(mock.call("STOP\n"), proc.stdin.write.call_args_list)
+        proc.terminate.assert_called_once()
+        self.assertIsNotNone(proc.poll())
+        self.assertIsNone(engine.proc)
         self.assertFalse(engine.alive())
 
     def test_frozen_engine_is_ended_by_the_stall_watchdog(self):
@@ -4095,8 +4107,9 @@ class LostStep(unittest.TestCase):
                         with urllib.request.urlopen(req, timeout=60) as r:
                             text = r.read().decode()
                     except urllib.error.HTTPError as e:
-                        self.assertEqual(e.code, 503)
-                        text = e.read().decode()
+                        with e:
+                            self.assertEqual(e.code, 503)
+                            text = e.read().decode()
                     self.assertIn("the next request restarts it", text)
                     self.assertIsNotNone(first.poll(), "the silent engine still runs")
                     self.assertEqual(svc.history[-1]["finish"], "error")

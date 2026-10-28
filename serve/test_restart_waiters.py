@@ -43,7 +43,8 @@ class RestartWaiters(unittest.TestCase):
         try:
             out[i] = ("ok", self.chat(text)["choices"][0]["message"]["content"])
         except urllib.error.HTTPError as e:
-            out[i] = ("http", e.code, json.loads(e.read().decode())["error"]["message"])
+            with e:
+                out[i] = ("http", e.code, json.loads(e.read().decode())["error"]["message"])
         except Exception as e:      # noqa: BLE001 - reported by the assertions
             out[i] = ("exc", repr(e))
 

@@ -297,7 +297,7 @@ class ParallelService(unittest.TestCase):
     def test_engine_reports_fewer_slots(self):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)
-        self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
+        self.assertEqual(self.get("/v1/status")["concurrency"], {"serving": 2, "requested": 4})
 
     def test_batch_groups_auto_follows_the_engine(self):
         """--batch-groups auto: the engine picks the groups and says so (INFO batch_groups=G); the server spreads the
@@ -533,7 +533,8 @@ class ParallelService(unittest.TestCase):
             try:
                 self.chat(t)
             except urllib.error.HTTPError as e:
-                errors.append(e.code)
+                with e:
+                    errors.append(e.code)
 
         threads = [threading.Thread(target=go, args=(t,)) for t in ("first question LONGREPLY", "second question")]
         for th in threads:
