@@ -12,6 +12,7 @@ namespace strata::plan {
 
 inline constexpr size_t launch_payload_limit = 1u << 20;
 inline constexpr unsigned launch_schema = 2;
+inline constexpr uint64_t launch_startup_scratch_allowance = 512ull << 20;
 
 struct LaunchResources {
     uint64_t vram_free = 0, ram_available = 0, commit_available = 0;
@@ -68,6 +69,8 @@ std::string encode_launch_settings(const LaunchSettings&);
 /// Compact verified-settings handoff; aggregate cache layout identity, never a per-expert telemetry dump.
 std::string encode_effective_launch(const LaunchSettings&);
 std::string frame_effective_launch(const LaunchSettings&, uint64_t sequence);
+// Applied owner values only; ordinary serving does not construct/validate a plan.
+std::map<std::string, uint64_t> runtime_launch_settings(const LaunchSettings&, uint64_t cache_slots, uint64_t cache_bytes);
 bool decode_launch_settings(const std::string& payload, LaunchSettings&, std::string& error);
 std::string frame_launch_settings(const std::string& payload);
 /// Consumes exactly one initial frame, leaving following engine commands unread.

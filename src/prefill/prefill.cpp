@@ -409,6 +409,8 @@ struct Alloc {
     uint64_t granule = 0;               ///< count_only: each take rounds up to this (cudaMalloc's 2 MiB pages: owned buffers)
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
+    core::RuntimeMemory* memory = nullptr;
+    std::string failure;
     template <typename T> T* take(size_t n, bool& ok) {
         if (n > (UINT64_MAX - 4096) / sizeof(T)) throw std::overflow_error("prefill allocation size overflow");
         uint64_t bytes = detail::buffer_bytes((uint64_t) n * sizeof(T));
@@ -422,13 +424,19 @@ struct Alloc {
             return nullptr;
         }
         if (base != nullptr) {
-            if (used + bytes > cap) { ok = false; failed_bytes = bytes; return nullptr; }
+            if (used + bytes > cap) { ok = false; failed_bytes = bytes; failure = "insufficient_resources: prefill borrowed region exhausted"; return nullptr; }
             T* p = (T*) (base + used);
             used += bytes;
             return p;
         }
         void* p = nullptr;
-        if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; failed_bytes = bytes; return nullptr; }
+        const auto status = cudaMalloc(&p, bytes);
+        if (status != cudaSuccess) {
+            ok = false; failed_bytes = bytes;
+            failure = core::native_error_message("prefill buffer allocation", std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status));
+            return nullptr;
+        }
+        if (memory) { memory->device_allocation(bytes); memory->logical+=(uint64_t)n * sizeof(T); }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -436,6 +444,13 @@ struct Alloc {
 };
 
 }  // namespace
+
+static bool prefill_resource_status(cudaError_t status, const char* context, std::string& error) {
+    if (status == cudaSuccess) return true;
+    error = core::native_error_message(context,
+        std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status));
+    return false;
+}
 
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
@@ -469,6 +484,9 @@ struct Stager {
     std::condition_variable cv;
     std::vector<std::thread> threads;
     int device = 0;
+    core::RuntimeMemory storage;
+    std::string failure;
+    bool* uncertain = nullptr;
 
     bool init(size_t blob_bytes, int nthreads, bool strict = false) {
         if (!strict) if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
@@ -477,15 +495,19 @@ struct Stager {
         dma_done.assign((size_t) kRing, nullptr);
         pageable.resize(kRing);
         for (int i = 0; i < kRing; ++i) {
-            pinned[i] = !force_pageable() && cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
+            const auto status = force_pageable() ? cudaErrorInvalidValue : cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault);
+            pinned[i] = status == cudaSuccess;
             if (!pinned[i]) {
-                if (strict) return false;
+                if (strict) { failure=core::native_error_message("prefill host stager", std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status)); return false; }
                 cudaGetLastError();
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
             }
-            if (cudaEventCreateWithFlags(&dma_done[i], stager_sleep() ? (cudaEventDisableTiming | cudaEventBlockingSync)
-                                                                      : cudaEventDisableTiming) != cudaSuccess) return false;
+            storage.requested += blob_bytes; storage.rounded += blob_bytes; storage.logical += blob_bytes;
+            if (pinned[i]) storage.pinned += blob_bytes;
+            if (!prefill_resource_status(cudaEventCreateWithFlags(&dma_done[i],
+                    stager_sleep() ? (cudaEventDisableTiming | cudaEventBlockingSync) : cudaEventDisableTiming),
+                    "prefill host stager event", failure)) return false;
         }
         cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
@@ -498,7 +520,7 @@ struct Stager {
         for (auto& t : threads) t.join();
         for (int i = 0; i < kRing; ++i) {
             if (dma_done[i]) cudaEventDestroy(dma_done[i]);
-            if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
+            if (buf[i] && pinned[i] && cudaFreeHost(buf[i])!=cudaSuccess && uncertain) *uncertain=true;
         }
     }
     void work() {
@@ -721,6 +743,8 @@ struct PeerPrefill {
 };
 
 struct Prefill::Impl {
+    std::map<std::string, core::RuntimeMemory> memory;
+    bool memory_ready = false;
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -909,30 +933,29 @@ void Prefill::reset() {
 
 void Prefill::release() {
     if (!impl_) return;
-    if (impl_->cs) cudaStreamSynchronize(impl_->cs);
-    if (impl_->copy) cudaStreamSynchronize(impl_->copy);
-    if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
+    for (auto stream : {impl_->cs,impl_->copy,impl_->kv_copy})
+        if (stream && cudaStreamSynchronize(stream)!=cudaSuccess) memory_uncertain_=true;
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
+        if (impl_->hand[b] && cudaFreeHost(impl_->hand[b])!=cudaSuccess) memory_uncertain_=true;
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
-        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
+        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty() && cudaFreeHost(impl_->ple_emb_host[b])!=cudaSuccess) memory_uncertain_=true;
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
-    if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+    if (impl_->grp_host && cudaFreeHost(impl_->grp_host)!=cudaSuccess) memory_uncertain_=true;
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
-        if (p) cudaFreeHost(p);
+        if (p && cudaFreeHost(p)!=cudaSuccess) memory_uncertain_=true;
     for (cudaEvent_t e : impl_->cpu_ev)
         if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : impl_->cpu_wall)
         if (e) cudaEventDestroy(e);
-    for (void* p : impl_->owned) cudaFree(p);
+    for (void* p : impl_->owned) if (cudaFree(p)!=cudaSuccess) memory_uncertain_=true;
 }
 
 namespace {
@@ -1075,6 +1098,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    bool allow_shared_stage, uint64_t remaining_priced_late_bytes, const Sizing* strict) {
     Impl& m = *impl_;
     m.strict=strict!=nullptr;
+    m.memory_ready=false;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     auto trace_memory = [](const char* where) {
@@ -1185,24 +1209,30 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
     if (m.tok_dev == nullptr) {
         if (const cudaError_t e = cudaMalloc((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t)); e != cudaSuccess) {
-            err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
+            err = core::native_error_message("prefill token id allocation",std::string(e==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(e));
             return false;
         }
         m.owned.push_back(m.tok_dev);
+        m.memory["prefill_token_ids"].device_allocation((size_t)chunk * sizeof(int32_t));
+        m.memory["prefill_token_ids"].logical+=(size_t)chunk * sizeof(int32_t);
         m.tok_host.resize((size_t) chunk);
     }
-    if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    if (!prefill_resource_status(cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking),
+                                 "prefill copy stream", err)) return false;
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
     bool ok = true;
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
     for (int i = 0; i < ring_cap(); ++i) {
-        if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
-        if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+        if (!prefill_resource_status(cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming),
+                                     "prefill copied event", err) ||
+            !prefill_resource_status(cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming),
+                                     "prefill used event", err)) return false;
     }
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
+        m.stager->uncertain=&memory_uncertain_;
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
         // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
         // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
@@ -1227,7 +1257,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         else resolve_stager(stager,files);
         const int threads=stager.stager_threads;
         m.stager->kRing=stager.stager_ring; m.stager->batch=stager.stager_batch;
-        if (!m.stager->init((size_t) MAXBLOB(), threads,strict!=nullptr)) ok = false;
+        if (!m.stager->init((size_t) MAXBLOB(), threads,strict!=nullptr)) {
+            err=core::native_error_message("prefill stager initialization",m.stager->failure); return false;
+        }
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
@@ -1236,45 +1268,55 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
-            if (m.grp_host) cudaFreeHost(m.grp_host);
+            if (m.grp_host && cudaFreeHost(m.grp_host)!=cudaSuccess) memory_uncertain_=true;
             m.grp_host = m.grp_dev = nullptr;
             m.grp_n = m.grp_tk = 0;
             void *h = nullptr, *d = nullptr;
-            if (!force_pageable() &&
-                cudaHostAlloc(&h, need * 4, cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
-                cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
+            auto status = force_pageable() ? cudaErrorInvalidValue :
+                cudaHostAlloc(&h, need * 4, cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0));
+            if (status == cudaSuccess) status = cudaHostGetDevicePointer(&d, h, 0);
+            if (status == cudaSuccess) {
                 m.grp_host = (int32_t*) h;
                 m.grp_dev = (int32_t*) d;
                 m.grp_n = need;
                 m.grp_tk = T * K;
             } else {                              // the copies, as before
                 if (h) cudaFreeHost(h);
-                if (strict) { err="out_of_memory: strict prefill group pinning failed"; return false; }
+                if (strict) { err=core::native_error_message("strict prefill group pinning", std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status)); return false; }
                 cudaGetLastError();
             }
         }
     }
     for (int b = 0; b < 2; ++b) {
-        if (!m.ple_emb_host[b] &&
-            (force_pageable() || cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) T * N * 4, cudaHostAllocDefault) != cudaSuccess)) {
-            if (strict) { err="out_of_memory: strict prefill PLE pinning failed"; return false; }
+        const auto status = m.ple_emb_host[b] ? cudaSuccess : force_pageable() ? cudaErrorInvalidValue :
+            cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) T * N * 4, cudaHostAllocDefault);
+        if (status != cudaSuccess) {
+            if (strict) { err=core::native_error_message("strict prefill PLE pinning", std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status)); return false; }
             cudaGetLastError();
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
         }
-        if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
-            ok = false;
+        if (!m.ple_copied[b] && !prefill_resource_status(
+                cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming),
+                "prefill PLE copied event", err)) return false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
-        if (cudaMalloc((void**) &m.ident_table, ident.size() * 4) != cudaSuccess ||
-            cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
-            ok = false;
-        else
+        auto status=cudaMalloc((void**) &m.ident_table, ident.size() * 4);
+        if (status==cudaSuccess) {
             m.owned.push_back(m.ident_table);
+            m.memory["prefill_kv_identity"].device_allocation(ident.size() * 4);
+            m.memory["prefill_kv_identity"].logical+=ident.size() * 4;
+            status=cudaMemcpy(m.ident_table, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice);
+        }
+        if (status!=cudaSuccess) {
+            err=core::native_error_message("prefill KV identity allocation/upload",
+                std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status));
+            return false;
+        }
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
     trace_memory("host staging and identity buffers");
@@ -1282,6 +1324,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
+    o.memory = &m.memory["prefill_scratch_ring_stage"];
     {
         uint16_t* gs = nullptr;
         void* ws = nullptr;
@@ -1304,7 +1347,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             gs = reinterpret_cast<uint16_t*>(o.take<uint8_t>((size_t) weight_scratch_layout().bytes, ok));
             ws = o.take<uint8_t>(GEMM_WS, ok);
         }
-        if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
+        if (!ok) { err = core::native_error_message("prefill GEMM scratch", o.failure); return false; }
         if (prepared_gemm) {
             if (!m.gemm.rebind(gs, GEMM_SCRATCH, ws, workspace_bytes, err)) return false;
         } else if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
@@ -1321,7 +1364,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
         (void) cudaGetLastError();
-        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit (" +
+        err = core::native_error_message("prefill device buffers", o.failure) + ": device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit (" +
               std::to_string(fb >> 20) + " of " + std::to_string(tb >> 20) + " MiB free at the failure; " +
               std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " +
               std::to_string(o.failed_bytes >> 20) + " MiB)";
@@ -1336,6 +1379,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!check_strict_sizing(*strict,applied,m.borrowed,m.shared_stage,err)) return false;
         m.applied_sizing=applied;
     }
+    else {
+        m.applied_sizing.chunk=chunk; m.applied_sizing.ring=m.ring;
+        m.applied_sizing.stager_threads=(int)m.stager->threads.size();
+        m.applied_sizing.stager_ring=m.stager->kRing; m.applied_sizing.stager_batch=m.stager->batch;
+    }
+    m.memory_ready=true;
     return true;
 }
 
@@ -1504,7 +1553,36 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 bool Prefill::shared_stage() const { return impl_->shared_stage; }
+bool Prefill::borrowed() const { return impl_->borrowed; }
 Prefill::Sizing Prefill::applied_sizing() const { return impl_->applied_sizing; }
+
+std::map<std::string, core::RuntimeMemory> Prefill::runtime_vram() const {
+    auto out=impl_->memory;
+    for (const char* key : {"prefill_token_ids", "prefill_kv_identity", "prefill_scratch_ring_stage"}) {
+        auto& m=out[key]; m.known=impl_->memory_ready && !memory_uncertain_;
+    }
+    return out;
+}
+std::map<std::string, core::RuntimeMemory> Prefill::runtime_ram() const {
+    const auto& m=*impl_;
+    std::map<std::string, core::RuntimeMemory> out;
+    if (m.stager) out["prefill_host_stager"]=m.stager->storage;
+    auto& host=out["prefill_host_buffers"];
+    auto take=[&](uint64_t bytes, bool pinned, bool mapped) {
+        host.requested+=bytes; host.rounded+=bytes; host.logical+=bytes;
+        if (pinned) host.pinned+=bytes;
+        if (mapped) host.mapped+=bytes;
+    };
+    if (m.grp_host) take(m.grp_n * 4,true,true);
+    for (int b=0;b<2;++b) {
+        if (m.ple_emb_host[b]) take((uint64_t)m.T_max * N * 4,m.ple_pageable[b].empty(),false);
+        if (m.hand[b]) take((uint64_t)m.T_max * D * 4,true,false);
+    }
+    if (m.cpu_x) take(m.cpu_x_n * sizeof(float),true,false);
+    if (m.cpu_rows) take(m.cpu_rows_n * sizeof(float),true,false);
+    for (auto& [key, value] : out) value.known=m.memory_ready && !memory_uncertain_;
+    return out;
+}
 
 bool Prefill::check_strict_sizing(const Sizing& approved, const Sizing& actual, bool borrowed,
                                  bool shared, std::string& error) {
@@ -3289,11 +3367,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t want = (size_t) T * N;
                             if (m.cpu_x_n < want) {
                                 cpu_cold = true;
-                                if (m.cpu_x) cudaFreeHost(m.cpu_x);
+                                if (m.cpu_x && cudaFreeHost(m.cpu_x)!=cudaSuccess) memory_uncertain_=true;
                                 m.cpu_x = nullptr;
                                 m.cpu_x_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                                    err = "prefill: cannot allocate the CPU experts' activations";
+                                const auto status=cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault);
+                                if (status != cudaSuccess) {
+                                    err = core::native_error_message("prefill CPU expert activations",std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status));
                                     return false;
                                 }
                                 m.cpu_x_n = want;
@@ -3481,12 +3560,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t want = (size_t) rows_cpu * N;
                             if (m.cpu_rows_n < want) {
                                 cpu_cold = true;
-                                if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
+                                if (m.cpu_rows && cudaFreeHost(m.cpu_rows)!=cudaSuccess) memory_uncertain_=true;
                                 m.cpu_rows = nullptr;
                                 m.cpu_rows_n = 0;
                                 const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
-                                if (cudaHostAlloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                                    err = "prefill: cannot allocate the CPU experts' rows";
+                                const auto status=cudaHostAlloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), cudaHostAllocDefault);
+                                if (status != cudaSuccess) {
+                                    err = core::native_error_message("prefill CPU expert rows",std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status));
                                     return false;
                                 }
                                 m.cpu_rows_n = cap_rows * N;

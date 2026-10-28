@@ -88,16 +88,31 @@ uint64_t session_bytes_for(const ModelGeometry& g, int64_t cells, int64_t k, con
     return session_count(g, cells, k, g.n_gdn_layers(), qsa);
 }
 
-namespace { thread_local bool strict_initialization = false; }
+namespace {
+thread_local bool strict_initialization = false;
+thread_local SessionState* initializing_session = nullptr;
+thread_local std::string initialization_error;
+}
 bool strict_session_initialization() { return strict_initialization; }
+const std::string& session_initialization_error() { return initialization_error; }
+void session_initialization_failed(const std::string& error) { initialization_error = error; }
+void record_session_host_allocation(uint64_t bytes, uint64_t logical, bool kv) {
+    if (!initializing_session) return;
+    auto& m = kv ? initializing_session->streamed_kv : initializing_session->host_staging;
+    m.requested += bytes; m.rounded += bytes; m.logical += logical; m.mapped += bytes; m.pinned += bytes;
+}
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo, int64_t layer_hi, bool strict) {
     struct Restore {
         bool previous = strict_initialization;
-        ~Restore() { strict_initialization=previous; }
+        SessionState* previous_session = initializing_session;
+        ~Restore() { strict_initialization=previous; initializing_session=previous_session; }
     } restore;
     strict_initialization=strict;
+    initializing_session=&s; initialization_error.clear();
+    s.streamed_kv={}; s.host_staging={};
+    s.streamed_kv.known=false; s.host_staging.known=false;
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -149,6 +164,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // `session_zero`; it survives every token, which is the whole point of a conv history.
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
+    s.streamed_kv.known=initialization_error.empty(); s.host_staging.known=initialization_error.empty();
     return used;
 }
 

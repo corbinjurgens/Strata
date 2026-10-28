@@ -223,7 +223,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, bool track_ownership) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, bool track_ownership, bool strict_completion) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -232,6 +232,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (arena_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     ownership_.known = false;
+    memory_.known = false;
     try {
         std::vector<Pending> pending;
         std::vector<PendingHc> pending_hc;
@@ -369,7 +370,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         status = cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
                                             cudaMemcpyHostToDevice);
                     if (status != cudaSuccess) {
-                        err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
+                        err = native_error_message("native dense (STRATA_HC_Q8) upload " + tensor.name,
+                            std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status)); return false;
                     }
                     // A converted F32 HC copy has no byte-identical GGUF source span.
                     pending_hc.push_back(PendingHc{&ref, std::move(data), bytes, f32_inject ? std::string() : path,
@@ -386,12 +388,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         void* allocation = nullptr;
         const auto status = cudaMalloc(&allocation, arena_bytes);
         DevicePtr arena(allocation);
-        if (status != cudaSuccess) { err = std::string("native dense arena: ") + cudaGetErrorString(status); return false; }
+        if (status != cudaSuccess) { err = native_error_message("native dense arena", std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status)); return false; }
         auto* base = static_cast<uint8_t*>(arena.get());
         for (const auto& item : pending) {
             auto upload = cudaMemcpy(base + item.offset, item.source, item.bytes, cudaMemcpyHostToDevice);
             if (upload != cudaSuccess) {
-                err = "native dense upload " + item.name + ": " + cudaGetErrorString(upload); return false;
+                err = native_error_message("native dense upload " + item.name,
+                    std::string(upload==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(upload)); return false;
             }
             if (item.packed) {
                 std::vector<uint8_t> host(item.bytes);
@@ -399,11 +402,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                                                        (int) item.ref->ne1);
                 upload = cudaMemcpy(base + item.packed_offset, host.data(), item.bytes, cudaMemcpyHostToDevice);
                 if (upload != cudaSuccess) {
-                    err = "native dense packed upload " + item.name + ": " + cudaGetErrorString(upload); return false;
+                    err = native_error_message("native dense packed upload " + item.name,
+                        std::string(upload==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(upload)); return false;
                 }
             }
         }
-        if (track_ownership && cudaStreamSynchronize(nullptr) != cudaSuccess) { err = "native dense upload synchronization failed"; return false; }
+        const auto uploaded = track_ownership ? cudaStreamSynchronize(nullptr) : cudaSuccess;
+        if (track_ownership && strict_completion && uploaded != cudaSuccess) { err = native_error_message("native dense upload synchronization", std::string(uploaded == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(uploaded)); return false; }
         PackedRegistrations registrations;
         WeightOwnership holding;
         if (track_ownership) {
@@ -451,13 +456,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         tensor_count_ = pending.size() + pending_hc.size();
         bytes_ = total + hc_q8_bytes;
         allocated_ = alloc_bytes(arena_bytes) + allocated;
-        if (track_ownership) ownership_ = std::move(holding);
+        holding.known = track_ownership && uploaded == cudaSuccess;
+        ownership_ = std::move(holding);
+        memory_ = {}; memory_.requested = ownership_.capacity; memory_.rounded = allocated_;
+        for (const auto& slice : ownership_.slices) memory_.logical += slice.bytes;
+        memory_.known = ownership_.known;
         if (hc_q8_requested())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);
         return true;
     } catch (const std::exception& error) {
-        err = std::string("native dense: ") + error.what();
+        err = native_error_message("native dense", error.what());
         return false;
     }
 }

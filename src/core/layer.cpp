@@ -808,10 +808,17 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
-                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-        cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
-            cudaSuccess) {
+    auto staging_status = cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                                       cudaHostAllocMapped | cudaHostAllocPortable);
+    if (staging_status == cudaSuccess) {
+        record_session_host_allocation(strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                                       strata::kernels::qsa_step_bytes() + sizeof(int32_t), false);
+        staging_status = cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (staging_status == cudaSuccess) record_session_host_allocation((size_t)s.n_head * 4, (size_t)s.n_head * 4, false);
+    }
+    if (staging_status != cudaSuccess) {
+        session_initialization_failed(native_error_message("session host staging",
+            std::string(staging_status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(staging_status)));
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     st.host_step[strata::kernels::kStepCount] = 0;
@@ -822,8 +829,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        auto status = cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (status == cudaSuccess) status = cudaHostGetDevicePointer((void**) &d, h, 0);
+        if (status != cudaSuccess) {
+            session_initialization_failed(native_error_message("streamed KV host allocation/alias",
+                std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status)));
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
@@ -832,6 +842,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             return 0;
         }
         g_kv_host_bytes += bytes;
+        record_session_host_allocation(bytes, bytes - 4 * 256, true);
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -860,7 +871,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                           hc.data(), hs.data());
         const auto cos_copy=cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
         const auto sin_copy=cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
-        if (strict_session_initialization() && (cos_copy!=cudaSuccess || sin_copy!=cudaSuccess)) return 0;
+        if (cos_copy!=cudaSuccess || sin_copy!=cudaSuccess) {
+            const auto status=cos_copy!=cudaSuccess ? cos_copy : sin_copy;
+            session_initialization_failed(native_error_message("session RoPE upload",
+                std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status)));
+            if (strict_session_initialization()) return 0;
+        }
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
@@ -871,14 +887,22 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
         const auto copied=cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
-        if (strict_session_initialization() && copied!=cudaSuccess) return 0;
+        if (copied!=cudaSuccess) {
+            session_initialization_failed(native_error_message("session page table upload",
+                std::string(copied==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(copied)));
+            if (strict_session_initialization()) return 0;
+        }
     } else if (p.mode == 1) {
         strata::kernels::kv_stream_reset(st.map, nullptr);
     } else {
         strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
     const auto initialized=cudaDeviceSynchronize();
-    if (strict_session_initialization() && initialized!=cudaSuccess) return 0;
+    if (initialized!=cudaSuccess) {
+        session_initialization_failed(native_error_message("session initialization",
+            std::string(initialized == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(initialized)));
+        if (strict_session_initialization()) return 0;
+    }
     return c.used;
 }
 

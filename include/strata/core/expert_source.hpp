@@ -658,6 +658,7 @@ public:
     bool retire_direct_mappings(std::string& err);
     bool direct_mappings_retired() const { return direct_mappings_retired_; }
     uint64_t mapped_view_bytes() const;
+    std::map<std::string, RuntimeMemory> runtime_memory();
     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
@@ -813,9 +814,11 @@ private:
     // header has no cuda_runtime.h).
     struct StageBufFree {
         bool pinned = false;
+        bool* confirmed = nullptr;
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;
+    bool storage_known_ = true; // a failed release cannot become a confirmed zero
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
     std::vector<uint64_t> stage_capacity_;
     std::vector<uint64_t> stage_pending_;     ///< possible physical touches until this slot's fill completes

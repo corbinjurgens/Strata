@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iosfwd>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -65,5 +66,42 @@ bool frame_weight_ownership(const WeightSnapshot&, const std::string& backend, u
 // Envelope reader for CPU protocol tests and native consumers. Leaves subsequent
 // command/output bytes unread. It rejects truncation, oversized frames and bad ends.
 bool read_weight_ownership_frame(std::istream&, uint64_t& sequence, std::string& payload, std::string& error);
+
+// Current owned storage, recorded only after successful allocation/initialization.
+// rounded is a comparable allocator-granule model, never driver usage or residency.
+// Host mapped/pinned are subsets of requested, not extra allocations. Allowances
+// are policy budgets and must not be added to measured storage.
+// logical is useful payload/capacity: confirmed tensor contents for weight/cache
+// owners, usable buffer/carve bytes for scratch, and zero for file views (mapped
+// holds their logical address span). It excludes allocator-granule rounding.
+struct RuntimeMemory {
+    bool known = true;
+    uint64_t requested = 0, rounded = 0, logical = 0, mapped = 0, pinned = 0, allowance = 0;
+    void device_allocation(uint64_t bytes);
+    void merge(const RuntimeMemory&);
+    bool operator==(const RuntimeMemory&) const = default;
+};
+struct RuntimeSnapshot {
+    std::map<std::string, uint64_t> settings;
+    std::map<std::string, RuntimeMemory> vram, ram;
+    WeightSnapshot weights;
+    bool operator==(const RuntimeSnapshot&) const = default;
+};
+// One complete snapshot on the existing stdout owner. Same bounded envelope and
+// commit-on-complete sequence rules as ownership, with STRATA-RUNTIME/1 and
+// STRATA-RUNTIME-END/1 markers. Payload: device/state/physical/totals/shards/shard
+// as above, then setting <name> <uint64> and component <vram|ram> <name>
+// <known|unknown> <requested> <rounding> <logical> <mapped> <pinned> <allowance>.
+// All quantities are bytes except settings. Unknown component numeric fields
+// are '-'. total_allocated and driver_os are always unknown. Names are ASCII
+// [a-z_]+; no estimates, paths or payload fingerprints enter this protocol.
+bool frame_runtime_snapshot(const RuntimeSnapshot&, const std::string& backend, unsigned device,
+                            const std::string& identity, uint64_t& sequence, std::string& frame, std::string& error);
+bool read_runtime_frame(std::istream&, uint64_t& sequence, std::string& payload, std::string& error);
+
+// Preserve a proved typed cause at the beginning of a wrapper's actual message.
+// Untyped allocation/device failures remain untyped; callers prove OOM from the
+// backend result, not from an allocation function name or free-memory guess.
+std::string native_error_message(const std::string& context, const std::string& cause, const std::string& fallback_code = {});
 
 } // namespace strata::core

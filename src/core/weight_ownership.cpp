@@ -154,4 +154,79 @@ bool read_weight_ownership_frame(std::istream& in, uint64_t& sequence, std::stri
     sequence = next;
     return true;
 }
+
+void RuntimeMemory::device_allocation(uint64_t bytes) {
+    constexpr uint64_t granule = 2ull << 20;
+    const auto next_requested = add(requested, bytes);
+    const auto next_rounded = add(rounded, add(bytes, granule - 1) / granule * granule);
+    requested=next_requested; rounded=next_rounded;
+}
+void RuntimeMemory::merge(const RuntimeMemory& other) {
+    RuntimeMemory next=*this;
+    next.known=known && other.known;
+    next.requested=add(requested,other.requested); next.rounded=add(rounded,other.rounded);
+    next.logical=add(logical,other.logical); next.mapped=add(mapped,other.mapped);
+    next.pinned=add(pinned,other.pinned); next.allowance=add(allowance,other.allowance);
+    *this=next;
+}
+
+std::string native_error_message(const std::string& context, const std::string& cause, const std::string& fallback_code) {
+    for (const char* code : {"out_of_memory:", "insufficient_resources:", "invalid_launch_plan:"}) {
+        const std::string prefix(code);
+        if (cause.rfind(prefix, 0) == 0) return prefix + " " + context + ":" + cause.substr(prefix.size());
+    }
+    return (fallback_code.empty() ? "" : fallback_code + ": ") + context + ": " + cause;
+}
+
+bool frame_runtime_snapshot(const RuntimeSnapshot& s, const std::string& backend, unsigned device,
+                            const std::string& identity, uint64_t& sequence, std::string& frame, std::string& error) {
+    frame.clear();
+    try {
+        if (sequence == UINT64_MAX || s.settings.size() > 64 || s.vram.size() + s.ram.size() > 64)
+            throw std::runtime_error("runtime snapshot bounds");
+        // Reuse the checked current-holdings codec, not a parallel attribution walk.
+        uint64_t seq = 0; std::string weight_frame, payload;
+        if (!frame_weight_ownership(s.weights, backend, device, identity, seq, weight_frame, error)) return false;
+        std::istringstream input(weight_frame); seq = 0;
+        if (!read_weight_ownership_frame(input, seq, payload, error)) return false;
+        auto name = [](const std::string& n) {
+            if (n.empty() || n.size() > 64) throw std::runtime_error("invalid runtime field name");
+            for (char c : n) if (c != '_' && (c < 'a' || c > 'z')) throw std::runtime_error("invalid runtime field name");
+        };
+        std::ostringstream out;
+        out << payload << "total_allocated\tunknown\ndriver_os\tunknown\n";
+        for (const auto& [key, value] : s.settings) { name(key); out << "setting\t" << key << '\t' << value << '\n'; }
+        auto components = [&](const char* space, const auto& records) {
+            for (const auto& [key, m] : records) {
+                name(key);
+                out << "component\t" << space << '\t' << key << '\t';
+                if (!m.known) { out << "unknown\t-\t-\t-\t-\t-\t-\n"; continue; }
+                if (m.rounded < m.requested || m.logical > m.requested || m.mapped > m.requested || m.pinned > m.requested)
+                    throw std::runtime_error("runtime component does not reconcile");
+                out << "known\t" << m.requested << '\t' << m.rounded - m.requested << '\t' << m.logical << '\t'
+                    << m.mapped << '\t' << m.pinned << '\t' << m.allowance << '\n';
+            }
+        };
+        components("vram", s.vram); components("ram", s.ram);
+        payload = out.str();
+        const auto next = std::to_string(sequence + 1);
+        auto candidate = "STRATA-RUNTIME/1\n" + next + '\n' + std::to_string(payload.size()) + '\n' + payload +
+                         "\nSTRATA-RUNTIME-END/1 " + next + '\n';
+        if (candidate.size() > ownership_frame_limit || payload.size() > ownership_frame_limit - 128)
+            throw std::runtime_error("runtime frame exceeds bound");
+        frame = std::move(candidate); ++sequence; return true;
+    } catch (const std::exception& e) { error = e.what(); return false; }
+}
+
+bool read_runtime_frame(std::istream& in, uint64_t& sequence, std::string& payload, std::string& error) {
+    std::string magic, seq, len, end, body; uint64_t n = 0, next = 0;
+    if (!line(in, magic, 32) || magic != "STRATA-RUNTIME/1" || !line(in, seq, 20) || !number(seq, next) ||
+        !next || next <= sequence || !line(in, len, 20) || !number(len, n) || n > ownership_frame_limit - 128) {
+        error = "invalid runtime frame header"; return false;
+    }
+    body.resize((size_t)n);
+    if (!in.read(body.data(), (std::streamsize)n) || in.get() != '\n' || !line(in, end, 64) ||
+        end != "STRATA-RUNTIME-END/1 " + seq) { error = "incomplete runtime frame"; return false; }
+    payload = std::move(body); sequence = next; return true;
+}
 } // namespace strata::core

@@ -62,6 +62,8 @@ public:
     static uint64_t workspace_bytes(const ModelGeometry& g, int64_t cells, int64_t k, int max_t,
                                     int64_t vocab, uint64_t max_blob, uint64_t& mapped_bytes);
     ~Verifier();
+    const RuntimeMemory& runtime_vram() const { return device_memory_; }
+    const RuntimeMemory& runtime_ram() const { return host_memory_; }
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
@@ -273,6 +275,7 @@ public:
     std::string profile_report();
 
 private:
+    RuntimeMemory device_memory_, host_memory_;
     uint64_t carve_workspace(void* base, const ModelGeometry& g, int64_t cells, int64_t k,
                              int max_t, int64_t vocab, uint64_t max_blob);
     RemoteExpertOpt* remote_opt_ = nullptr;

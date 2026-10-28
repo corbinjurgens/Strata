@@ -417,9 +417,10 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
     void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
-        err = "cudaHostAlloc for the staging buffers failed";
+    auto staging_status=cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault);
+    if (staging_status==cudaSuccess) staging_status=cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault);
+    if (staging_status != cudaSuccess) {
+        err = native_error_message("weight staging allocation",std::string(staging_status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(staging_status));
         if (stage_in) cudaFreeHost(stage_in);
         if (stage_out) cudaFreeHost(stage_out);
         return false;

@@ -186,7 +186,12 @@ bool one_token_self_commit() {
 #endif
 }
 
-bool mapped(size_t bytes, void** h, void** d) {
+bool mapped(size_t bytes, void** h, void** d, RuntimeMemory* memory = nullptr, std::string* error = nullptr) {
+    auto failed = [&](cudaError_t status) {
+        if (error) *error=native_error_message("verifier mapped allocation/alias",
+            std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status));
+        return false;
+    };
 #if defined(STRATA_USE_HIP)
     if (g_coherent) {
         if (hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent |
@@ -196,9 +201,13 @@ bool mapped(size_t bytes, void** h, void** d) {
         return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
     }
 #endif
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
+    auto status=cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0));
+    if (status != cudaSuccess) return failed(status);
     std::memset(*h, 0, bytes);
-    return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+    status=cudaHostGetDevicePointer(d, *h, 0);
+    if (status != cudaSuccess) return failed(status);
+    if (memory) { memory->requested+=bytes; memory->rounded+=bytes; memory->logical+=bytes; memory->mapped+=bytes; memory->pinned+=bytes; }
+    return true;
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -552,30 +561,32 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t NH = (uint64_t) g.n_head, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads;
     // ---- mapped staging
-    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
-              mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
-              mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
-              mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
-              mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
-              mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
-              mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
-              mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
-              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
-              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
-              mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
-    if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    device_memory_.known=host_memory_.known=false;
+    auto take_mapped=[&](size_t bytes, void** h, void** d) { return mapped(bytes,h,d,&host_memory_,&err); };
+    bool ok = take_mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
+              take_mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
+              take_mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
+              take_mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
+              take_mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
+              take_mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
+              take_mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
+              take_mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
+              take_mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
+              take_mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
+              take_mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
+              take_mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
+              take_mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
+              take_mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
+              take_mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+    if (!ok) { err = native_error_message("verify mapped staging", err); return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
         plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
-        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
-            err = "verify: mapped plan allocation failed";
+        if (!take_mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
+            err = native_error_message("verify mapped plan", err);
             return false;
         }
         sink_.counts = h_plan_;
@@ -595,12 +606,17 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump count;
     count.used = carve_workspace(nullptr, g, ss.max_cells, ss.k, max_t, n_vocab_,
                                  strata::kernels::cpu::expert_layout().max_blob);
-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
-        err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+    const auto allocated=cudaMalloc(&arena_, count.used);
+    if (allocated != cudaSuccess) {
+        err = native_error_message("verifier arena", std::string(allocated == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(allocated));
         return false;
     }
+    device_memory_.device_allocation(count.used);
+    device_memory_.logical+=count.used;
     const auto cleared=cudaMemset(arena_, 0, count.used);
-    if (strict && cleared!=cudaSuccess) { err="verify: strict arena initialization failed"; return false; }
+    if (strict && cleared!=cudaSuccess) {
+        err=native_error_message("verify arena initialization",std::string(cleared==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(cleared)); return false;
+    }
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -725,6 +741,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
+    device_memory_.known = cleared == cudaSuccess && !prof_on_ && !qcnt_ && !skip_ && !slot_off_d_;
+    host_memory_.known = true;
     return true;
 }
 
@@ -2125,11 +2143,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
         bool judged = false;
         if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= kVerifyMaxT) {
-            if (d_spec_ == nullptr &&
-                cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
-                    cudaSuccess) {
-                (void) cudaGetLastError();
-                d_spec_ = nullptr;
+            if (d_spec_ == nullptr) {
+                const auto bytes=(size_t)kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t);
+                if (cudaMalloc((void**) &d_spec_, bytes)!=cudaSuccess) {
+                    (void) cudaGetLastError(); d_spec_=nullptr;
+                } else { device_memory_.device_allocation(bytes); device_memory_.logical+=bytes; }
             }
             if (d_spec_ != nullptr) {
                 const int nq = std::min(spec_nq_, T - 1);

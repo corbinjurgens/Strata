@@ -221,6 +221,7 @@ public:
     void borrow_ownership(int32_t first);
     void end_borrow_ownership();
     WeightOwnership weight_ownership() const;
+    RuntimeMemory runtime_memory() const;
     uint64_t ownership_revision() const { return ownership_revision_; }
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS

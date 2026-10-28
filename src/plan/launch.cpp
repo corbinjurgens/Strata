@@ -295,6 +295,17 @@ std::string frame_effective_launch(const LaunchSettings& s, uint64_t sequence) {
     return "STRATA-EFFECTIVE/1\n"+std::to_string(sequence)+'\n'+std::to_string(payload.size())+'\n'+payload;
 }
 
+std::map<std::string, uint64_t> runtime_launch_settings(const LaunchSettings& s, uint64_t cache_slots, uint64_t cache_bytes) {
+    return {{"context",s.context},{"prefill",s.prefill},{"spec",s.spec},{"kv",s.kv},{"kv_resident",s.kv_resident},
+        {"batch",s.batch},{"batch_groups",s.batch_groups},{"parallel",s.parallel},{"auto_cache",s.auto_cache},
+        {"per_layer",s.per_layer},{"no_prefill_borrow",s.no_prefill_borrow},{"resident_budget",s.resident_budget},
+        {"resident_bytes",s.resident_bytes},{"resident_experts",s.resident_experts},{"resident_pin",s.resident_pin},
+        {"file_cache_effective",s.file_cache_effective},{"file_cache_compact",s.file_cache_compact},
+        {"host_headroom",s.host_headroom},{"vram_reserve",s.vram_reserve},{"cache_slots",cache_slots},
+        {"cache_bytes",cache_bytes},{"shared_stage",s.shared_stage},{"ring",s.ring},
+        {"stager_threads",s.stager_threads},{"stager_ring",s.stager_ring},{"stager_batch",s.stager_batch}};
+}
+
 bool decode_launch_settings(const std::string& payload, LaunchSettings& settings, std::string& error) {
     try {
         if (payload.empty() || payload.size() > launch_payload_limit || payload.back() != '\n')
@@ -529,14 +540,14 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         for (auto run:s.kv_stage_runs) kv_host=launch_add(kv_host,run);
         out.ram["streamed_kv"] = launch_mul(kv_host,12);
         out.ram["host_headroom_allowance"] = s.host_headroom;
-        out.ram["startup_scratch_allowance"] = 512*MiB;
+        out.ram["startup_scratch_allowance"] = launch_startup_scratch_allowance;
         out.ram["prefill_host_stager"] = launch_mul(s.stager_ring,s.max_blob);
         out.vram_required=sum(out.vram); out.ram_required=sum(out.ram);
         out.commit_required=launch_add(out.ram_required,out.vram_required);
         s.vram_required=out.vram_required; s.ram_required=out.ram_required; s.commit_required=out.commit_required;
         if (approved && !(s==*approved)) throw std::invalid_argument("saved launch disagrees with metadata, argv or environment");
         if (out.vram_required>resources.vram_free || out.ram_required>resources.ram_available ||
-            out.commit_required>resources.commit_available) throw std::invalid_argument("insufficient launch resources");
+            out.commit_required>resources.commit_available) throw std::invalid_argument("insufficient_resources: insufficient launch resources");
         out.payload=encode_launch_settings(s);
         LaunchSettings roundtrip;
         if (!decode_launch_settings(out.payload,roundtrip,error) || !(roundtrip==s)) throw std::logic_error("native codec round trip mismatch");
@@ -677,7 +688,7 @@ int launch_metadata_main(int argc, char** argv) {
                   << ",\"commit_available\":" << resources.commit_available << ",\"devices\":" << resources.devices << "}}\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "invalid_launch_plan: " << e.what() << '\n'; return 2;
+        std::cerr << core::native_error_message("native launch metadata",e.what(),"invalid_launch_plan") << '\n'; return 2;
     }
 }
 

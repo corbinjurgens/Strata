@@ -171,10 +171,52 @@ void consume_slots(const LaunchSettings& saved) {
     }
     require(cache.resident()==saved.slots.size(),"all saved slots consumed");
 }
+void runtime_controls(const LaunchSettings& saved, uint64_t context, uint64_t kv, uint64_t resident) {
+    uint64_t capacity=0;
+    for (const auto& slot : saved.slots) capacity+=(slot.bytes/256+(slot.bytes%256!=0))*256;
+    // These are applied-owner values, deliberately no slots, metadata, approved
+    // fingerprint, required-memory estimates or validated plan in ordinary mode.
+    LaunchSettings ordinary;
+    ordinary.context=context; ordinary.prefill=64; ordinary.spec=2; ordinary.kv=kv; ordinary.kv_resident=resident;
+    ordinary.batch=0; ordinary.batch_groups=1; ordinary.parallel=1; ordinary.no_prefill_borrow=1;
+    ordinary.auto_cache=saved.auto_cache; ordinary.per_layer=saved.per_layer;
+    ordinary.resident_budget=saved.resident_budget; ordinary.resident_bytes=saved.resident_bytes;
+    ordinary.resident_experts=saved.resident_experts; ordinary.resident_pin=1;
+    ordinary.file_cache_effective=saved.file_cache_effective;
+    std::string error;
+    require(!validate_launch_settings(ordinary,error),"ordinary telemetry specimen cannot be misused as approved payload");
+    const auto actual=runtime_launch_settings(ordinary,saved.slots.size(),capacity);
+    require(actual.at("context")==context && actual.at("prefill")==64 && actual.at("spec")==2 && actual.at("kv")==kv &&
+            actual.at("kv_resident")==resident && actual.at("parallel")==1 && actual.at("batch")==0 &&
+            actual.at("resident_bytes")==saved.resident_bytes && actual.at("cache_bytes")==capacity,
+            "ordinary generated profile reports concrete applied settings without admission or payload");
+    core::RuntimeSnapshot runtime; runtime.settings=actual;
+    auto& cache=runtime.vram["expert_cache"]; cache.device_allocation(capacity);
+    const uint64_t pages=capacity/2097152+(capacity%2097152!=0);
+    require(cache.requested==capacity && cache.rounded==pages*2097152,"runtime component rounds one actual arena independently");
+    uint64_t sequence=0; std::string frame;
+    require(core::frame_runtime_snapshot(runtime,"cuda",0,"cpu-fixture",sequence,frame,error) && sequence==1 &&
+            frame.find("setting\tcontext\t"+std::to_string(context)+"\n")!=std::string::npos,
+            "ordinary generated snapshot publishes through real bounded codec");
+    const auto strict=runtime_launch_settings(saved,saved.slots.size(),capacity);
+    require(strict.at("context")==context && strict.at("kv")==kv && strict.at("kv_resident")==resident &&
+            strict.at("prefill")==64 && strict.at("cache_bytes")==capacity,
+            "strict generated snapshot uses same applied-settings codec");
+    require(frame_effective_launch(saved,1).rfind("STRATA-EFFECTIVE/1\n1\n",0)==0,
+            "existing strict effective framing remains compatible");
+}
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc==2 && std::string(argv[1])=="--codec-roundtrip") {
+            std::string payload,error; LaunchSettings saved;
+            require(read_launch_stdin(payload,error),error.c_str());
+            require(decode_launch_settings(payload,saved,error),error.c_str());
+            require(encode_launch_settings(saved)==payload,"frozen payload bytes changed in native codec");
+            std::cout << "PASS frozen_native_codec exact_roundtrip=1 bytes=" << payload.size() << " checks=" << checks << '\n';
+            return 0;
+        }
         if (argc>1 && (std::string(argv[1])=="--consume" || std::string(argv[1])=="--consume-ample")) {
             std::string error;
             LaunchSettings saved;
@@ -227,6 +269,7 @@ int main(int argc, char** argv) {
         require(a.settings.spec==2 && a.settings.no_prefill_borrow==1 && a.settings.prefill==64,"8K preserves generated settings");
         require(a.vram.at("verifier")>16ull<<20,"mandatory verifier is priced");
         require(a.ram.at("streamed_kv")==0,"8K fully resident KV");
+        runtime_controls(a.settings,8192,1,0);
         require(a.settings.slots.size()>1 && a.settings.slots[0].bytes!=a.settings.slots[1].bytes,"variable aligned ordered slots");
         require(resolve_launch(r,resources,b,error) && a.payload==b.payload,"fixed inputs resolve deterministically");
         require(prefill::owned_auto_chunk(true,true)==2048 && prefill::owned_auto_chunk(true,false)==2048 &&
@@ -541,7 +584,13 @@ int main(int argc, char** argv) {
                 b.settings.spec==2 && b.settings.no_prefill_borrow==1,"128K preserves spec2/q4_0/20480/owned prefill");
         require(b.settings.kv_stage_runs==std::vector<uint64_t>{37748736,37748736},"128K stage has two q4 pools");
         require(b.ram.at("streamed_kv")==905969664,"128K logical host KV priced independently");
+        runtime_controls(b.settings,131072,2,20480);
         require(admit_launch(r,resources,b.settings,error),"saved 128K streamed q4 spec2 settings admitted exactly");
+        auto short_now=resources; short_now.vram_free=1;
+        require(!admit_launch(r,short_now,b.settings,error) && error.rfind("insufficient_resources:",0)==0,
+                "actual admission shortage preserves proved resource type");
+        require(core::native_error_message("strict launch admission",error,"invalid_launch_plan").rfind("insufficient_resources:",0)==0,
+                "admission wrapper cannot relabel resource shortage as invalid payload");
         for (uint64_t resident : {20481u, 20483u, 131072u, 131073u}) {
             auto bad_request = r; bad_request.kv_resident = resident;
             refusal(bad_request,resources,"nonreplayable KV residency refuses before metadata allocation");

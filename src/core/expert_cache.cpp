@@ -465,7 +465,8 @@ bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
     void* next = nullptr;
     const cudaError_t status = cudaHostAlloc(&next, bytes, cudaHostAllocDefault);
     if (status != cudaSuccess) {
-        err = std::string("ExpertCache: HIP blocking staging allocation: ") + cudaGetErrorString(status);
+        err = native_error_message("ExpertCache HIP blocking staging allocation",
+            std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status));
         return false;
     }
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
@@ -508,7 +509,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
+                          "insufficient_resources: ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
                           "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
                           (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
                           (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
@@ -529,19 +530,19 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         auto r = std::make_unique<VmmRange>();
         if (!r->reserve(want) || !r->map_range(0, r->chunks(), [] { return (VmmChunk) 0; })) {
             char buf[256];
-            std::snprintf(buf, sizeof buf, "ExpertCache: mapping %.2f GiB of VRAM failed: out of memory",
+            std::snprintf(buf, sizeof buf, "ExpertCache: mapping %.2f GiB of VRAM failed (driver cause unavailable)",
                           (double) want / 1073741824.0);
             err = buf;
             return false;
         }
         base_ = r->base();
         vmm_ = std::move(r);
-    } else if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    } else if (const auto status=cudaMalloc((void**) &base_, (size_t) want); status != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                      (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
-        err = buf;
+                      (double) want / 1073741824.0, cudaGetErrorString(status));
+        err = status == cudaErrorMemoryAllocation ? std::string("out_of_memory: ") + buf : buf;
         return false;
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
@@ -892,6 +893,14 @@ WeightOwnership ExpertCache::weight_ownership() const {
     for (auto slot : borrowed_ownership_)
         if (slot < live_slots_) out.shared += slot_offset(slot+1) - slot_offset(slot);
     return out;
+}
+
+RuntimeMemory ExpertCache::runtime_memory() const {
+    const auto w=weight_ownership();
+    RuntimeMemory m; m.device_allocation(w.capacity);
+    for (const auto& slice : w.slices) m.logical += slice.bytes;
+    m.known=w.known;
+    return m;
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {

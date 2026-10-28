@@ -19,9 +19,10 @@ NativeHead::~NativeHead() {
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err,
-                      bool track_ownership) {
+                      bool track_ownership, bool strict_completion) {
     if (loaded()) { err = "native head is already loaded"; return false; }
     ownership_.known = false;
+    weight_memory_.known = scratch_memory_.known = false;
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
         return false;
@@ -54,11 +55,12 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status == cudaSuccess)
             status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
-        if (track_ownership && status == cudaSuccess) status = cudaStreamSynchronize(nullptr);
+        const auto uploaded = track_ownership && status == cudaSuccess ? cudaStreamSynchronize(nullptr) : status;
+        if (track_ownership && strict_completion) status = uploaded;
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + cudaGetErrorString(status);
+            err = native_error_message("native head upload", std::string(status == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(status));
             return false;
         }
         weights_ = weights;
@@ -71,13 +73,17 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             ownership_.capacity = bytes + strata::kernels::native_q8_1_bytes((int)n_in, 1);
             ownership_.scratch = strata::kernels::native_q8_1_bytes((int)n_in, 1);
             ownership_.slices = {{0, bytes, gguf.path(), gguf.data_start() + tensor->offset}};
-            ownership_.known = true;
+            ownership_.known = uploaded == cudaSuccess;
+            weight_memory_ = {}; weight_memory_.device_allocation(bytes); weight_memory_.logical = bytes;
+            scratch_memory_ = {}; scratch_memory_.device_allocation(ownership_.scratch);
+            scratch_memory_.logical=ownership_.scratch;
+            weight_memory_.known = scratch_memory_.known = ownership_.known;
         }
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         return true;
     } catch (const std::exception& error) {
-        err = std::string("native head: ") + error.what();
+        err = native_error_message("native head",error.what());
         return false;
     }
 }
@@ -119,7 +125,8 @@ NativeEmbed::~NativeEmbed() {
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
 
-bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err, bool strict) {
+bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err,
+                       bool strict, bool track_ownership) {
     if (host_ || dev_) { err = "native embedding is already loaded"; return false; }
     ownership_.known = false;
     try {
@@ -149,19 +156,19 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
         cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
         if (host_err != cudaSuccess) {
-            if (strict) { err="out_of_memory: strict native embedding pinning failed"; return false; }
+            if (strict) { err=native_error_message("strict native embedding pinning", std::string(host_err == cudaErrorMemoryAllocation ? "out_of_memory: " : "") + cudaGetErrorString(host_err)); return false; }
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
             // instead: it costs its size there and reads faster than over PCIe.
             cudaGetLastError();
             host_ = nullptr;
             void* d = nullptr;
-            if (cudaMalloc(&d, bytes_) != cudaSuccess ||
-                cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+            auto status=cudaMalloc(&d, bytes_);
+            if (status==cudaSuccess) status=cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice);
+            if (status != cudaSuccess) {
                 if (d) cudaFree(d);
                 cudaGetLastError();
-                err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB: " +
-                      cudaGetErrorString(host_err) + ", nor place it in VRAM";
+                err = native_error_message("native embedding VRAM fallback",std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status));
                 return false;
             }
             std::fprintf(stderr, "strata: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
@@ -178,11 +185,12 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess || d == nullptr) {
                 cudaGetLastError();
                 d = nullptr;
-                if (cudaMalloc(&d, bytes_) != cudaSuccess ||
-                    cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+                auto status=cudaMalloc(&d, bytes_);
+                if (status==cudaSuccess) status=cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice);
+                if (status != cudaSuccess) {
                     if (d) cudaFree(d);
                     cudaGetLastError();
-                    err = "native embedding: no device alias for the mapped table, and no VRAM to copy it into";
+                    err = native_error_message("native embedding alias VRAM fallback",std::string(status==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(status));
                     return false;
                 }
                 cudaFreeHost(host_);   // the destructor frees dev_ when host_ is null
@@ -198,22 +206,23 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             dev_ = d;
         }
         type_ = (int) t->type;
-        if (strict && !host_ && cudaStreamSynchronize(nullptr) != cudaSuccess) {
-            err = "native embedding upload synchronization failed"; return false;
+        const auto uploaded = (strict || track_ownership) && !host_ ? cudaStreamSynchronize(nullptr) : cudaSuccess;
+        if (strict && uploaded != cudaSuccess) {
+            err = native_error_message("native embedding upload synchronization",std::string(uploaded==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(uploaded)); return false;
         }
         n_embd_ = n_embd;
         n_vocab_ = n_vocab;
-        if (strict) {
+        if (strict || track_ownership) {
             if (host_) ownership_.mapped_host = bytes_;
             else {
                 ownership_.capacity = bytes_;
                 ownership_.slices = {{0, bytes_, gguf.path(), gguf.data_start() + t->offset}};
             }
-            ownership_.known = true;
+            ownership_.known = uploaded == cudaSuccess && dev_ != nullptr;
         }
         return true;
     } catch (const std::exception& e) {
-        err = std::string("native embedding: ") + e.what();
+        err = native_error_message("native embedding",e.what());
         return false;
     }
 }

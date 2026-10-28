@@ -74,6 +74,8 @@ public:
     static bool check_strict_sizing(const Sizing& approved, const Sizing& actual, bool borrowed,
                                     bool shared, std::string& error);
     Sizing applied_sizing() const;
+    std::map<std::string, core::RuntimeMemory> runtime_vram() const;
+    std::map<std::string, core::RuntimeMemory> runtime_ram() const;
     /// E-9: the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual rows `R_rows`
     /// (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs and its idle
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
@@ -105,6 +107,7 @@ public:
 
     /// Private pressure prototype: the selected owned GEMM/KV-stage layout; reset clears it.
     bool shared_stage() const;
+    bool borrowed() const;
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
@@ -240,6 +243,7 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
+    bool memory_uncertain_ = false; // survives a failed reset/release
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

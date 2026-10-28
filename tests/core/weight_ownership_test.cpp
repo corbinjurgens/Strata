@@ -10,6 +10,10 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 namespace strata::core::detail {
 struct ExpertCacheTestAccess {
@@ -70,10 +74,13 @@ void cache_cases() {
     require(c.open_sized({56,80,56},2,4,e), "actual cache open_sized via CPU I/O");
     auto s=snapshot(c);
     require(s.known && s.capacity==768 && s.logical==0 && s.padding==768, "aligned allocation holds no model weights before upload");
+    require(c.runtime_memory().known && c.runtime_memory().requested==768 && c.runtime_memory().rounded==2097152 &&
+            c.runtime_memory().logical==0, "successful allocator request and granule model use independent slot alignment oracle");
     require(c.admit(0,0)==0 && c.fill_slot_blocking(0, source.blob(0,0), e,56), "first blocking upload");
     require(c.ownership_revision()==1, "first confirmed upload advances ownership revision");
     s=snapshot(c);
     require(s.logical==56 && s.shards[0].bytes==32 && s.shards[1].bytes==24 && s.padding==712, "split role upload reconciles");
+    require(c.runtime_memory().requested==768 && c.runtime_memory().logical==56, "current logical cache bytes exclude allocation padding");
     require(c.fill_slot_blocking(0,source.blob(0,0),e,56), "repeat upload");
     require(snapshot(c).logical==56, "repeat upload is replacement rather than cumulative bytes");
     require(c.ownership_revision()==2, "same-shard same-size successful upload still advances publication revision");
@@ -83,6 +90,7 @@ void cache_cases() {
     require(s.logical==136 && s.shards[0].bytes==56 && s.shards[1].bytes==48 && s.shards[2].bytes==32, "unequal source roles summed independently");
     require(c.prepare_ownership(0,0,2) && c.fill_slot_queued(0,source.blob(0,2),e,56), "replacement queued");
     require(!snapshot(c).known, "queued copy cannot publish held contents");
+    require(!c.runtime_memory().known, "queued upload suppresses fresh numeric component state");
     require(c.sync_queued(e), "replacement synchronized");
     c.replace(0,0,2);
     require(snapshot(c).logical==136 && c.weight_ownership().slices[0].source_offset==1032, "replacement subtracts prior source");
@@ -93,11 +101,13 @@ void cache_cases() {
     c.borrow_ownership(1);
     s=snapshot(c);
     require(s.known && s.logical==56 && s.shared==512 && s.padding==200, "borrow removes weights and separates shared scratch");
+    require(c.runtime_memory().logical==56 && c.runtime_memory().requested==768, "borrowing changes contents without changing owned allocation");
     require(c.prepare_ownership(1,1,1) && c.fill_slot_queued(1,source.blob(1,1),e,80) &&
             c.prepare_ownership(2,0,2) && c.fill_slot_queued(2,source.blob(0,2),e,56), "restoration issued");
     require(!snapshot(c).known && c.sync_queued(e), "restoration waits for successful sync");
     s=snapshot(c);
     require(s.logical==192 && s.shared==0 && s.padding==576, "restoration exactly reconciles");
+    require(c.runtime_memory().logical==192, "confirmed restoration updates current component");
     require(c.prepare_ownership(0,0,2) && c.fill_slot(0,source.blob(0,2),(void*)1,e,56), "nonlegacy asynchronous upload issued");
     require(c.prepare_ownership(1,1,1) && c.fill_slot_blocking(1,source.blob(1,1),e,80) && !snapshot(c).known,
             "legacy copy sync cannot confirm a different stream's pending write");
@@ -111,6 +121,7 @@ void cache_cases() {
     c.close();
     s=snapshot(c);
     require(s.known && s.capacity==0 && s.logical==0, "confirmed release clears holdings");
+    require(c.runtime_memory().known && c.runtime_memory().requested==0 && c.runtime_memory().rounded==0, "confirmed release clears allocation accounting");
     io.copy_ok=true;
     require(c.open_sized({56},2,4,e) && c.admit(0,0)==0, "reopen after confirmed rollback");
     io.sync_ok=false;
@@ -119,12 +130,15 @@ void cache_cases() {
     require(c.open_sized({56},2,4,e), "open for uncertain release");
     io.free_ok=false; c.close();
     require(!snapshot(c).known && c.weight_ownership().capacity==256, "unconfirmed release retains uncertain capacity");
+    require(!c.runtime_memory().known, "failed release does not claim zero successful storage");
     require(!c.open_sized({56},2,4,e) && !snapshot(c).known, "unknown release cannot be forgotten by reopening");
     // The injected allocator retained the failed free for teardown, as the real
     // owner no longer has a usable pointer after its existing close path.
     Io failed; ExpertCache f; detail::ExpertCacheTestAccess::io(f,&failed.hooks); f.track_ownership(&source);
     failed.alloc_ok=false;
     require(!f.open_sized({56},2,4,e) && snapshot(f).capacity==0, "allocation failure has no successful holdings");
+    require(e.find("out_of_memory")==std::string::npos && e.find("insufficient_resources")==std::string::npos,
+            "untyped allocator fault cannot prove OOM or a resource shortfall");
     failed.alloc_ok=true; failed.touch_ok=false;
     require(!f.open_sized({56},2,4,e) && snapshot(f).capacity==0, "touch failure followed by confirmed rollback");
     failed.touch_ok=true;
@@ -192,6 +206,11 @@ void file_source_case(const std::filesystem::path& root) {
     require(strata::kernels::cpu::expert_layout_load(root.string(),1,4,error), "real native layout reader accepts split-role fixture");
     FileExpertSource source; source.set_gguf(paths[0]);
     require(source.open(root.string(),1,4,error) && source.gguf_mode(), "actual file source validates and maps independent GGUF roles");
+    const auto storage=source.runtime_memory();
+    // Header lengths are fixed by the fixture's explicit GGUF encoding above.
+    const uint64_t mapped=fs::file_size(root/"gate.gguf")+fs::file_size(root/"up.gguf")+fs::file_size(root/"down.gguf");
+    require(storage.at("expert_file_views").mapped==mapped && storage.at("resident_experts").requested==0,
+            "file owner reports logical view lengths from independently inspected files, not physical RAM");
     auto slices=source.weight_slices(0,3);
     require(slices.size()==3 && slices[0].bytes==1740800 && slices[1].offset==1740800 &&
             slices[2].offset==3481600 && slices[2].bytes==921600, "actual parsed role sizes and concatenated offsets");
@@ -208,6 +227,8 @@ void file_source_case(const std::filesystem::path& root) {
             s.shards[0].bytes==1740800 && s.shards[1].bytes==1740800 && s.shards[2].bytes==921600,
             "three real reader source spans reconcile with successful cache contents");
     source.close();
+    require(source.runtime_memory().at("expert_file_views").mapped==0 &&
+            source.runtime_memory().at("file_cache_target").requested==0,"source release updates current storage");
     require(source.weight_slices(0,0).empty(), "source close clears attribution for future uploads");
     layout(true);
     require(strata::kernels::cpu::expert_layout_load(root.string(),1,4,error), "bad span fixture parses layout only");
@@ -250,11 +271,81 @@ void frame_cases() {
         require(!read_weight_ownership_frame(input,old,valid,e) && old==0 && valid=="last valid", "malformed envelope preserves last valid snapshot");
     }
 }
+void runtime_cases(bool emit_fixture = false) {
+    RuntimeMemory device; device.device_allocation(768); device.device_allocation(2097153);
+    require(device.requested==2097921 && device.rounded==6291456,"separate successful allocations round independently");
+    const auto previous=device;
+    bool overflow=false;
+    try { device.device_allocation(UINT64_MAX); } catch (const std::overflow_error&) { overflow=true; }
+    require(overflow && device==previous,"allocation accounting overflow preserves previous complete record");
+    RuntimeSnapshot s; s.weights.capacity=768; s.weights.logical=56; s.weights.padding=712; s.weights.shards={{56,56}};
+    s.settings={{"context",8192},{"prefill",64},{"batch",0},{"parallel",1},{"spec",2},{"kv",1},{"kv_resident",0}};
+    if (emit_fixture) {
+        for (const char* name : {"batch_groups", "auto_cache", "per_layer", "no_prefill_borrow", "resident_budget",
+                "resident_bytes", "resident_experts", "resident_pin", "file_cache_effective", "file_cache_compact",
+                "host_headroom", "vram_reserve", "cache_slots", "cache_bytes", "shared_stage", "ring",
+                "stager_threads", "stager_ring", "stager_batch", "prefill_borrowed"}) s.settings[name]=0;
+        s.settings["batch_groups"]=1; s.settings["no_prefill_borrow"]=1; s.settings["resident_pin"]=1;
+        s.settings["cache_slots"]=3; s.settings["cache_bytes"]=768; s.settings["ring"]=8;
+        s.settings["stager_threads"]=1; s.settings["stager_ring"]=2; s.settings["stager_batch"]=1;
+    }
+    auto& cache=s.vram["expert_cache"]; cache.device_allocation(768); cache.logical=56;
+    s.vram["overhead_allowance"].allowance=469762048;
+    auto& host=s.ram["streamed_kv"]; host.requested=host.rounded=75498496; host.logical=75497472;
+    host.mapped=host.pinned=75498496;
+    uint64_t seq=0; std::string frame,error,body;
+    require(frame_runtime_snapshot(s,"cuda",0,emit_fixture ? "0000:01:00.0" : "pci",seq,frame,error) && seq==1,"ordinary snapshot needs no approved plan");
+    if (emit_fixture) {
+        require(std::fwrite(frame.data(),1,frame.size(),stdout)==frame.size(),"runtime fixture output");
+        return;
+    }
+    require(frame.find("setting\tcontext\t8192\n")!=std::string::npos &&
+            frame.find("component\tvram\texpert_cache\tknown\t768\t2096384\t56\t0\t0\t0\n")!=std::string::npos &&
+            frame.find("component\tram\tstreamed_kv\tknown\t75498496\t0\t75497472\t75498496\t75498496\t0\n")!=std::string::npos &&
+            frame.find("component\tvram\toverhead_allowance\tknown\t0\t0\t0\t0\t0\t469762048\n")!=std::string::npos,
+            "independent allocation, rounding, logical, mapped, pin and allowance byte oracles");
+    require(frame.find("physical\tunavailable\n")!=std::string::npos && frame.find("total_allocated\tunknown\n")!=std::string::npos,
+            "no estimator or physical residency masquerades as measured total");
+    std::istringstream input(frame+"READY 8192 stop\n"); uint64_t readseq=0;
+    require(read_runtime_frame(input,readseq,body,error) && readseq==1 && input.peek()=='R',"runtime frame commits before following stdout");
+    for (size_t n=0;n<frame.size();++n) {
+        std::istringstream broken(frame.substr(0,n)); uint64_t old=0; std::string previous="predecessor";
+        require(!read_runtime_frame(broken,old,previous,error) && old==0 && previous=="predecessor","every interrupted runtime frame retains complete predecessor");
+    }
+    std::istringstream repeat(frame);
+    require(!read_runtime_frame(repeat,readseq,body,error),"runtime stale sequence refuses");
+    cache.known=false; s.weights.known=false;
+    require(frame_runtime_snapshot(s,"cuda",0,"pci",seq,frame,error) && seq==2 &&
+            frame.find("component\tvram\texpert_cache\tunknown\t-\t-\t-\t-\t-\t-\n")!=std::string::npos &&
+            frame.find("totals\t")==std::string::npos,"failed or unconfirmed ownership suppresses numeric holdings");
+    cache.known=true; cache.logical=769;
+    require(!frame_runtime_snapshot(s,"cuda",0,"pci",seq,frame,error) && seq==2 && frame.empty(),"invalid component refuses atomically");
+    cache.logical=56; seq=UINT64_MAX;
+    require(!frame_runtime_snapshot(s,"cuda",0,"pci",seq,frame,error) && seq==UINT64_MAX,"runtime sequence cannot wrap");
+    seq=0; s.settings["bad\nname"]=0;
+    require(!frame_runtime_snapshot(s,"cuda",0,"pci",seq,frame,error) && seq==0,"field injection refuses");
+    for (const char* code : {"out_of_memory", "insufficient_resources", "invalid_launch_plan"}) {
+        const auto cause=std::string(code)+": proved cause";
+        const auto wrapped=native_error_message("final initialization",native_error_message("prefill/cache",cause),"invalid_launch_plan");
+        char line[512]; std::snprintf(line,sizeof line,"ERROR %s\n",wrapped.c_str());
+        require(std::string(line).rfind(std::string("ERROR ")+code+": ",0)==0,"actual wrapper formatting preserves typed cause");
+    }
+    require(native_error_message("allocation","generic device failure")=="allocation: generic device failure",
+            "unproved allocation/device failure is never guessed OOM");
+    require(native_error_message("admission","malformed payload","invalid_launch_plan")=="invalid_launch_plan: admission: malformed payload",
+            "invalid plan fallback is separate from a proved resource cause");
+}
 }
 int main(int argc, char** argv) {
     try {
+        if (argc==2 && std::string(argv[1])=="--runtime-fixture") {
+#if defined(_WIN32)
+            require(_setmode(_fileno(stdout),_O_BINARY)!=-1,"runtime fixture binary stdout");
+#endif
+            runtime_cases(true); return 0;
+        }
         require(argc==2 && std::filesystem::path(argv[1]).is_absolute(), "explicit absolute fixture directory required");
-        cache_cases(); aggregate_cases(); frame_cases(); file_source_case(argv[1]);
+        cache_cases(); aggregate_cases(); frame_cases(); runtime_cases(); file_source_case(argv[1]);
         std::printf("PASS weight_ownership %d/%d checks (CPU I/O injection; no device execution)\n",checks,checks);
     }
     catch (const std::exception& e) { std::fprintf(stderr,"FAIL after %d checks: %s\n",checks,e.what()); return 1; }

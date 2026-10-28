@@ -20,13 +20,16 @@ public:
     NativeHead(const NativeHead&) = delete;
     NativeHead& operator=(const NativeHead&) = delete;
 
-    /// track_ownership adds completion checking and source attribution for planned startup.
+    /// track_ownership confirms uploads and records source spans. Ordinary serving
+    /// uses strict_completion=false: failed confirmation makes telemetry unknown.
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err,
-              bool track_ownership = false);
+              bool track_ownership = false, bool strict_completion = true);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
     const WeightOwnership& weight_ownership() const { return ownership_; }
+    const RuntimeMemory& weight_memory() const { return weight_memory_; }
+    const RuntimeMemory& scratch_memory() const { return scratch_memory_; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
@@ -40,6 +43,7 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     WeightOwnership ownership_;
+    RuntimeMemory weight_memory_, scratch_memory_;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
@@ -51,7 +55,8 @@ public:
     ~NativeEmbed();
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
-    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err, bool strict = false);
+    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err,
+              bool strict = false, bool track_ownership = false);
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.

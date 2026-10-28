@@ -79,6 +79,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
+#include <fcntl.h>
 #else
 #include <unistd.h>
 #include <cerrno>
@@ -1582,7 +1583,7 @@ int main(int argc, char** argv) {
         std::string why;
         strata::plan::LaunchSettings saved;
         if (!strata::plan::consume_strict_launch(argc,argv,saved,why)) {
-            std::fprintf(stderr,"ERROR invalid_launch_plan: %s\n",why.c_str()); return 2;
+            std::fprintf(stderr,"ERROR %s\n",strata::core::native_error_message("strict launch admission",why,"invalid_launch_plan").c_str()); return 2;
         }
         strict_launch=std::move(saved);
     }
@@ -2632,8 +2633,8 @@ int main(int argc, char** argv) {
         const strata::core::ModelGeometry g0;
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err, strict_launch.has_value())) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                               248320, err, strict_launch.has_value(), o.serve)) {
+            std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("native embedding",err).c_str());
             return 1;
         }
         strata::core::set_native_embed(&native_embed);
@@ -2714,7 +2715,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* arena = nullptr;
-    if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
+    std::map<std::string, strata::core::RuntimeMemory> startup_memory;
+    auto runtime_malloc = [&](auto** p, size_t bytes, const char* component) {
+        const auto status=cudaMalloc((void**)p,bytes);
+        if (status==cudaSuccess) {
+            startup_memory[component].device_allocation(bytes);
+            startup_memory[component].logical+=bytes;
+        }
+        else if (status==cudaErrorMemoryAllocation)
+            std::fprintf(stderr,"ERROR out_of_memory: %s allocation of %llu bytes failed: %s\n",component,
+                         (unsigned long long)bytes,cudaGetErrorString(status));
+        return status;
+    };
+    if (const cudaError_t ce = runtime_malloc(&arena, pool_bytes,"weights_canonical"); ce != cudaSuccess) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
         // missing is held by something else: say how much was free
         cudaGetLastError();
@@ -2753,7 +2766,7 @@ int main(int argc, char** argv) {
     };
     strata::core::WeightTable wt;
     if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
-        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("weights",err).c_str());
         return 1;
     }
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
@@ -2762,8 +2775,8 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, -1, strict_launch.has_value())) {
-            std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, -1, o.serve, strict_launch.has_value())) {
+            std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("native dense projections",err).c_str());
             return 1;
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
@@ -2973,8 +2986,8 @@ int main(int argc, char** argv) {
         // `ss.ple.hist` and the ready() check wait for `session_init`, which carves the history - the session is
         // now allocated after the layer-split search (see the carve), and the wiring lands there
         ss.ple.emb_host = ple_emb_host.data();
-        if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
-            cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+        if (runtime_malloc(&ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4,"decode_auxiliary") != cudaSuccess ||
+            runtime_malloc(&ple_scratch, strata::core::ple_run_scratch_bytes(),"decode_auxiliary") != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
             return 1;
         }
@@ -2987,7 +3000,7 @@ int main(int argc, char** argv) {
     }
 
     float* d_parts = nullptr;
-    if (cudaMalloc(&d_parts, (size_t) K * g.n_embd * 4) != cudaSuccess ||
+    if (runtime_malloc(&d_parts, (size_t) K * g.n_embd * 4,"decode_auxiliary") != cudaSuccess ||
         cudaMemset(d_parts, 0, (size_t) K * g.n_embd * 4) != cudaSuccess) {
         std::fprintf(stderr, "strata generate: the parts buffer failed\n");
         return 1;
@@ -3835,12 +3848,12 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (runtime_malloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0),"session_including_resident_kv") != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
         if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0, strict_launch.has_value()) == 0) {
-            std::fprintf(stderr, "strata generate: session_init failed\n");
+            std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("session_init",strata::core::session_initialization_error()).c_str());
             return 1;
         }
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
@@ -4050,8 +4063,8 @@ int main(int argc, char** argv) {
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err, strict_launch.has_value())) {
-            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err, o.serve, strict_launch.has_value())) {
+            std::fprintf(stderr, "ERROR %s%s\n", strata::core::native_error_message("native head",err).c_str(), vram_free_note().c_str());
             return 1;
         }
         std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
@@ -4060,7 +4073,7 @@ int main(int argc, char** argv) {
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
-    if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
+    if (runtime_malloc(&d_logits, (size_t) n_vocab * 4,"head_scratch_logits") != cudaSuccess) {
         (void) cudaGetLastError();
         std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
         return 1;
@@ -4715,7 +4728,7 @@ int main(int argc, char** argv) {
             }, strict_launch.has_value());
         if (retry.status == strata::core::ExpertCacheRetryStatus::allocation_failed ||
             retry.status == strata::core::ExpertCacheRetryStatus::validation_failed) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("expert cache",err).c_str());
 #if defined(_WIN32)
             if (retry.status == strata::core::ExpertCacheRetryStatus::allocation_failed)
                 std::fprintf(stderr, "strata generate: on Windows the graphics card's memory also needs room in the page "
@@ -4761,7 +4774,7 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
-    if (strict_launch) xcache.track_ownership(srcp);
+    if (o.serve) xcache.track_ownership(srcp);
     if (!profile.empty() && srcp != nullptr) {
         std::vector<std::pair<int32_t,int32_t>> saved_pairs;
         if (strict_launch) for (auto slot:strict_launch->slots) saved_pairs.emplace_back((int32_t)slot.layer,(int32_t)slot.expert);
@@ -5122,15 +5135,15 @@ int main(int argc, char** argv) {
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
         const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
-        if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_q8, (size_t) (g.n_embd / 32) * 34) != cudaSuccess ||
+        if (runtime_malloc(&hit_scratch, (size_t) sb,"decode_hit_scratch") != cudaSuccess ||
+            runtime_malloc(&d_hit_slot, (size_t) K * sizeof(int32_t),"decode_hit_scratch") != cudaSuccess ||
+            runtime_malloc(&d_hit_dst, (size_t) K * sizeof(int32_t),"decode_hit_scratch") != cudaSuccess ||
+            runtime_malloc(&d_hit_q8, (size_t) (g.n_embd / 32) * 34,"decode_hit_scratch") != cudaSuccess ||
             // R4.2h: the fp32 activation scales.  Without this the GPU's hits use the block's fp16 `d`
             // while the CPU's misses use `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement on
             // every chunk, and the reason enabling the cache changed the tokens.
-            cudaMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess) {
+            runtime_malloc(&d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float),"decode_hit_scratch") != cudaSuccess ||
+            runtime_malloc(&d_hit_out, (size_t) K * g.n_embd * 4,"decode_hit_scratch") != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the R4 hit path could not allocate its device buffers\n");
             return 1;
         }
@@ -5288,7 +5301,7 @@ int main(int argc, char** argv) {
                native_head.run(ss.block.mixed, d_logits, stream, err);
     };
     float* d_emb = nullptr;
-    if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
+    if (runtime_malloc(&d_emb, (size_t) g.n_embd * 4,"decode_auxiliary") != cudaSuccess) {
         std::fprintf(stderr, "strata generate: the embedding buffer failed\n");
         return 1;
     }
@@ -5297,7 +5310,7 @@ int main(int argc, char** argv) {
     // error surfaces at the NEXT synchronising call, which here was the next token's `embed_row`, reporting an
     // illegal access on a weight plane.  Nothing in the parameter names said device.
     int* d_next = nullptr;
-    if (cudaMalloc(&d_next, sizeof(int)) != cudaSuccess) {
+    if (runtime_malloc(&d_next, sizeof(int),"decode_auxiliary") != cudaSuccess) {
         std::fprintf(stderr, "strata generate: the sampler output buffer failed\n");
         return 1;
     }
@@ -5698,8 +5711,8 @@ int main(int argc, char** argv) {
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
-        if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
+        if (runtime_malloc(&d_res, host_res.size() * sizeof(int32_t),"cache_tables") != cudaSuccess ||
+            runtime_malloc(&d_hit_count, sizeof(int32_t),"cache_tables") != cudaSuccess ||
             res_put(d_res) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
             return 1;
@@ -6394,6 +6407,11 @@ int main(int argc, char** argv) {
                      dropped ? "is closed" : "stays open", why.c_str());
     }
     if (o.serve) {
+#if defined(_WIN32)
+        if (_setmode(_fileno(stdout),_O_BINARY)==-1) {
+            std::fprintf(stderr,"ERROR runtime_accounting: binary stdout unavailable\n"); return 1;
+        }
+#endif
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
@@ -6743,6 +6761,7 @@ int main(int argc, char** argv) {
             // headroom on that device (a chunk that fits to the last MiB left hipBLAS nothing: its GEMMs then
             // failed to launch on gfx1201 and the prompt hung).  `bytes_needed` is the same count `init` makes.
             const int64_t kHeadroom = 512ll << 20;
+            bool own_query_failed=false;
             auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
                 for (size_t i = 0; i <= stages.size(); ++i) {
                     const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
@@ -6750,7 +6769,7 @@ int main(int argc, char** argv) {
                     const int dev = i == 0 ? -1 : stages[i - 1]->dev;
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
-                    cudaMemGetInfo(&fb, &tb);
+                    if (cudaMemGetInfo(&fb, &tb)!=cudaSuccess) own_query_failed=true;
                     const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
@@ -6762,7 +6781,10 @@ int main(int argc, char** argv) {
             int dev = 0;
             int64_t need = 0, fb = 0;
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
-                if (strict_launch) { std::fprintf(stderr,"ERROR insufficient_resources: approved prefill buffers no longer fit\n"); return 1; }
+                if (strict_launch) {
+                    std::fprintf(stderr,own_query_failed ? "ERROR prefill_resource_query: free memory unavailable\n" :
+                        "ERROR insufficient_resources: approved prefill buffers no longer fit\n"); return 1;
+                }
                 int64_t c = 0;
                 for (const int64_t s : kStepChunks) {
                     int d2 = 0;
@@ -6780,7 +6802,7 @@ int main(int argc, char** argv) {
         for (;;) {
             const int r = init_prompt_paths();
             if (r == 0) break;
-            if (strict_launch) { std::fprintf(stderr,"ERROR strict prefill initialization failed: %s\n",err.c_str()); return 1; }
+            if (strict_launch) { std::fprintf(stderr,"ERROR %s\n",strata::core::native_error_message("strict prefill initialization",err).c_str()); return 1; }
             int64_t next = 0;
             for (const int64_t c : kStepChunks)
                 if (c < o.prefill_chunk) { next = c; break; }
@@ -6809,7 +6831,7 @@ int main(int argc, char** argv) {
                 err.clear();
                 continue;
             }
-            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("prefill initialization",err).c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
                 std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
@@ -6884,7 +6906,7 @@ int main(int argc, char** argv) {
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
-        if (const strata::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
+        if (const strata::core::OnDevice on_h(hist_dev); runtime_malloc(&d_hist, kHistSlots * sizeof(int32_t),"decode_auxiliary") != cudaSuccess) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
@@ -7034,7 +7056,7 @@ int main(int argc, char** argv) {
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err, strict_launch.has_value()) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
-            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            std::fprintf(stderr, "ERROR %s\n", strata::core::native_error_message("verifier initialization",err).c_str());
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
@@ -7637,43 +7659,113 @@ int main(int argc, char** argv) {
         }
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         uint64_t ownership_sequence = 0;
+        uint64_t runtime_sequence = 0;
+        strata::plan::LaunchSettings applied_launch;
+        bool startup_confirmed = false;
+        std::optional<strata::core::RuntimeSnapshot> last_runtime;
         bool ownership_ready = false;
         std::optional<strata::core::WeightSnapshot> last_ownership;
         uint64_t last_ownership_revision = 0;
         // This is the existing stdout owner, on the serving thread. No worker
         // writes frames, and no second stream reader or allocation registry exists.
         auto publish_ownership = [&]() -> bool {
-            if (!strict_launch || !ownership_ready) return true;
+            if (!ownership_ready) return true;
             const auto cache = xcache.weight_ownership();
             strata::core::WeightSnapshot current;
             std::string error, frame;
             if (!strata::core::aggregate_weight_ownership({&wt.weight_ownership(), &native_dense.weight_ownership(),
                     &native_head.weight_ownership(), &native_embed.weight_ownership(), &cache},
                     o.native_shards, current, error)) {
-                std::fprintf(stderr, "ERROR ownership_accounting: %s\n", error.c_str()); return false;
+                std::fprintf(stderr, "ERROR ownership_accounting: %s\n", error.c_str());
+                if (strict_launch) return false;
+                current={}; current.known=false;
             }
-            if (ownership_sequence == 0 && !current.known) {
+            if (strict_launch && ownership_sequence == 0 && !current.known) {
                 std::fprintf(stderr, "ERROR ownership_accounting: startup holdings are unknown\n"); return false;
             }
-            if (last_ownership && *last_ownership == current && last_ownership_revision == xcache.ownership_revision()) return true;
             int device = 0; char pci[64]{};
-            if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetPCIBusId(pci, sizeof pci, device) != cudaSuccess ||
-                !strata::core::frame_weight_ownership(current, "cuda", (unsigned)device, pci,
-                                                       ownership_sequence, frame, error)) {
-                std::fprintf(stderr, "ERROR ownership_accounting: device identity or frame failed: %s\n", error.c_str()); return false;
+            const bool identified=cudaGetDevice(&device)==cudaSuccess && cudaDeviceGetPCIBusId(pci,sizeof pci,device)==cudaSuccess;
+            if (!identified && strict_launch) {
+                std::fprintf(stderr,"ERROR ownership_accounting: device identity unavailable\n"); return false;
             }
-            if (std::fwrite(frame.data(), 1, frame.size(), stdout) != frame.size() || std::fflush(stdout) != 0) return false;
+            const char* backend="cuda";
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+            backend="hip";
+#elif defined(STRATA_USE_SYCL)
+            backend="sycl";
+#endif
+            const bool supported=identified && std::strcmp(backend,"cuda")==0 && native_pack &&
+                srcp==&src && !peer.valid() && o.expert_cache_remote[0]==0 &&
+                o.expert_cache_remote[1]==0 && o.expert_cache_remote[2]==0 &&
+                !multi_gpu && !split_same && stages.empty() && o.peer_device<0 &&
+                o.batch==0 && o.pipeline_windows==0 && !use_mtp && !strata::core::qsa_kv_elastic();
+            if (!supported || !startup_confirmed) { current={}; current.known=false; }
+            strata::core::RuntimeSnapshot runtime;
+            applied_launch.resident_bytes=src.resident_bytes();
+            applied_launch.resident_experts=src.resident_order().size();
+            applied_launch.resident_pin=src.pinned_bytes()==src.resident_bytes() && o.resident_pin;
+            const auto file_cache=src.file_cache_stats();
+            applied_launch.file_cache_effective=file_cache.target_bytes;
+            applied_launch.file_cache_compact=file_cache.compact;
+            runtime.settings=strata::plan::runtime_launch_settings(applied_launch,xcache.slots(),xcache.bytes());
+            runtime.settings["prefill_borrowed"]=sp.borrowed();
+            runtime.weights=current; runtime.vram=startup_memory;
+            auto& canonical=runtime.vram["weights_canonical"];
+            canonical.logical=0;
+            for (const auto& slice : wt.weight_ownership().slices) canonical.logical+=slice.bytes;
+            canonical.known=wt.weight_ownership().known;
+            runtime.vram["weights_native_dense"]=native_dense.runtime_memory();
+            runtime.vram["weights_native_head"]=native_head.weight_memory();
+            runtime.vram["head_scratch_logits"].merge(native_head.scratch_memory());
+            runtime.vram["expert_cache"]=xcache.runtime_memory();
+            runtime.vram["verifier"]=ver.runtime_vram();
+            for (auto& [name,memory] : sp.runtime_vram()) runtime.vram[name]=memory;
+            runtime.vram["overhead_allowance"].allowance=applied_launch.vram_reserve;
+            runtime.ram=src.runtime_memory();
+            runtime.ram["streamed_kv"]=ss.streamed_kv;
+            runtime.ram["session_host_staging"]=ss.host_staging;
+            runtime.ram["verifier_mapped"]=ver.runtime_ram();
+            for (auto& [name,memory] : sp.runtime_ram()) runtime.ram[name]=memory;
+            const auto& embedding=native_embed.weight_ownership();
+            auto& host_embed=runtime.ram["mapped_embedding"];
+            host_embed.requested=host_embed.rounded=host_embed.logical=host_embed.mapped=host_embed.pinned=embedding.mapped_host;
+            host_embed.known=embedding.known;
+            auto& device_embed=runtime.vram["embedding_fallback"];
+            device_embed.device_allocation(embedding.capacity); device_embed.logical=embedding.capacity; device_embed.known=embedding.known;
+            runtime.ram["host_headroom_allowance"].allowance=applied_launch.host_headroom;
+            runtime.ram["startup_scratch_allowance"].allowance=strata::plan::launch_startup_scratch_allowance;
+            if (!supported || !startup_confirmed) {
+                for (auto* records : {&runtime.vram,&runtime.ram}) for (auto& [name,memory] : *records) memory.known=false;
+            }
+            if (last_runtime && *last_runtime==runtime && last_ownership_revision==xcache.ownership_revision()) return true;
+            if (!strata::core::frame_runtime_snapshot(runtime,backend,(unsigned)device,identified ? pci : "unavailable",
+                                                     runtime_sequence,frame,error)) {
+                std::fprintf(stderr,"ERROR runtime_accounting: %s\n",error.c_str());
+                if (strict_launch) return false;
+                runtime.weights={}; runtime.weights.known=false;
+                for (auto* records : {&runtime.vram,&runtime.ram}) for (auto& [name,memory] : *records) memory.known=false;
+                if (!strata::core::frame_runtime_snapshot(runtime,backend,(unsigned)device,identified ? pci : "unavailable",
+                                                        runtime_sequence,frame,error)) return false;
+            }
+            if (std::fwrite(frame.data(),1,frame.size(),stdout)!=frame.size() || std::fflush(stdout)!=0) return false;
+            last_runtime=std::move(runtime);
+            // Keep the strict public protocol and frozen payload compatible.
+            if (strict_launch && (!last_ownership || *last_ownership!=current || last_ownership_revision!=xcache.ownership_revision())) {
+                if (!strata::core::frame_weight_ownership(current,backend,(unsigned)device,pci,ownership_sequence,frame,error)) return false;
+                if (std::fwrite(frame.data(),1,frame.size(),stdout)!=frame.size() || std::fflush(stdout)!=0) return false;
+            }
             last_ownership = std::move(current);
             last_ownership_revision = xcache.ownership_revision();
             return true;
         };
         auto res_upload = [&]() {
-            if (d_res != nullptr)
-                res_put(d_res);
+            bool confirmed=true;
+            if (d_res != nullptr) confirmed=res_put(d_res)==cudaSuccess;
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
-                res_put(st->d_res);
+                confirmed=res_put(st->d_res)==cudaSuccess && confirmed;
             }
+            if (!confirmed) xcache.fail_ownership();
             if (!publish_ownership()) std::_Exit(1);
         };
         auto apply_pending = [&](bool wait) {
@@ -7686,7 +7778,16 @@ int main(int argc, char** argv) {
                     return;
                 }
             }
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            else {
+                const auto status=cudaEventQuery(adapt_ev);
+                if (status!=cudaSuccess) {
+                    if (status!=cudaErrorNotReady) {
+                        xcache.fail_ownership();
+                        if (!publish_ownership()) std::_Exit(1);
+                    }
+                    return;
+                }
+            }
             for (auto& st : stages)
                 if (st->adapt_live) {
                     if (wait) cudaEventSynchronize(st->adapt_ev);
@@ -8320,11 +8421,11 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
         }
-        if (strict_launch) {
-            auto effective=*strict_launch;
+        {
+            auto effective=strict_launch.value_or(strata::plan::LaunchSettings{});
             effective.context=ss.max_cells; effective.spec=o.spec; effective.prefill=sp.chunk();
-            effective.batch=o.batch; effective.batch_groups=o.batch_groups;
-            effective.parallel=1; effective.auto_cache=auto_cache; effective.per_layer=xcache.per_layer_admission();
+            effective.batch=o.batch>0 ? o.batch : 0; effective.batch_groups=o.batch_groups;
+            effective.parallel=o.batch>0 ? o.batch : 1; effective.auto_cache=auto_cache; effective.per_layer=xcache.per_layer_admission();
             effective.no_prefill_borrow=o.no_prefill_borrow; effective.resident_budget=o.resident_budget;
             effective.host_headroom=o.resident_headroom; effective.resident_bytes=src.resident_bytes();
             effective.resident_pin=src.pinned_bytes()==src.resident_bytes() && o.resident_pin;
@@ -8340,7 +8441,7 @@ int main(int argc, char** argv) {
                 const auto& other=ss.qsa_states[ss.qsa_ord0+j];
                 if (other.max_cells!=q.max_cells || other.n_slots!=q.n_slots || other.kv_mode!=q.kv_mode ||
                     other.kv_q4!=q.kv_q4 || other.kv_int8!=q.kv_int8 || other.kv_hybrid!=q.kv_hybrid) {
-                    std::fprintf(stderr,"ERROR invalid_launch_plan: applied per-layer KV layout differs\n"); return 1;
+                    if (strict_launch) { std::fprintf(stderr,"ERROR invalid_launch_plan: applied per-layer KV layout differs\n"); return 1; }
                 }
             }
             const auto pf=sp.applied_sizing();
@@ -8351,26 +8452,38 @@ int main(int argc, char** argv) {
             effective.stager_threads=pf.stager_threads; effective.stager_ring=pf.stager_ring;
             effective.stager_batch=pf.stager_batch;
             effective.shared_stage=sp.shared_stage();
-            effective.slots.assign((size_t)xcache.slots(),{});
+            if (strict_launch) effective.slots.assign((size_t)xcache.slots(),{});
             effective.layer_blobs.clear(); effective.max_blob=strata::kernels::cpu::expert_layout().max_blob;
             for (int64_t l=0;l<g.n_layers;++l) {
                 const auto bytes=strata::kernels::cpu::expert_layout().blob_bytes(l);
                 effective.layer_blobs.push_back(bytes);
                 for (int64_t e=0;e<g.n_expert;++e) {
                     const auto slot=xcache.slot_of(l,e);
-                    if (slot>=0 && slot<xcache.slots()) effective.slots[(size_t)slot]={(uint64_t)l,(uint64_t)e,bytes,xcache.slot_offset(slot)};
+                    if (strict_launch && slot>=0 && slot<xcache.slots()) effective.slots[(size_t)slot]={(uint64_t)l,(uint64_t)e,bytes,xcache.slot_offset(slot)};
                 }
             }
-            if (!strata::plan::check_effective_launch(*strict_launch,effective,err) ||
-                cudaDeviceSynchronize()!=cudaSuccess) {
-                std::fprintf(stderr,"ERROR invalid_launch_plan: effective settings or final initialization failed: %s\n",err.c_str()); return 1;
+            if (strict_launch && !strata::plan::check_effective_launch(*strict_launch,effective,err)) {
+                std::fprintf(stderr,"ERROR %s\n",strata::core::native_error_message("effective settings",err,"invalid_launch_plan").c_str()); return 1;
             }
-            size_t free=0,total=0;
-            if (cudaMemGetInfo(&free,&total)!=cudaSuccess || free<effective.vram_reserve) {
-                std::fprintf(stderr,"ERROR insufficient_resources: approved final VRAM reserve unavailable\n"); return 1;
+            const auto initialized=cudaDeviceSynchronize();
+            startup_confirmed=initialized==cudaSuccess && adapt_event_status==cudaSuccess;
+            if (strict_launch && !startup_confirmed) {
+                std::fprintf(stderr,"ERROR %s\n",strata::core::native_error_message("final initialization",
+                    std::string(initialized==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+cudaGetErrorString(initialized)).c_str()); return 1;
             }
-            const auto frame=strata::plan::frame_effective_launch(effective,1);
-            if (std::fwrite(frame.data(),1,frame.size(),stdout)!=frame.size()) return 1;
+            if (strict_launch) {
+                size_t free=0,total=0;
+                const auto query=cudaMemGetInfo(&free,&total);
+                if (query!=cudaSuccess) {
+                    std::fprintf(stderr,"ERROR final_resource_query: %s\n",cudaGetErrorString(query)); return 1;
+                }
+                if (free<effective.vram_reserve) {
+                    std::fprintf(stderr,"ERROR insufficient_resources: approved final VRAM reserve unavailable\n"); return 1;
+                }
+                const auto frame=strata::plan::frame_effective_launch(effective,1);
+                if (std::fwrite(frame.data(),1,frame.size(),stdout)!=frame.size()) return 1;
+            }
+            applied_launch=std::move(effective);
             ownership_ready = true;
             if (!publish_ownership()) return 1;
         }
@@ -11320,7 +11433,7 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            if (strict_launch) {
+            if (ownership_ready) {
                 // The final window may have submitted copies after its last completion check.
                 // Settle and publish before DONE lets the serving loop wait indefinitely for input.
                 apply_pending(true);

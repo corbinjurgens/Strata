@@ -13,6 +13,7 @@
 // (rounds 211-214), and the HOST decides when each layer runs.  That decision is the whole point - it is what
 // lets the CPU expert pool start while the GPU is still working on the next layer.
 #pragma once
+#include "strata/core/weight_ownership.hpp"
 
 #include "strata/core/hit_hook.hpp"
 #include "strata/core/layer.hpp"
@@ -39,6 +40,7 @@ uint64_t session_bytes_for(const ModelGeometry& g, int64_t cells, int64_t k, con
 /// Everything a sequence needs that is NOT a weight: the per-layer state, the block scratch, and the pinned
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
+    RuntimeMemory streamed_kv, host_staging;
     int64_t max_cells = 0;
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
@@ -112,6 +114,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
                       int64_t layer_lo = 0, int64_t layer_hi = -1, bool strict = false);
 /// Scoped to the calling thread's session_init; the QSA owner checks initialization operations in strict mode.
 bool strict_session_initialization();
+const std::string& session_initialization_error();
+void session_initialization_failed(const std::string& error);
+void record_session_host_allocation(uint64_t bytes, uint64_t logical, bool kv);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);

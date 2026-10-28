@@ -129,7 +129,7 @@ bool admit_exact_resident_budget(uint64_t requested, uint64_t physical, uint64_t
 }
 bool admit_exact_pinning(uint64_t bytes, uint64_t pinned_bytes, std::string& error) {
     if (bytes==pinned_bytes) return true;
-    error="out_of_memory: strict arena is not fully pinned"; return false;
+    error="insufficient_resources: strict arena is not fully pinned"; return false;
 }
 FileCacheTarget file_cache_target(uint64_t requested, bool compact, bool staged, uint64_t blobs,
                                   uint64_t max_blob, uint64_t expert_bytes) {
@@ -953,16 +953,18 @@ void FileExpertSource::close() {
     for (auto& value : copy_counts_) value.store(0, std::memory_order_relaxed);
     inputs_.clear();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+        if (complement_pinned_ && !complement_registered_) {
+            if (cudaFreeHost(complement_arena_)!=cudaSuccess) storage_known_=false;
+        }
         else {
-            if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+            if (complement_registered_ && cudaHostUnregister(complement_arena_)!=cudaSuccess) storage_known_=false;
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
         }
     }
     if (xstage_ != nullptr) {
-        if (xstage_pinned_) (void) cudaFreeHost(xstage_);
+        if (xstage_pinned_) { if (cudaFreeHost(xstage_)!=cudaSuccess) storage_known_=false; }
         else std::free(xstage_);
     }
     xstage_ = nullptr;
@@ -990,11 +992,11 @@ void FileExpertSource::close() {
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
-            if (m.base != nullptr) UnmapViewOfFile((LPCVOID) m.base);
+            if (m.base != nullptr && !UnmapViewOfFile((LPCVOID) m.base)) storage_known_=false;
             if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
             if (m.file != nullptr) CloseHandle((HANDLE) m.file);
 #else
-            if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
+            if (m.base != nullptr && munmap((void*) m.base, (size_t) m.bytes)!=0) storage_known_=false;
             if (m.fd >= 0) ::close(m.fd);
 #endif
         }
@@ -1046,14 +1048,14 @@ void FileExpertSource::close() {
     io_pf_jobs_.store(0); io_pf_blobs_.store(0); io_pf_skips_.store(0); io_pf_dropped_.store(0);
     io_pf_used_.store(0); io_pf_unused_.store(0); io_crit_us_.store(0); io_crit_n_.store(0);
 #if defined(_WIN32)
-    if (base_ != nullptr && !unmapped_) UnmapViewOfFile((LPCVOID) base_);
+    if (base_ != nullptr && !unmapped_ && !UnmapViewOfFile((LPCVOID) base_)) storage_known_=false;
     unmapped_ = false;
     if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
     if (file_ != nullptr) CloseHandle((HANDLE) file_);
     mapping_ = nullptr;
     file_ = nullptr;
 #else
-    if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
+    if (base_ != nullptr && munmap((void*) base_, (size_t) mapped_bytes_)!=0) storage_known_=false;
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1;
 #endif
@@ -1259,6 +1261,39 @@ FileExpertSource::FileCacheStats FileExpertSource::file_cache_stats() {
     return stats;
 }
 
+std::map<std::string, RuntimeMemory> FileExpertSource::runtime_memory() {
+    std::map<std::string, RuntimeMemory> out;
+    auto& resident=out["resident_experts"];
+    resident.requested=resident.rounded=resident.logical=complement_bytes_;
+    resident.known=!complement_bytes_ || complement_ready_;
+    resident.pinned=pinned_bytes();
+    // A successfully registered device alias is not physical residency.
+    resident.mapped=complement_device_ ? resident.pinned : 0;
+    auto& views=out["expert_file_views"];
+    views.requested=views.rounded=views.mapped=mapped_view_bytes();
+    auto& exchange=out["resident_exchange"];
+    if (xstage_) {
+        exchange.requested=exchange.rounded=exchange.logical=(uint64_t)xstage_cap_ * xstage_blob_;
+        if (xstage_pinned_) exchange.pinned=exchange.requested;
+    }
+    std::lock_guard<std::mutex> lock(stage_mu_);
+    auto& cache=out["file_cache_target"];
+    cache.requested=cache.rounded=stage_allocated_bytes_;
+    cache.allowance=stage_cache_bytes_;
+    for (size_t i=0;i<stage_buf_.size();++i) if (stage_buf_[i]) {
+        if (stage_buf_[i].get_deleter().pinned) cache.pinned+=stage_capacity_[i];
+        if (!stage_busy_[i] && stage_key_[i]>=0 && n_expert_>0) {
+            const auto layer=(size_t)(stage_key_[i]/n_expert_);
+            if (layer<layer_blob_bytes_.size()) cache.logical+=layer_blob_bytes_[layer];
+            else cache.known=false;
+        }
+    }
+    // Pending fills are owned storage, but their contents have not been confirmed.
+    if (stage_pending_bytes_) cache.known=false;
+    if (!storage_known_) for (auto& [name,memory] : out) memory.known=false;
+    return out;
+}
+
 FileExpertSource::FetchStats FileExpertSource::fetch_stats() const {
     FetchStats stats;
     for (size_t i = 0; i < stats.values.size(); ++i)
@@ -1272,7 +1307,7 @@ FileExpertSource::FetchStats FileExpertSource::fetch_stats() const {
 #define STAGE_PIN_DEFAULT 0
 constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
 void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
-    if (pinned) (void) cudaFreeHost(p);
+    if (pinned) { if (cudaFreeHost(p)!=cudaSuccess && confirmed) *confirmed=false; }
     else delete[] p;
 }
 
@@ -1389,7 +1424,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
             const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
             if (want_pin && !pinned) (void) cudaGetLastError();
             uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) need];
-            buffer = std::unique_ptr<uint8_t[], StageBufFree>(raw, StageBufFree{pinned});
+            buffer = std::unique_ptr<uint8_t[], StageBufFree>(raw, StageBufFree{pinned,&storage_known_});
             if (pinned && !stage_pin_said_) {
                 stage_pin_said_ = true;
                 std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
@@ -2818,6 +2853,7 @@ bool FileExpertSource::pin_cache_complement(
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
+    cudaError_t pin_failure = cudaSuccess;
     bool paced = false;         ///< #1250: the pages are taken in steps and page-locked afterwards
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
@@ -2825,9 +2861,9 @@ bool FileExpertSource::pin_cache_complement(
     std::string note;
     auto release = [&]() {
         if (arena == nullptr) return;
-        if (pinned_ok) (void) cudaFreeHost(arena);
+        if (pinned_ok) { if (cudaFreeHost(arena)!=cudaSuccess) storage_known_=false; }
         else {
-            if (partial_pin > 0) (void) cudaHostUnregister(arena);
+            if (partial_pin > 0 && cudaHostUnregister(arena)!=cudaSuccess) storage_known_=false;
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
@@ -2889,9 +2925,11 @@ bool FileExpertSource::pin_cache_complement(
         if (pin && !paced) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
+            pin_failure=allocated;
             if (allocated == cudaSuccess) {
                 void* alias = nullptr;
                 const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
+                pin_failure=aliased;
                 if (aliased == cudaSuccess && alias != nullptr) {
                     device = (const uint8_t*) alias;
                     pinned_ok = true;
@@ -2911,7 +2949,10 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
         if (arena == nullptr) {
-            if (strict && !paced) { err="out_of_memory: strict resident pinning failed: "+note; return false; }
+            if (strict && !paced) {
+                err=native_error_message("strict resident pinning",std::string(pin_failure==cudaErrorMemoryAllocation ? "out_of_memory: " : "")+note);
+                return false;
+            }
             if (!note.empty()) {
                 std::fprintf(stderr, "FileExpertSource: %s; trying pageable memory\n", note.c_str());
                 log_complement_memory("before pageable allocation", bytes);
@@ -3240,7 +3281,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     for (const uint64_t b : layer_blob_bytes_) blob = std::max(blob, b);
     if (blob == 0 || n <= 0) { err = "FileExpertSource: no expert geometry for the exchange buffers"; return false; }
     if (xstage_ != nullptr) {
-        if (xstage_pinned_) (void) cudaFreeHost(xstage_);
+        if (xstage_pinned_) { if (cudaFreeHost(xstage_)!=cudaSuccess) storage_known_=false; }
         else std::free(xstage_);
         xstage_ = nullptr;
         xstage_cap_ = 0;
