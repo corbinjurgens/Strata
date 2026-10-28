@@ -9,6 +9,12 @@ Work through the steps in order. Tell the user what you are doing in plain words
 
 ## 0. Ground rules
 
+For a manager such as PAIR that approves exact settings before startup, use
+[PAIR integration](PAIR_INTEGRATION.md). Its opt-in `--print-launch-plan`,
+`--estimate-memory`, `--launch-plan` and `--check-install` interfaces keep
+planning/install checks separate from model loading. The guide includes a
+no-model first-use fixture; ordinary setup below remains available.
+
 - **Never expose the server without an API key.** Keep the default `--host 127.0.0.1`. Only if the user asks for
   access from other devices, use `--host 0.0.0.0` **together with** `--api-key <a long random secret>`, and give the
   user the key. Never put a tunnel or port forward in front of a server without a key.
@@ -152,7 +158,12 @@ The HTTP server answers once the model is loaded (30-90 s on later starts, a few
 curl http://127.0.0.1:8080/health
 ```
 
-It returns `{"status": "ok", "model": ..., "max_context": ..., "images": ..., "api_key": ..., "loaded": true, ...}`.
+It returns health information including `status`, `model`, `max_context`,
+`images`, `api_key` and `loaded`. `api_key` is a boolean, never the key value.
+For a lazy server, HTTP readiness can precede model loading; check
+`/v1/status.lifecycle` and its effective launch/build fields before dispatching
+work that requires the approved model. `/v1/models` lists the configured model
+and aliases even when unloaded.
 Then:
 
 ```
@@ -162,6 +173,12 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 With an API key, add `-H "Authorization: Bearer <key>"`. The server window prints a `ready: http://127.0.0.1:8080/v1`
 line when it is ready; the engine log is `strata-<model>.log` in the Strata folder.
+
+Managed launches can keep the key in an absolute `api_key_file` with user-only
+permissions. Credential precedence is CLI, `STRATA_API_KEY`, key file, then
+legacy inline config. Explicitly empty credentials refuse. The preparation
+helper creates a private one-key file; keep its contents out of logs/config
+examples. See [credential details](PAIR_INTEGRATION.md#credentials).
 
 ## 8. Connect the user's apps
 

@@ -636,6 +636,12 @@ per step, so the upper rows are noisy).
 
 ## Using it
 
+For managed approval, deterministic launch plans, exact saved replay, effective
+status/build identity, private key files and lifecycle contracts, see
+[PAIR integration](PAIR_INTEGRATION.md). Planned startup is opt-in and currently
+limited to generated single-GPU CUDA serial profiles; ordinary startup remains
+available. The guide includes a repository-owned first-use fixture without a model.
+
 The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or edit the run script).
 
 | API | Endpoint |
@@ -675,7 +681,10 @@ token, time between tokens and request duration (p50 / p95), the prompt cache an
 own panels (state, batch slots, rates, expert cache hit rate, GPU and RAM). Its first row uses only vLLM's names, so
 it also reads a vLLM server.
 
-`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+`/models` and `/v1/models` always list the configured model and aliases, with
+their context limit, input modalities and `status.value` (`unloaded`, `loading`
+or `loaded`), regardless of idle-unload settings. `/v1/status.lifecycle` also
+distinguishes `unloading` and `failed`. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
 `chat_template_caps` uses llama.cpp's field names. Strata checks them when loading the active template by rendering
 small requests; a rejected or omitted feature is `false`, and a template that fails a probe in any way only turns that
@@ -755,7 +764,10 @@ print(r.choices[0].message.content)
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
-  connection or pressing stop in your app really stops the model, so the next request starts at once.
+  connection or pressing stop sends cancellation. A slot is reused after native
+  acknowledgement or confirmed owned-engine exit. The five-second grace and
+  bounded shutdown fallback are described in [PAIR integration](PAIR_INTEGRATION.md#api-lifecycle-completion-and-failures);
+  native GPU preemption timing remains unverified.
 - **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a
   tool the request declared also when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
   (`{"name": ..., "arguments": ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line
@@ -1600,7 +1612,18 @@ default.
 `{"model":"<configured model>"}` and returning model status. They require the configured API key,
 `application/json`, and no foreign browser Origin. They return **409** while a request is active or queued,
 and **404** for an unknown model. Existing `/load` and `/unload` behavior is preserved. `/api/health` aliases
-`/health`; `/v1/status` exposes `loaded` and `auto_load`. The unloaded model remains discoverable.
+`/health`; `/v1/status` exposes `loaded`, `auto_load` and the detailed `lifecycle`.
+Controls are synchronous: HTTP 200 merges `status` (`loaded`, `unloaded`,
+`not loaded` or `unsupported`) with the current `/v1/status` object. Successful
+native unload confirms child exit; failed or uncertain cleanup returns 503.
+The first lazy chat waits for loading, with no promised Retry-After header.
+The configured model remains discoverable independently of idle-unload settings.
+Optional `max_queued_requests` limits waiting generation requests; a full application
+queue returns **429** with `error.code: "busy"`. Absent/null preserves legacy
+unbounded waiting; generated PAIR configs use 32. Current ordinary and planned
+native runtime snapshots expose applied scalar settings, logical shard holdings
+and memory components separately from saved startup verification and estimates.
+See [PAIR integration](PAIR_INTEGRATION.md) for typed errors, byte units and limits.
 
 Unloading and shutdown close the native engine's stdin after sending `QUIT`, allowing Windows' detached
 stdin reader to see EOF. Cleanup waits for process exit before releasing handles; if forced shutdown still
