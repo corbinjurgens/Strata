@@ -2185,9 +2185,10 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
+    if (const auto chunk = strata::prefill::owned_auto_chunk(o.no_prefill_borrow, !o.expert_profile.empty());
+        o.prefill_auto && chunk) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
-        o.prefill_chunk = 2048;
+        o.prefill_chunk = chunk;
     }
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};

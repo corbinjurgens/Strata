@@ -2369,10 +2369,10 @@ def config_environment(cfg: dict, inherited: dict) -> dict:
     return env
 
 
-def child_env(cfg: dict) -> dict:
+def child_env(cfg: dict, *, inherited: dict | None = None) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
-    env = dict(os.environ)
+    env = dict(os.environ if inherited is None else inherited)
     if hip_visible(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (hip_visible)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
@@ -2718,14 +2718,18 @@ def slot_filename_problem(name) -> str | None:
     return None
 
 
-def slot_save_dir(value, base: str | None = None) -> str:
-    """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
-    directory), created private to this user when missing.  ValueError for anything else."""
+def normalized_slot_save_dir(value, base: str | None = None) -> str:
+    """Normalize a session directory without creating it or opening the filesystem."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError("slot_save_path must be a directory path (a string)")
     if any(ord(c) < 32 for c in value):
         raise ValueError("slot_save_path must not contain control characters")
-    path = os.path.abspath(os.path.join(base, value) if base and not os.path.isabs(value) else value)
+    return os.path.abspath(os.path.join(base, value) if base and not os.path.isabs(value) else value)
+
+
+def slot_save_dir(value, base: str | None = None) -> str:
+    """Normalize a session directory and create it private to this user when missing."""
+    path = normalized_slot_save_dir(value, base)
     os.makedirs(path, mode=0o700, exist_ok=True)
     if not os.path.isdir(path):
         raise ValueError(f"slot_save_path {path} is not a directory")
@@ -2873,17 +2877,7 @@ class Service:
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
         ValueError for anything else."""
-        if aliases is None:
-            aliases = []
-        if isinstance(aliases, str):
-            aliases = aliases.split(",")
-        if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
-            raise ValueError(f"aliases={aliases!r}: expected a list of model names")
-        names = []
-        for x in (x.strip() for x in aliases):
-            if x and x != self.model and x not in names:
-                names.append(x)
-        self.aliases = names
+        self.aliases = model_aliases(aliases, self.model)
 
     def model_names(self) -> list[str]:
         return [self.model, *self.aliases]
@@ -5654,7 +5648,22 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
-def sampling_defaults_from_config(cfg: dict) -> dict:
+def model_aliases(aliases, model: str) -> list[str]:
+    """Validate and normalize the configured aliases without constructing a service."""
+    if aliases is None:
+        aliases = []
+    if isinstance(aliases, str):
+        aliases = aliases.split(",")
+    if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
+        raise ValueError(f"aliases={aliases!r}: expected a list of model names")
+    names = []
+    for x in (x.strip() for x in aliases):
+        if x and x != model and x not in names:
+            names.append(x)
+    return names
+
+
+def sampling_defaults_from_config(cfg: dict, *, warn: bool = True) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
     presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
@@ -5707,7 +5716,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
-        else:
+        elif warn:
             print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
@@ -5717,6 +5726,11 @@ def main() -> int:
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
+    planning = ap.add_mutually_exclusive_group()
+    planning.add_argument("--print-launch-plan", action="store_true",
+                          help="print a resolved read-only launch plan as JSON and exit")
+    planning.add_argument("--estimate-memory", action="store_true",
+                          help="print the launch plan's qualified memory estimate as JSON and exit")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -5757,7 +5771,19 @@ def main() -> int:
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    planning_options = [option for action in planning._group_actions for option in action.option_strings]
+    if any(len(value) > 2 and value.startswith("--") and any(option.startswith(value.split("=", 1)[0])
+           for option in planning_options) for value in sys.argv[1:]):
+        def planning_error(_message):
+            # argparse errors may repeat arbitrary supplied values, including a
+            # credential accidentally supplied as another option's argument.
+            print('{"error":{"code":"invalid_launch_plan","message":"Invalid planning command arguments."}}')
+            raise SystemExit(2)
+        ap.error = planning_error
     a = ap.parse_args()
+    if a.print_launch_plan or a.estimate_memory:
+        from serve.launch_plan import planning_main
+        return planning_main(a)
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     diagnostic = cfg.get("launch_memory_metrics", False)
     if type(diagnostic) is not bool:

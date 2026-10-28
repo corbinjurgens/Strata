@@ -576,7 +576,8 @@ def memory_environment_removals(cfg: dict) -> set[str]:
     return removed
 
 
-def refreshed_config(cfg: dict) -> dict:
+def refreshed_config(cfg: dict, *, sample: tuple[dict, dict] | None = None,
+                     inherited_env: dict | None = None) -> dict:
     """Refresh only policy-owned values that the user has not changed in the saved configuration."""
     cfg = copy.deepcopy(cfg)
     policy = cfg.get("memory_policy")
@@ -589,7 +590,7 @@ def refreshed_config(cfg: dict) -> dict:
     explicit = copy.deepcopy(policy.get("overrides", {}))
     explicit.setdefault("args", {})
     explicit["env"] = memory_environment(explicit.get("env", {}))
-    memory_environment(os.environ)  # Refuse ambiguous inherited aliases before any resource sampler.
+    memory_environment(os.environ if inherited_env is None else inherited_env)
     context = flag_value(cfg["args"], "--max-context")
     if context is None or not re.fullmatch(r"[0-9]+", str(context).strip()) or int(context) <= 0:
         raise ValueError("Automatic memory policy requires an explicit positive --max-context capacity; "
@@ -634,7 +635,8 @@ def refreshed_config(cfg: dict) -> dict:
         elif not same_environment_value(env.get(key), policy["generated_env"].get(key)):
             explicit["env"][key] = cfg.get("env", {}).get(key)
     validate_memory_overrides(explicit)
-    gpu, memory = detected_gpu(cfg.get("gpu")), dict(detected_memory())
+    gpu, memory = sample if sample is not None else (detected_gpu(cfg.get("gpu")), detected_memory())
+    memory = dict(memory)
     cfg["gpu"] = gpu["index"]
     plan = memory_plan(ram=memory.pop("ram_gib"), vram=gpu["vram_gb"],
                        context=int(context), overrides=explicit, **memory)

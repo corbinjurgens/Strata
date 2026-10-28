@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, StrataEngine, engine_args, serve
+from serve.server import ByteTokenizer, EngineDied, Service, StrataEngine, child_env, engine_args, serve
 from serve.test_lifecycle import ResidentEngine
 
 
@@ -33,6 +33,21 @@ class VramEngine(ResidentEngine):
 
 
 class EngineCommand(unittest.TestCase):
+    def test_planning_child_environment_uses_explicit_parent_without_changing_defaults(self):
+        cfg = {"args": [], "gpu": 3, "env": {"STRATA_FILE_CACHE_MIB": "8"}}
+        parent = {"PATH": "frozen-search-path", "STRATA_API_KEY": "synthetic-server-key", "KEEP": "yes"}
+        with mock.patch.dict("os.environ", {"PATH": "ordinary-search-path", "STRATA_API_KEY": "other-key"}, clear=True):
+            planned = child_env(cfg, inherited=parent)
+            ordinary = child_env(cfg)
+        self.assertEqual(planned["PATH"], "frozen-search-path")
+        self.assertEqual(ordinary["PATH"], "ordinary-search-path")
+        self.assertEqual(planned["CUDA_VISIBLE_DEVICES"], "3")
+        self.assertEqual(planned["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(planned["STRATA_FILE_CACHE_MIB"], "8")
+        self.assertNotIn("STRATA_API_KEY", planned)
+        self.assertNotIn("STRATA_API_KEY", ordinary)
+        self.assertEqual(parent["STRATA_API_KEY"], "synthetic-server-key")
+
     def engine(self, replies):
         e = StrataEngine("missing-executable", [], lazy=True)
         e.proc = mock.Mock()

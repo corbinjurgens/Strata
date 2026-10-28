@@ -24,6 +24,25 @@ def value(args, flag):
 
 
 class MemoryProfiles(unittest.TestCase):
+    def test_explicit_planning_snapshot_uses_shared_policy_without_sampling_or_reporting(self):
+        generated = prep.memory_plan(64, 6, 8192, available_gib=48, commit_available_gib=48)
+        cfg = {"gpu": 0, "args": list(generated["args"]), "env": dict(generated["env"]),
+               "memory_policy": {"version": 1, "generated_args": list(generated["args"]),
+                                 "generated_env": dict(generated["env"]), "overrides": {}}}
+        before = json.dumps(cfg)
+        sample = ({"index": 0, "vram_gb": 6}, {"ram_gib": 64, "available_gib": 40,
+                   "commit_available_gib": 40, "windows_commit": True})
+        sample_before = json.dumps(sample)
+        with patch.object(prep, "detected_memory") as memory, patch.object(prep, "detected_gpu") as gpu, \
+                patch.object(prep, "report_memory") as report, patch.object(prep, "check_ready") as ready:
+            resolved = prep.refreshed_config(cfg, sample=sample, inherited_env={})
+        for seam in (memory, gpu, report, ready):
+            seam.assert_not_called()
+        self.assertEqual(value(resolved["args"], "--resident-budget-gib"), "16")
+        self.assertEqual(resolved["env"]["STRATA_FILE_CACHE_MIB"], "8128")
+        self.assertEqual(json.dumps(cfg), before)
+        self.assertEqual(json.dumps(sample), sample_before)
+
     def test_windows_plan_uses_managed_alias_values_without_changing_raw_types(self):
         for key, raw in (("strata_resident_headroom_gib", "8"),
                          ("Strata_Resident_Headroom_Gib", 8),

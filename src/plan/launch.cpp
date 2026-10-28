@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #if defined(_WIN32)
@@ -128,6 +129,17 @@ uint64_t env_number(const char* key, uint64_t fallback, uint64_t unit = 1) {
     uint64_t n;
     if (!number(v, n)) throw std::invalid_argument(std::string("invalid ") + key);
     return launch_mul(n, unit);
+}
+uint64_t gib_bytes(const std::string& text, bool positive) {
+    // Keep the ordinary resident owner's double conversion and sub-byte behavior.
+    // Unlike atof, planned transport must reject partial parses, nonfinite and overflowing inputs.
+    if (text.empty() || text.front()=='-' || text.find_first_not_of("0123456789.eE+-")!=std::string::npos)
+        throw std::invalid_argument("invalid GiB setting");
+    char* end=nullptr;
+    const double gib=std::strtod(text.c_str(),&end);
+    if (end!=text.c_str()+text.size() || !std::isfinite(gib) || gib<0 || (positive && !(gib>0)) || gib>1024)
+        throw std::invalid_argument("invalid or unsupported GiB setting");
+    return core::detail::resident_gib_bytes(gib,positive);
 }
 void reject_unpriced_modes() {
     // These change allocation geometry or add owners outside this bounded profile.
@@ -352,15 +364,17 @@ bool read_launch_stdin(std::string& payload, std::string& error) {
 static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resources, LaunchResolution& result,
                            const LaunchSettings* approved, std::string& error) {
     try {
+        if (approved && r.prefill_auto) throw std::invalid_argument("strict launch requires resolved numeric prefill");
+        const uint64_t chunk=r.prefill_auto ? prefill::owned_auto_chunk(r.no_prefill_borrow,!r.profile.empty()) : r.prefill;
         if (!resources.cuda || resources.devices != 1) throw std::invalid_argument("planned metadata supports one CUDA device only");
         if (r.shards.size() > core::ownership_shard_limit) throw std::invalid_argument("planned ownership shard bound exceeded");
         if (!resources.vram_free || !resources.ram_available || !resources.commit_available)
             throw std::invalid_argument("required resource snapshot is unavailable");
-        if (!r.context || r.context > 1048576 || !r.prefill || r.prefill > 32768 || r.prefill > r.context || r.spec != 2 ||
+        if (!r.context || r.context > 1048576 || !chunk || chunk > 32768 || chunk > r.context || r.spec != 2 ||
             r.kv > 3 || !replayable_kv_residency(r.context, r.kv_resident) ||
             r.expert_cache < -1 || !r.no_prefill_borrow || !r.resident_budget || r.resident_budget > (1ull << 40) ||
             r.file_cache > (1ull << 40) || r.host_headroom > (1ull << 40) || r.vram_reserve > (1ull << 40) || r.shards.empty())
-            throw std::invalid_argument("unsupported launch request (spec2, explicit prefill, owned buffers and resident budget required)");
+            throw std::invalid_argument("unsupported launch request (spec2, resolved prefill, owned buffers and resident budget required)");
         reject_unpriced_modes();
         if (approved && !validate_launch_settings(*approved, error)) return false;
         bool compact;
@@ -430,7 +444,7 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         if (ranked.empty() || unique.size() != ranked.size()) throw std::invalid_argument("empty or duplicate expert ranking");
         LaunchResolution out;
         auto& s = out.settings;
-        s.context=r.context; s.prefill=r.prefill; s.spec=r.spec; s.kv=r.kv; s.kv_resident=r.kv_resident;
+        s.context=r.context; s.prefill=chunk; s.spec=r.spec; s.kv=r.kv; s.kv_resident=r.kv_resident;
         s.auto_cache=r.expert_cache == -1; s.per_layer=r.per_layer; s.resident_budget=r.resident_budget;
         s.file_cache=r.file_cache; s.host_headroom=r.host_headroom; s.vram_reserve=r.vram_reserve;
         s.cache_request=r.expert_cache < 0 ? 0 : r.expert_cache;
@@ -442,7 +456,7 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         s.experts=g.n_expert; s.top_k=k; s.vocab=head->shape[1]; s.max_blob=layout.max_blob;
         for (int l=0; l<48; ++l) s.layer_blobs.push_back(layout.blob_bytes(l));
         core::SessionSizing kv; kv.kv=(core::SessionSizing::Kv) r.kv; kv.resident_cells=(int64_t) r.kv_resident;
-        auto pf = prefill::Prefill::sizing_inputs(g, (int64_t) r.context, (int64_t) r.prefill, kv);
+        auto pf = prefill::Prefill::sizing_inputs(g, (int64_t) r.context, (int64_t) chunk, kv);
         prefill::Prefill::resolve_stager(pf,!std::filesystem::exists(r.pack+"/experts.bin"));
         s.stager_threads=pf.stager_threads; s.stager_ring=pf.stager_ring; s.stager_batch=pf.stager_batch;
         s.ring=pf.ring; s.workspace=pf.workspace; s.weight_scratch=pf.weight_scratch; s.common=pf.common; s.region=pf.region;
@@ -456,7 +470,7 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         out.vram["session_including_resident_kv"] = launch_align(core::session_bytes_for(g,r.context,k,kv),2*MiB);
         out.vram["verifier"] = launch_align(core::Verifier::workspace_bytes(g,r.context,k,2,s.vocab,s.max_blob,mapped),2*MiB);
         out.vram["prefill_scratch_ring_stage"] = prefill::Prefill::bytes_needed_for(pf,true);
-        out.vram["prefill_token_ids"] = launch_align(launch_mul(r.prefill,4),2*MiB);
+        out.vram["prefill_token_ids"] = launch_align(launch_mul(chunk,4),2*MiB);
         out.vram["prefill_kv_identity"] = pf.kv_runs.empty() ? 0 : launch_align(launch_align(r.context,4),2*MiB);
         out.vram["cache_tables"] = 4*MiB; // residency and slot-pointer allocations, rounded separately
         out.vram["decode_hit_scratch"] = launch_align(kernels::moe_hit_grouped_scratch_bytes(10,2560,640),2*MiB) + 10*MiB;
@@ -558,7 +572,8 @@ bool parse_launch_request(int argc, char** argv, LaunchRequest& r, LaunchResourc
         resources.cuda=false;
 #endif
         r.file_cache=env_number("STRATA_FILE_CACHE_MIB",0,MiB);
-        r.host_headroom=env_number("STRATA_RESIDENT_HEADROOM_GIB",4*GiB,GiB);
+        const char* headroom=std::getenv("STRATA_RESIDENT_HEADROOM_GIB");
+        r.host_headroom=headroom ? gib_bytes(headroom,false) : 4*GiB;
         std::set<std::string> seen;
         for (int i=1;i<argc;++i) {
             const std::string key=argv[i];
@@ -578,6 +593,11 @@ bool parse_launch_request(int argc, char** argv, LaunchRequest& r, LaunchResourc
                 else if (value=="k8v4") r.kv=3; else throw std::invalid_argument("invalid KV format"); continue;
             }
             if (key=="--expert-cache" && value=="auto") { r.expert_cache=-1; continue; }
+            if (key=="--prefill" && (value=="auto" || value=="auto:8192" || value=="auto:16384" || value=="auto:32768")) {
+                if (strict) throw std::invalid_argument("strict launch requires resolved numeric prefill");
+                r.prefill_auto=true; continue;
+            }
+            if (key=="--resident-budget-gib") { r.resident_budget=gib_bytes(value,true); continue; }
             uint64_t n;
             if (!number(value,n)) throw std::invalid_argument("invalid metadata number");
             if (key=="--max-context") r.context=n;
@@ -585,7 +605,6 @@ bool parse_launch_request(int argc, char** argv, LaunchRequest& r, LaunchResourc
             else if (key=="--spec") r.spec=n;
             else if (key=="--kv-resident") r.kv_resident=n;
             else if (key=="--expert-cache") { if (n>INT64_MAX) throw std::invalid_argument("cache count overflow"); r.expert_cache=(int64_t)n; }
-            else if (key=="--resident-budget-gib") r.resident_budget=launch_mul(n,GiB);
             else if (key=="--vram-reserve-mib") { r.vram_reserve=launch_mul(n,MiB); r.reserve_given=true; }
             else if (key=="--plan-vram-free-bytes") resources.vram_free=n;
             else if (key=="--plan-ram-available-bytes") resources.ram_available=n;

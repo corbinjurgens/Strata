@@ -27,6 +27,11 @@ namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
 
+/// Ordinary owned-buffer auto selection, before allocation. Zero leaves borrowed selection to its owner.
+inline constexpr int64_t owned_auto_chunk(bool no_borrow, bool has_profile) {
+    return no_borrow || !has_profile ? 2048 : 0;
+}
+
 struct PrefillStats {
     int64_t tokens = 0;
     int64_t chunks = 0;

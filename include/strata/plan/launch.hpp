@@ -25,7 +25,7 @@ struct LaunchRequest {
     uint64_t context = 0, prefill = 0, spec = 2, kv = 1, kv_resident = 0;
     int64_t expert_cache = -1;
     uint64_t resident_budget = 0, file_cache = 0, host_headroom = 0, vram_reserve = 700ull << 20;
-    bool no_prefill_borrow = false, reserve_given = false, per_layer = false;
+    bool no_prefill_borrow = false, reserve_given = false, per_layer = false, prefill_auto = false;
 };
 
 struct LaunchSlot {

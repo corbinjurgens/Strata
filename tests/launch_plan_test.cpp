@@ -142,9 +142,15 @@ void fixture(const fs::path& root, bool gguf_experts = false, bool wrong_offset 
     for (uint16_t e=0;e<512;++e) for (uint16_t l=0;l<48;++l) { put(profile,l); put(profile,e); }
 }
 std::string refusal(const LaunchRequest& r, const LaunchResources& resources, const char* label) {
-    LaunchResolution untouched; untouched.payload="sentinel"; std::string error;
+    LaunchResolution untouched; untouched.payload="sentinel"; untouched.settings.context=123;
+    untouched.vram={{"sentinel",456}}; untouched.ram={{"sentinel",789}};
+    untouched.vram_required=1; untouched.ram_required=2; untouched.commit_required=3;
+    const auto before=untouched; std::string error;
     require(!resolve_launch(r,resources,untouched,error),label);
-    require(untouched.payload=="sentinel" && !error.empty(),"failed resolution does not publish a plan");
+    require(untouched.payload==before.payload && untouched.settings==before.settings && untouched.vram==before.vram &&
+            untouched.ram==before.ram && untouched.vram_required==before.vram_required &&
+            untouched.ram_required==before.ram_required && untouched.commit_required==before.commit_required &&
+            untouched.unknown_costs==before.unknown_costs && !error.empty(),"failed resolution preserves complete unpublished state");
     return error;
 }
 void environment(const char* name, const char* value) {
@@ -169,13 +175,18 @@ void consume_slots(const LaunchSettings& saved) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc>1 && std::string(argv[1])=="--consume") {
+        if (argc>1 && (std::string(argv[1])=="--consume" || std::string(argv[1])=="--consume-ample")) {
             std::string error;
             LaunchSettings saved;
+            const bool ample=std::string(argv[1])=="--consume-ample";
+            const auto observe_ample=[](LaunchResources& resources,std::string&) {
+                resources={24ull<<30,48ull<<30,96ull<<30,1,true}; return true;
+            };
             const auto observe=[](LaunchResources& resources,std::string&) {
                 resources={6ull<<30,48ull<<30,48ull<<30,1,true}; return true;
             };
-            require(consume_strict_launch(argc-1,argv+1,saved,error,observe),error.c_str());
+            const bool consumed=consume_strict_launch(argc-1,argv+1,saved,error,ample ? +observe_ample : +observe);
+            require(consumed,error.c_str());
             consume_slots(saved);
             core::ModelGeometry geometry; geometry.n_expert=saved.experts;
             core::SessionSizing kv; kv.kv=(core::SessionSizing::Kv)saved.kv; kv.resident_cells=saved.kv_resident;
@@ -218,6 +229,89 @@ int main(int argc, char** argv) {
         require(a.ram.at("streamed_kv")==0,"8K fully resident KV");
         require(a.settings.slots.size()>1 && a.settings.slots[0].bytes!=a.settings.slots[1].bytes,"variable aligned ordered slots");
         require(resolve_launch(r,resources,b,error) && a.payload==b.payload,"fixed inputs resolve deterministically");
+        require(prefill::owned_auto_chunk(true,true)==2048 && prefill::owned_auto_chunk(true,false)==2048 &&
+                prefill::owned_auto_chunk(false,false)==2048 && prefill::owned_auto_chunk(false,true)==0,
+                "owned auto keeps ordinary selection and leaves borrowing to its existing owner");
+        auto automatic=r; automatic.prefill=0; automatic.prefill_auto=true;
+        auto ample=resources; ample.vram_free=24ull<<30; ample.commit_available=96ull<<30;
+        LaunchResolution auto_plan,auto_repeat;
+        require(resolve_launch(automatic,ample,auto_plan,error),"owned auto resolves with sufficient synthetic VRAM");
+        require(auto_plan.settings.prefill==2048 && auto_plan.settings.no_prefill_borrow==1,
+                "owned auto is the ordinary 2048 chunk without borrowing");
+        require(resolve_launch(automatic,ample,auto_repeat,error) && auto_plan.payload==auto_repeat.payload,
+                "automatic resolution repeats exact payload deterministically");
+        require(!admit_launch(automatic,ample,auto_plan.settings,error),"strict admission refuses unresolved prefill");
+        automatic.prefill_auto=false; automatic.prefill=2048;
+        require(admit_launch(automatic,ample,auto_plan.settings,error),"numeric replay consumes saved auto chunk and layout");
+        auto auto_loss=ample; auto_loss.vram_free=auto_plan.settings.vram_required-1;
+        const auto saved_auto=auto_plan.settings;
+        require(!admit_launch(automatic,auto_loss,auto_plan.settings,error) && auto_plan.settings==saved_auto,
+                "resource loss refuses without shrinking approved automatic settings");
+        automatic.prefill_auto=true; automatic.no_prefill_borrow=false;
+        refusal(automatic,ample,"automatic borrowed search remains unsupported");
+        automatic.no_prefill_borrow=true;
+        auto auto_short=resources; auto_short.vram_free=1;
+        refusal(automatic,auto_short,"owned auto refuses below its priced requirement without reserve or chunk reduction");
+        const char* headroom_env=std::getenv("STRATA_RESIDENT_HEADROOM_GIB");
+        const bool had_headroom=headroom_env!=nullptr;
+        const std::string original_headroom=headroom_env ? headroom_env : "";
+        auto parse=[&](const std::string& budget,const std::string& chunk,bool strict,LaunchRequest& parsed) {
+            std::vector<std::string> words={"strata","--pack",r.pack,"--native",r.shards[0],"--expert-profile",r.profile,
+                "--max-context","8192","--prefill",chunk,"--spec","2","--expert-cache","97",
+                "--resident-budget-gib",budget,"--no-prefill-borrow","--suffix-draft","0","--lookup-chain","0"};
+            if (strict) { words.push_back("--strict-launch-stdin"); words.push_back("--serve"); }
+            std::vector<char*> argv; for (auto& word:words) argv.push_back(word.data());
+            LaunchResources snapshot;
+            return parse_launch_request((int)argv.size(),argv.data(),parsed,snapshot,strict,error);
+        };
+        environment("STRATA_RESIDENT_HEADROOM_GIB","8.25");
+        LaunchRequest fractional;
+        require(parse("0.25","64",false,fractional),"fractional resident budget and headroom parse");
+        require(fractional.resident_budget==268435456 && fractional.host_headroom==8858370048ull,
+                "fractional transport preserves exact ordinary resident byte semantics");
+        LaunchResolution fractional_plan;
+        require(resolve_launch(fractional,resources,fractional_plan,error),"fractional request resolves");
+        require(fractional_plan.settings.resident_budget==268435456 && fractional_plan.settings.host_headroom==8858370048ull,
+                "fractional bytes persist in native schema2");
+        require(admit_launch(fractional,resources,fractional_plan.settings,error),"fractional numeric request replays exactly");
+        LaunchRequest fractional_strict;
+        require(parse("0.25","64",true,fractional_strict) &&
+                admit_launch(fractional_strict,resources,fractional_plan.settings,error),
+                "strict numeric argv parses the same fractional bytes without another selection");
+        for (const char* value : {"0.0000000001","2.5e-1","+0.25",".25","00.25"}) {
+            LaunchRequest tiny;
+            require(parse(value,"64",false,tiny),"finite decimal transport follows ordinary double semantics");
+            require(tiny.resident_budget==(std::string(value)=="0.0000000001" ? 1 : 268435456),
+                    "sub-byte budget remains positive and decimal spellings retain exact quarter GiB");
+        }
+        for (const char* value : {"auto","auto:8192","auto:16384","auto:32768"}) {
+            LaunchRequest parsed;
+            require(parse("0.25",value,false,parsed) && parsed.prefill_auto,"supported owned automatic forms reach native selection");
+            require(!parse("0.25",value,true,parsed),"strict argv refuses every unresolved automatic form");
+        }
+        LaunchRequest empty_budget;
+        require(!parse("","64",false,empty_budget),"empty resident budget refuses");
+        // _putenv_s removes an empty value on Windows, so nonempty malformed values exercise this fixture's environment seam.
+        for (const char* value : {"nan", "inf", "-0", "-0.25", "1e999", "1024.0001", "0x1p0", "1x", " 1", "1 ", "1..2"}) {
+            LaunchRequest invalid;
+            require(!parse(value,"64",false,invalid),"malformed nonfinite negative overflowing budget refuses");
+            environment("STRATA_RESIDENT_HEADROOM_GIB",value);
+            require(!parse("0.25","64",false,invalid),"malformed nonfinite negative overflowing headroom refuses");
+            environment("STRATA_RESIDENT_HEADROOM_GIB","8.25");
+        }
+        for (const char* value : {"0","0.0","0e3"}) {
+            LaunchRequest invalid;
+            require(!parse(value,"64",false,invalid),"zero resident budget refuses");
+        }
+        for (const char* value : {"auto:","auto:bad","auto:65536","auto:0","064","-1"}) {
+            LaunchRequest invalid;
+            require(!parse("0.25",value,false,invalid),"unsupported or malformed prefill refuses");
+        }
+        environment("STRATA_RESIDENT_HEADROOM_GIB",nullptr);
+        LaunchRequest defaults;
+        require(parse("22","64",true,defaults) && defaults.host_headroom==(4ull<<30) && defaults.vram_reserve==(700ull<<20),
+                "default headroom and reserve remain unchanged");
+        environment("STRATA_RESIDENT_HEADROOM_GIB",had_headroom ? original_headroom.c_str() : nullptr);
         auto too_many_shards = r;
         too_many_shards.shards.assign(core::ownership_shard_limit + 1, r.shards.front());
         require(refusal(too_many_shards,resources,"ownership shard bound refuses before reading files").find("shard bound")!=std::string::npos,
