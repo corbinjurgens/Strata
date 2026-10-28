@@ -46,7 +46,7 @@ public:
     ~NativeEmbed();
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
-    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err);
+    bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err, bool strict = false);
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.

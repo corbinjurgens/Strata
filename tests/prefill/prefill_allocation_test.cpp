@@ -531,6 +531,64 @@ void attention_bounds(int64_t queries, bool q4) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc==2 && std::strcmp(argv[1],"--strict-pinning-refusal")==0) {
+        try {
+            const char* fault=std::getenv("STRATA_TEST_PAGEABLE");
+            require(fault && std::strcmp(fault,"1")==0,"pinning refusal selector requires existing STRATA_TEST_PAGEABLE=1 fault");
+            strata::core::ModelGeometry g;
+            strata::core::WeightTable wt;
+            strata::core::QsaState q; q.max_cells=8192; q.n_pages=2048; q.kv_int8=true;
+            strata::core::SessionState ss; ss.qsa_states=&q; ss.max_cells=8192;
+            std::string error;
+            const auto absent=std::filesystem::temp_directory_path()/"strata-prefill-strict-no-pack";
+            require(!std::filesystem::exists(absent),"strict fixture absent pack exists");
+            require(k::cpu::expert_layout_load(absent.string(),g.n_layers,g.n_expert,error),error);
+            auto approved=pf::Prefill::sizing_inputs(g,8192,64,{strata::core::SessionSizing::Kv::Int8,0,false});
+            pf::Prefill::resolve_stager(approved,false);
+            pf::Prefill prefill;
+            require(!prefill.init(wt,g,ss,nullptr,nullptr,nullptr,64,nullptr,error,nullptr,0,false,0,&approved),
+                    "actual strict init accepted forced pageable fallback");
+            require(error=="invalid_launch_plan: strict prefill requires pinned host buffers","actual strict init did not report pinning refusal");
+            std::puts("PASS actual prefill strict pinning refusal checks=5; before allocations/workers");
+            return 0;
+        } catch (const std::exception& e) { std::fprintf(stderr,"FAIL actual strict pinning refusal: %s\n",e.what()); return 1; }
+    }
+    if (argc==2 && std::strcmp(argv[1],"--strict-contract")==0) {
+        try {
+            pf::Prefill::Sizing expected;
+            expected.chunk=64; expected.ring=8; expected.workspace=32ull<<20;
+            expected.weight_scratch=8ull<<20; expected.common=16ull<<20; expected.region=32ull<<20;
+            expected.max_blob=1048576; expected.experts=512;
+            expected.stager_threads=32; expected.stager_ring=128; expected.stager_batch=1;
+            expected.kv_runs={37748736,37748736};
+            std::string error;
+            require(pf::Prefill::check_strict_sizing(expected,expected,false,false,error),"exact strict prefill refused");
+            require(!pf::Prefill::check_strict_sizing(expected,expected,true,false,error),"strict accepted borrowing");
+            require(!pf::Prefill::check_strict_sizing(expected,expected,false,true,error),"strict accepted shared stage");
+            int checks=3;
+            for (int change=0;change<14;++change) {
+                auto actual=expected;
+                if (change==0) actual.chunk=32;
+                if (change==1) actual.chunk=1024;
+                if (change==2) actual.ring=16;
+                if (change==3) actual.workspace=8ull<<20;
+                if (change==4) actual.weight_scratch+=256;
+                if (change==5) actual.common+=256;
+                if (change==6) actual.region+=256;
+                if (change==7) actual.mmq=!actual.mmq;
+                if (change==8) actual.stage_own=true;
+                if (change==9) actual.kv_runs[0]+=256;
+                if (change==10) actual.reserve_bo=!actual.reserve_bo;
+                if (change==11) actual.stager_threads=4;
+                if (change==12) actual.stager_ring=16;
+                if (change==13) actual.stager_batch=2;
+                require(!pf::Prefill::check_strict_sizing(expected,actual,false,false,error),"strict changed layout accepted");
+                ++checks;
+            }
+            std::printf("PASS prefill strict allocation contract checks=%d\n",checks);
+            return 0;
+        } catch (const std::exception& e) { std::fprintf(stderr,"FAIL strict allocation contract: %s\n",e.what()); return 1; }
+    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {

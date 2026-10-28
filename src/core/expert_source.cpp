@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/plan/launch.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -120,6 +121,25 @@ uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t c
     const uint64_t margin = 256ull << 20;
     return room > margin ? room - margin : 0;
 }
+bool admit_exact_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom,
+                                 std::string& error) {
+    if (physical>=headroom && commit>=headroom &&
+        clamp_resident_budget(requested,physical,commit,headroom)==requested) return true;
+    error="insufficient_resources: strict host target would be clamped"; return false;
+}
+bool admit_exact_pinning(uint64_t bytes, uint64_t pinned_bytes, std::string& error) {
+    if (bytes==pinned_bytes) return true;
+    error="out_of_memory: strict arena is not fully pinned"; return false;
+}
+FileCacheTarget file_cache_target(uint64_t requested, bool compact, bool staged, uint64_t blobs,
+                                  uint64_t max_blob, uint64_t expert_bytes) {
+    FileCacheTarget target;
+    if (!staged || !max_blob) return target;
+    target.slots=std::min(blobs,requested/max_blob);
+    target.compact=compact && requested>0;
+    target.bytes=target.compact ? std::min(requested,expert_bytes) : target.slots*max_blob;
+    return target;
+}
 
 bool pin_depends_on_reclaim(uint64_t free_now, uint64_t bytes, uint64_t reserve) {
     return bytes > 0 && free_now < bytes + reserve;
@@ -215,6 +235,22 @@ bool make_cache_complement_plan(
         return false;
     }
     return true;
+}
+
+void rank_cache_complement(std::vector<uint64_t>& offsets, const std::vector<uint64_t>& layer_blob_bytes,
+                            int64_t n_expert, const std::vector<std::pair<int32_t,int32_t>>* rank,
+                            uint64_t budget, uint64_t& bytes, int64_t& held) {
+    std::vector<uint64_t> chosen(offsets.size(),kNoCacheComplement);
+    bytes=0; held=0;
+    if (rank) for (const auto& pr:*rank) {
+        if (pr.first<0 || pr.second<0 || (size_t)pr.first>=layer_blob_bytes.size() || pr.second>=n_expert) continue;
+        const size_t i=(size_t)pr.first*(size_t)n_expert+(size_t)pr.second;
+        if (i>=offsets.size() || offsets[i]==kNoCacheComplement || chosen[i]!=kNoCacheComplement) continue;
+        const auto b=layer_blob_bytes[(size_t)pr.first];
+        if (b>budget-bytes) continue;
+        chosen[i]=bytes; bytes+=b; ++held;
+    }
+    offsets.swap(chosen);
 }
 
 const uint8_t* cache_complement_blob_or_fallback(
@@ -1184,13 +1220,34 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
 
 uint64_t FileExpertSource::set_file_cache_bytes(uint64_t bytes, bool compact, uint64_t headroom) {
     std::lock_guard<std::mutex> lk(stage_mu_);
-    stage_cache_slots_ = staged() && stage_blob_ > 0
-        ? (size_t) std::min<uint64_t>((uint64_t) blobs_, bytes / stage_blob_) : 0;
-    stage_compact_ = compact && bytes > 0 && staged() && stage_blob_ > 0;
-    stage_cache_bytes_ = stage_compact_ ? std::min(bytes, expert_bytes())
-                                      : (uint64_t) stage_cache_slots_ * stage_blob_;
+    const auto target=detail::file_cache_target(bytes,compact,staged(),blobs_,stage_blob_,expert_bytes());
+    stage_cache_slots_=target.slots; stage_compact_=target.compact; stage_cache_bytes_=target.bytes;
     stage_headroom_ = headroom;
     return stage_cache_bytes_;
+}
+
+bool FileExpertSource::set_file_cache_exact(uint64_t requested, bool compact, uint64_t headroom,
+                                           uint64_t approved, std::string& error) {
+    detail::HostMemory mem;
+    if (!detail::host_available_memory(mem)) { error="insufficient_resources: file cache memory query failed"; return false; }
+    if (!detail::admit_exact_resident_budget(0,mem.available,mem.commit,headroom,error)) return false;
+    const auto charged=file_cache_stats().allocated_bytes;
+    const auto add=[&](uint64_t b) { return b>UINT64_MAX-charged ? UINT64_MAX : b+charged; };
+    if (!detail::admit_exact_resident_budget(requested,add(mem.available),add(mem.commit),headroom,error)) return false;
+    if (set_file_cache_bytes(requested,compact,headroom)!=approved) {
+        error="invalid_launch_plan: file cache target differs from approved native target"; return false;
+    }
+    return true;
+}
+
+std::vector<uint64_t> FileExpertSource::resident_order() const {
+    std::vector<std::pair<uint64_t,uint64_t>> ordered;
+    for (size_t i=0;i<complement_offsets_.size();++i)
+        if (complement_offsets_[i]!=kNoComplement) ordered.emplace_back(complement_offsets_[i],i);
+    std::sort(ordered.begin(),ordered.end());
+    std::vector<uint64_t> result;
+    for (auto [offset,index]:ordered) result.push_back(index);
+    return result;
 }
 
 FileExpertSource::FileCacheStats FileExpertSource::file_cache_stats() {
@@ -2603,7 +2660,8 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    const plan::LaunchSettings* strict) {
     err.clear();
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
@@ -2670,6 +2728,7 @@ bool FileExpertSource::pin_cache_complement(
         const uint64_t available = std::min(physical, budget_commit);
         const char* limit = budget_commit < physical ? "commit" : "RAM";
         const uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
+        if (strict && !detail::admit_exact_resident_budget(budget_bytes,physical,budget_commit,headroom_bytes,err)) return false;
         if (budget_bytes > clamped) {
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
@@ -2686,20 +2745,9 @@ bool FileExpertSource::pin_cache_complement(
                              (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
             budget_bytes = clamped;
         }
-        std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
-        if (rank != nullptr)
-            for (const auto& pr : *rank) {
-                if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
-                const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
-                if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) continue;
-                ranked[i] = at;
-                at += b;
-                ++held;
-            }
+        detail::rank_cache_complement(offsets,layer_blob_bytes_,n_expert_,rank,budget_bytes,at,held);
         if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
             err = "FileExpertSource: available memory cannot hold any expert of the complement";
             return false;
@@ -2707,9 +2755,21 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files\n",
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
-        offsets.swap(ranked);
         bytes = at;
         lend_from_slot = -1;
+    }
+    if (strict) {
+        if (!pin || headroom_bytes!=strict->host_headroom || budget_bytes!=strict->resident_budget ||
+            bytes!=strict->resident_bytes || !additional_gpu_pairs.empty() || lend_from_slot!=-1) {
+            err="invalid_launch_plan: resident policy differs from approval"; return false;
+        }
+        std::vector<uint64_t> expected(offsets.size(),kNoComplement);
+        uint64_t at=0;
+        for (auto index:strict->resident_order) {
+            if (index>=expected.size()) { err="invalid_launch_plan: resident index out of bounds"; return false; }
+            expected[index]=at; at+=layer_blob_bytes_[index/(size_t)n_expert_];
+        }
+        if (offsets!=expected) { err="invalid_launch_plan: resident membership/order changed"; return false; }
     }
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
@@ -2850,6 +2910,7 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
         if (arena == nullptr) {
+            if (strict && !paced) { err="out_of_memory: strict resident pinning failed: "+note; return false; }
             if (!note.empty()) {
                 std::fprintf(stderr, "FileExpertSource: %s; trying pageable memory\n", note.c_str());
                 log_complement_memory("before pageable allocation", bytes);
@@ -3001,6 +3062,9 @@ bool FileExpertSource::pin_cache_complement(
         return false;
     }
 #endif
+    if (strict && !detail::admit_exact_pinning(bytes,pinned_ok ? bytes : partial_pin,err)) {
+        release(); return false;
+    }
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
     std::atomic<bool> failed{false};

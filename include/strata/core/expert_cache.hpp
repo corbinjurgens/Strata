@@ -31,6 +31,7 @@
 #include "strata/core/vmm.hpp"
 
 namespace strata::core {
+namespace detail { struct ExpertCacheTestAccess; }
 
 /// Where one expert's VRAM lives, or -1.  `int32_t` and not a bool because the slot index is what the kernel
 /// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
@@ -93,6 +94,8 @@ public:
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
+    static bool sized_layout(const std::vector<int64_t>& slot_bytes, std::vector<uint64_t>& offsets,
+                              int64_t& max_blob, std::string& err);
     /// Byte offset of each slot in the arena (null for uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
     void close();
@@ -215,6 +218,7 @@ private:
     uint8_t* blocking_staging_ = nullptr;
     std::size_t blocking_staging_bytes_ = 0;
 #endif
+    friend struct detail::ExpertCacheTestAccess;
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
     bool open_segmented(uint64_t want, std::string& err);
     void release_segmented();

@@ -470,8 +470,8 @@ struct Stager {
     std::vector<std::thread> threads;
     int device = 0;
 
-    bool init(size_t blob_bytes, int nthreads) {
-        if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
+    bool init(size_t blob_bytes, int nthreads, bool strict = false) {
+        if (!strict) if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
@@ -479,6 +479,7 @@ struct Stager {
         for (int i = 0; i < kRing; ++i) {
             pinned[i] = !force_pageable() && cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
             if (!pinned[i]) {
+                if (strict) return false;
                 cudaGetLastError();
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
@@ -729,6 +730,8 @@ struct Prefill::Impl {
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
     bool shared_stage = false;
+    bool strict = false;
+    Prefill::Sizing applied_sizing;
     uint64_t shared_stage_bytes = 0;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
@@ -1069,8 +1072,9 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes,
-                   bool allow_shared_stage, uint64_t remaining_priced_late_bytes) {
+                   bool allow_shared_stage, uint64_t remaining_priced_late_bytes, const Sizing* strict) {
     Impl& m = *impl_;
+    m.strict=strict!=nullptr;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     auto trace_memory = [](const char* where) {
@@ -1095,6 +1099,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
+    Sizing applied;
+    if (strict) {
+        const auto& q = ss.qsa_states[ss.qsa_primary()];
+        core::SessionSizing kv;
+        using Kv = core::SessionSizing::Kv;
+        kv.kv=q.kv_hybrid ? Kv::Hybrid : q.kv_q4 ? Kv::Q4 : q.kv_int8 ? Kv::Int8 : Kv::Fp16;
+        kv.resident_cells=q.kv_mode==1 ? q.n_slots*strata::kernels::qsa_real_shapes().page_size : 0;
+        applied=sizing_inputs(g,q.max_cells,chunk,kv);
+        applied.stager_threads=strict->stager_threads; applied.stager_ring=strict->stager_ring;
+        applied.stager_batch=strict->stager_batch;
+        if (!check_strict_sizing(*strict,applied,borrow!=nullptr,allow_shared_stage,err)) return false;
+        if (force_pageable()) { err="invalid_launch_plan: strict prefill requires pinned host buffers"; return false; }
+        m.applied_sizing=applied;
+    }
     bool prepared_gemm = false, select_shared_stage = false;
 #if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
     if (allow_shared_stage && borrow == nullptr && stage_lb_ == 0 && stage_le_ == g.n_layers &&
@@ -1185,7 +1203,6 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
-        const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
         // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
         // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
@@ -1197,7 +1214,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // pages are already in the page cache (a Q8 pack on a big-RAM box with a warm cache).  Those copies are memcpy
         // from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the defaults.  So ask the OS: the SSD
         // profile only when fewer than 90% of a sample of the blobs' pages are resident (-1: it cannot tell, keep it).
-        if (files && !stv) {
+        if (!strict && files && !stv) {
             const char* ev = std::getenv("STRATA_STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
             if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
             else if (const double warm = src->cached_share(256); warm >= 0.9) {
@@ -1205,12 +1222,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
-        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
-        const char* batch = std::getenv("STRATA_STAGER_BATCH");
-        // Larger batches retain more read scratch per worker; opt in after checking the host RAM headroom.
-        m.stager->batch = std::clamp(batch ? std::atoi(batch) : 1, 1, Stager::kMaxBatch);
-        if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
+        Sizing stager;
+        if (strict) stager=*strict;
+        else resolve_stager(stager,files);
+        const int threads=stager.stager_threads;
+        m.stager->kRing=stager.stager_ring; m.stager->batch=stager.stager_batch;
+        if (!m.stager->init((size_t) MAXBLOB(), threads,strict!=nullptr)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
@@ -1232,6 +1249,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 m.grp_tk = T * K;
             } else {                              // the copies, as before
                 if (h) cudaFreeHost(h);
+                if (strict) { err="out_of_memory: strict prefill group pinning failed"; return false; }
                 cudaGetLastError();
             }
         }
@@ -1239,6 +1257,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
             (force_pageable() || cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) T * N * 4, cudaHostAllocDefault) != cudaSuccess)) {
+            if (strict) { err="out_of_memory: strict prefill PLE pinning failed"; return false; }
             cudaGetLastError();
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
@@ -1309,6 +1328,14 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         return false;
     }
     trace_memory("owned chunk buffers");
+    if (strict) {
+        applied.ring=m.ring;
+        applied.common=m.applied_sizing.common; applied.region=m.region_bytes;
+        applied.stager_threads=(int)m.stager->threads.size(); applied.stager_ring=m.stager->kRing;
+        applied.stager_batch=m.stager->batch;
+        if (!check_strict_sizing(*strict,applied,m.borrowed,m.shared_stage,err)) return false;
+        m.applied_sizing=applied;
+    }
     return true;
 }
 
@@ -1324,7 +1351,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     // layout keeps the same slices in its existing arena; m.borrowed still controls all lending semantics.
     Alloc common;
     if (o.base == nullptr) {
-        common.cap = common_set_bytes(T, m.f16_io);
+        common.cap = m.strict ? m.applied_sizing.common : common_set_bytes(T, m.f16_io);
         common.base = o.take<uint8_t>((size_t) common.cap, ok);
         if (!ok) return false;
     }
@@ -1477,6 +1504,29 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 
 int64_t Prefill::chunk() const { return impl_->T; }
 bool Prefill::shared_stage() const { return impl_->shared_stage; }
+Prefill::Sizing Prefill::applied_sizing() const { return impl_->applied_sizing; }
+
+bool Prefill::check_strict_sizing(const Sizing& approved, const Sizing& actual, bool borrowed,
+                                 bool shared, std::string& error) {
+    if (borrowed || shared || !(approved==actual) || approved.stager_threads<1 || approved.stager_threads>32 ||
+        approved.stager_ring<2 || approved.stager_ring>256 || approved.stager_batch<1 ||
+        approved.stager_batch>32 || approved.stager_batch>approved.stager_ring) {
+        error="invalid_launch_plan: prefill allocation layout differs from approved settings";
+        return false;
+    }
+    return true;
+}
+
+void Prefill::resolve_stager(Sizing& inputs, bool files) {
+    const int hw=(int)std::thread::hardware_concurrency();
+    const char* stv=std::getenv("STRATA_STAGER_THREADS");
+    if (files && !stv) if (const char* v=std::getenv("STRATA_STAGER_SSD"); v && v[0]) files=v[0]!='0';
+    inputs.stager_threads=stv ? std::clamp(std::atoi(stv),1,32) : files ? 32 : std::max(2,std::min(4,hw/4));
+    const char* ring=std::getenv("STRATA_STAGER_RING");
+    inputs.stager_ring=ring ? std::clamp(std::atoi(ring),2,256) : files ? 4*inputs.stager_threads : 16;
+    const char* batch=std::getenv("STRATA_STAGER_BATCH");
+    inputs.stager_batch=std::min(std::clamp(batch ? std::atoi(batch) : 1,1,Stager::kMaxBatch),inputs.stager_ring);
+}
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {

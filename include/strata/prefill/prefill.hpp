@@ -57,12 +57,18 @@ public:
         uint64_t weight_scratch = 0, workspace = 0, common = 0, region = 0;
         uint64_t max_blob = 0, chunk = 0, experts = 0;
         int ring = 0;
+        int stager_threads = 0, stager_ring = 0, stager_batch = 0;
         bool mmq = false, ring_enabled = true, reserve_bo = true, stage_own = false;
         std::vector<uint64_t> kv_runs;
+        bool operator==(const Sizing&) const = default;
     };
     static Sizing sizing_inputs(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
                                 const core::SessionSizing& kv);
     static uint64_t bytes_needed_for(const Sizing& inputs, bool owned_pages);
+    static void resolve_stager(Sizing& inputs, bool files);
+    static bool check_strict_sizing(const Sizing& approved, const Sizing& actual, bool borrowed,
+                                    bool shared, std::string& error);
+    Sizing applied_sizing() const;
     /// E-9: the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual rows `R_rows`
     /// (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs and its idle
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
@@ -89,7 +95,8 @@ public:
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0,
-              bool allow_shared_stage = false, uint64_t remaining_priced_late_bytes = 0);
+              bool allow_shared_stage = false, uint64_t remaining_priced_late_bytes = 0,
+              const Sizing* strict = nullptr);
 
     /// Private pressure prototype: the selected owned GEMM/KV-stage layout; reset clears it.
     bool shared_stage() const;

@@ -110,7 +110,7 @@ NativeEmbed::~NativeEmbed() {
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
 
-bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
+bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err, bool strict) {
     try {
         const strata::GgufModel model(shards);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
@@ -138,6 +138,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
         cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
         if (host_err != cudaSuccess) {
+            if (strict) { err="out_of_memory: strict native embedding pinning failed"; return false; }
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
             // instead: it costs its size there and reads faster than over PCIe.
@@ -178,7 +179,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                 std::fprintf(stderr, "strata: native embedding: no device alias for the mapped table, kept in VRAM\n");
             }
 #else
-            if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
+            if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess || (strict && d==nullptr)) {
                 err = "native embedding: no device alias for the mapped table";
                 return false;
             }

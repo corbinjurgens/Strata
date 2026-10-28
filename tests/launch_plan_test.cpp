@@ -16,11 +16,30 @@
 #include <cstdlib>
 #if defined(_WIN32)
 #include <winioctl.h>
+#include <io.h>
+#else
+#include <unistd.h>
 #endif
 
 using namespace strata;
 using namespace strata::plan;
 namespace fs = std::filesystem;
+namespace strata::core::detail {
+// Omit only device storage; exercise the cache's real byte-layout and admission consumers without a model/GPU.
+struct ExpertCacheTestAccess {
+    static bool initialize(ExpertCache& cache, const LaunchSettings& s, std::string& error) {
+        std::vector<int64_t> bytes;
+        for (auto slot:s.slots) bytes.push_back((int64_t)slot.bytes);
+        if (!ExpertCache::sized_layout(bytes,cache.off_,cache.blob_,error)) return false;
+        cache.slots_=cache.live_slots_=(int64_t)s.slots.size(); cache.n_layers_=48; cache.n_expert_=s.experts;
+        cache.residency_.assign(48*s.experts,kNotResident); cache.per_layer_=s.per_layer;
+        for (int64_t l=0;l<48;++l) {
+            int64_t lo=0,hi=0; cache.layer_slot_range(l,lo,hi); cache.layer_next_.push_back((int32_t)lo);
+        }
+        return true;
+    }
+};
+}
 namespace {
 int checks = 0;
 void require(bool pass, const char* what) {
@@ -135,10 +154,52 @@ void environment(const char* name, const char* value) {
     if (value) setenv(name, value, 1); else unsetenv(name);
 #endif
 }
+void consume_slots(const LaunchSettings& saved) {
+    core::ExpertCache cache; std::string error;
+    require(core::detail::ExpertCacheTestAccess::initialize(cache,saved,error),"real cache layout consumes saved byte sizes");
+    for (size_t i=0;i<saved.slots.size();++i) {
+        const auto& slot=saved.slots[i];
+        require(cache.slot_offset(i)==slot.offset,"actual aligned offset equals saved offset");
+        require(cache.admit(slot.layer,slot.expert)==i,"actual cache consumer preserves ordered pair admission");
+        require(cache.slot_of(slot.layer,slot.expert)==i,"actual mapping agrees with saved ordered slot");
+    }
+    require(cache.resident()==saved.slots.size(),"all saved slots consumed");
+}
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc>1 && std::string(argv[1])=="--consume") {
+            std::string error;
+            LaunchSettings saved;
+            const auto observe=[](LaunchResources& resources,std::string&) {
+                resources={6ull<<30,48ull<<30,48ull<<30,1,true}; return true;
+            };
+            require(consume_strict_launch(argc-1,argv+1,saved,error,observe),error.c_str());
+            consume_slots(saved);
+            core::ModelGeometry geometry; geometry.n_expert=saved.experts;
+            core::SessionSizing kv; kv.kv=(core::SessionSizing::Kv)saved.kv; kv.resident_cells=saved.kv_resident;
+            auto current=prefill::Prefill::sizing_inputs(geometry,saved.context,saved.prefill,kv);
+            const auto approved=launch_prefill_sizing(saved);
+            current.stager_threads=approved.stager_threads; current.stager_ring=approved.stager_ring;
+            current.stager_batch=approved.stager_batch;
+            require(prefill::Prefill::check_strict_sizing(approved,current,false,false,error),"real prefill consumer accepts exact generated profile");
+            std::string command;
+            while (command.size()<5) {
+                char chunk[5];
+#if defined(_WIN32)
+                const int n=_read(0,chunk,(unsigned)(5-command.size()));
+#else
+                const auto n=::read(0,chunk,5-command.size());
+#endif
+                if (n<=0) break;
+                command.append(chunk,(size_t)n);
+            }
+            require(command=="QUIT\n","real stdin frame leaves raw-fd engine command unread");
+            std::cout<<frame_effective_launch(saved,1);
+            std::cout<<"PASS strict_profile context="<<saved.context<<" checks="<<checks<<" slots="<<saved.slots.size()<<'\n';
+            return 0;
+        }
         const auto root=argc>1 ? fs::path(argv[1]) : fs::temp_directory_path()/"strata-launch-plan-test";
         require(root.is_absolute(),"fixtures must be outside checkout at an absolute path");
         fixture(root);
@@ -235,6 +296,8 @@ int main(int argc, char** argv) {
         environment("STRATA_FILE_CACHE_COMPACT", compact_was_set ? saved_compact.c_str() : nullptr);
         LaunchSettings decoded;
         require(decode_launch_settings(a.payload,decoded,error) && decoded==a.settings,"exact codec round trip");
+        auto old_schema=a.payload; old_schema.replace(0,8,"schema=1");
+        require(!decode_launch_settings(old_schema,decoded,error) && error=="unsupported native schema","old native schema fails closed explicitly");
         for (const char* ring : {"0", "9", "15", "600"}) {
             auto payload = a.payload;
             const auto at = payload.find("\nring=") + 1;
@@ -253,6 +316,88 @@ int main(int argc, char** argv) {
         const auto other=encode_launch_settings(reordered);
         require(other!=a.payload && reordered.slots.size()==a.settings.slots.size(),"same-count layouts retain order");
         require(decode_launch_settings(other,decoded,error) && decoded==reordered,"second ordered layout round trip");
+        require(admit_launch(r,resources,a.settings,error),"saved 8K settings admitted without resolving autos");
+        require(core::detail::admit_exact_resident_budget(22ull<<30,30ull<<30,30ull<<30,8ull<<30,error),"exact resident budget fits boundary");
+        require(!core::detail::admit_exact_resident_budget(22ull<<30,(30ull<<30)-1,30ull<<30,8ull<<30,error),"resident clamp refuses physical shortfall");
+        require(!core::detail::admit_exact_resident_budget(22ull<<30,30ull<<30,(30ull<<30)-1,8ull<<30,error),"resident clamp refuses commit shortfall");
+        require(!core::detail::admit_exact_resident_budget(0,7ull<<30,30ull<<30,8ull<<30,error),"zero file cache cannot waive physical headroom");
+        require(!core::detail::admit_exact_resident_budget(0,30ull<<30,7ull<<30,8ull<<30,error),"zero file cache cannot waive commit headroom");
+        require(core::detail::admit_exact_pinning(1024,1024,error),"full resident pin accepted");
+        require(!core::detail::admit_exact_pinning(1024,0,error),"resident pageable fallback refused");
+        require(!core::detail::admit_exact_pinning(1024,1023,error),"partial resident pin refused");
+        require(core::detail::file_cache_target(1000,true,true,10,256,2560).bytes==1000,"compact source target stays exact");
+        require(core::detail::file_cache_target(1000,false,true,10,256,2560).bytes==768,"uniform source target rounds at the real owner");
+        require(core::detail::file_cache_target(1000,true,false,10,256,2560).bytes==0,"mapped contiguous source has no assembly cache");
+        require(core::detail::file_cache_target(4096,true,true,10,256,2560).bytes==2560,"source inventory bounds compact retention");
+        prefill::Prefill::Sizing cold_stager;
+        prefill::Prefill::resolve_stager(cold_stager,true);
+        require(cold_stager.stager_threads==32 && cold_stager.stager_ring==128 && cold_stager.stager_batch==1,
+                "metadata captures existing cold file-source host stager policy");
+        require(a.ram.at("prefill_host_stager")==42598400,"contiguous source host ring is priced independently");
+        environment("STRATA_STAGER_RING","256");
+        require(!admit_launch(r,resources,a.settings,error),"host stager environment drift refuses replay");
+        require(resolve_launch(r,resources,b,error),"explicit host stager ring can be planned");
+        require(b.settings.stager_ring==256 && b.ram.at("prefill_host_stager")==681574400,
+                "explicit host ring uses its actual source-owned buffer cost");
+        environment("STRATA_STAGER_RING",nullptr);
+        require(admit_launch(r,resources,reordered,error),"same-count second slot order admitted unchanged");
+        consume_slots(a.settings); consume_slots(reordered);
+        auto per_layer_request=r; per_layer_request.per_layer=true;
+        LaunchResolution per_layer_plan;
+        require(resolve_launch(per_layer_request,resources,per_layer_plan,error),"per-layer layout resolves at existing owner");
+        require(per_layer_plan.settings.slots.size()%48==0 && per_layer_plan.settings.per_layer==1,"resolved per-layer quotas are explicit");
+        require(admit_launch(per_layer_request,resources,per_layer_plan.settings,error),"per-layer layout replays exactly");
+        consume_slots(per_layer_plan.settings);
+        auto explicit_request=r; explicit_request.expert_cache=600;
+        LaunchResolution explicit_plan;
+        require(resolve_launch(explicit_request,resources,explicit_plan,error),"explicit uniform grant resolves variable aligned slots");
+        require(explicit_plan.settings.auto_cache==0 && explicit_plan.settings.cache_request==600 && explicit_plan.settings.slots.size()>600,
+                "original explicit cache grant is distinct from applied slot count");
+        require(admit_launch(explicit_request,resources,explicit_plan.settings,error),"explicit grant replays saved variable slots without reconstruction");
+        consume_slots(explicit_plan.settings);
+        auto more=resources; more.vram_free=12ull<<30;
+        require(admit_launch(r,more,a.settings,error),"more current VRAM does not grow saved slots");
+        require(check_effective_launch(a.settings,a.settings,error),"exact applied settings pass READY gate");
+        require(!check_effective_launch(a.settings,reordered,error),"same-count changed effective order blocks READY");
+        const auto effective_payload=encode_effective_launch(a.settings);
+        require(effective_payload.size()<16384 && effective_payload.starts_with("schema=1\nverified=1\n"),"bounded versioned effective handoff");
+        require(effective_payload.find("\nslots=")==std::string::npos && effective_payload.find("resident_order=")==std::string::npos,
+                "runtime handoff contains no per-expert slot/member dump");
+        require(effective_payload!=encode_effective_launch(reordered),"aggregate handoff distinguishes same-count ordered layouts");
+        require(frame_effective_launch(a.settings,1)=="STRATA-EFFECTIVE/1\n1\n"+
+                std::to_string(effective_payload.size())+'\n'+effective_payload,"effective frame has coherent sequence and exact byte length");
+        for (int change=0;change<14;++change) {
+            auto changed=a.settings;
+            if (change==0) changed.auto_cache=0;
+            if (change==1) changed.resident_budget+=1ull<<30;
+            if (change==2) changed.file_cache-=1ull<<20;
+            if (change==3) changed.host_headroom+=1ull<<30;
+            if (change==4) changed.shared_stage=1;
+            if (change==5) changed.workspace=8ull<<20;
+            if (change==6) changed.prefill=32;
+            if (change==7) changed.batch=2;
+            if (change==8) changed.batch_groups=2;
+            if (change==9) changed.parallel=2;
+            if (change==10) changed.resident_pin=0;
+            if (change==11) changed.vram_required+=1;
+            if (change==12) changed.environment^=1;
+            if (change==13) std::swap(changed.resident_order[0],changed.resident_order[1]);
+            require(!admit_launch(r,resources,changed,error),"changed approval refuses native admission");
+            require(!check_effective_launch(a.settings,changed,error),"changed actual settings block READY");
+        }
+        for (int loss=0;loss<4;++loss) {
+            auto current=resources;
+            if (loss==0) current.vram_free=a.vram_required-1;
+            if (loss==1) current.ram_available=a.ram_required-1;
+            if (loss==2) current.commit_available=a.commit_required-1;
+            if (loss==3) current.devices=2;
+            require(!admit_launch(r,current,a.settings,error),"current resource loss refuses without adjustment");
+        }
+        auto argv_changed=r; argv_changed.expert_cache=100;
+        require(!admit_launch(argv_changed,resources,a.settings,error),"original auto-cache provenance is bound");
+        environment("STRATA_TEST_STRICT_ENV","changed");
+        require(!admit_launch(r,resources,a.settings,error),"native environment drift refuses");
+        environment("STRATA_TEST_STRICT_ENV",nullptr);
         for (const std::string bad_value:{"-1","+2","02","18446744073709551616"}) {
             auto bytes=a.payload;
             const auto at=bytes.find("spec=2\n");
@@ -298,6 +443,26 @@ int main(int argc, char** argv) {
                 b.settings.spec==2 && b.settings.no_prefill_borrow==1,"128K preserves spec2/q4_0/20480/owned prefill");
         require(b.settings.kv_stage_runs==std::vector<uint64_t>{37748736,37748736},"128K stage has two q4 pools");
         require(b.ram.at("streamed_kv")==905969664,"128K logical host KV priced independently");
+        require(admit_launch(r,resources,b.settings,error),"saved 128K streamed q4 spec2 settings admitted exactly");
+        for (uint64_t resident : {20481u, 20483u, 131072u, 131073u}) {
+            auto bad_request = r; bad_request.kv_resident = resident;
+            refusal(bad_request,resources,"nonreplayable KV residency refuses before metadata allocation");
+            auto bad_settings = b.settings; bad_settings.kv_resident = resident;
+            require(!validate_launch_settings(bad_settings,error),"nonreplayable KV residency refuses codec validation");
+            auto bad_payload = b.payload;
+            const auto at = bad_payload.find("kv_resident=20480\n");
+            require(at != std::string::npos,"streamed fixture carries concrete KV residency");
+            bad_payload.replace(at, std::string("kv_resident=20480\n").size(),
+                                "kv_resident=" + std::to_string(resident) + '\n');
+            require(!decode_launch_settings(bad_payload,decoded,error),"nonreplayable saved KV residency refuses decoding");
+        }
+        for (uint64_t resident : {0u, 20480u, 20484u}) {
+            auto exact_request = r; exact_request.kv_resident = resident;
+            LaunchResolution exact_plan;
+            require(resolve_launch(exact_request,resources,exact_plan,error),"canonical KV residency resolves");
+            require(exact_plan.settings.kv_resident == resident &&
+                    admit_launch(exact_request,resources,exact_plan.settings,error),"canonical KV residency replays unchanged");
+        }
         core::ModelGeometry g; core::SessionSizing kv;
         uint64_t mapped1=0,mapped2=0;
         const auto verify1=core::Verifier::workspace_bytes(g,8192,10,2,248320,1ull<<20,mapped1);

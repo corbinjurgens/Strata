@@ -43,6 +43,7 @@
 namespace strata::kernels::cpu {
 struct ExpertLayout;
 }
+namespace strata::plan { struct LaunchSettings; }
 
 namespace strata::core {
 
@@ -93,6 +94,12 @@ uint64_t resident_gib_bytes(double gib, bool keep_positive = false);
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
+bool admit_exact_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom,
+                                 std::string& error);
+bool admit_exact_pinning(uint64_t bytes, uint64_t pinned_bytes, std::string& error);
+struct FileCacheTarget { uint64_t slots=0, bytes=0; bool compact=false; };
+FileCacheTarget file_cache_target(uint64_t requested, bool compact, bool staged, uint64_t blobs,
+                                  uint64_t max_blob, uint64_t expert_bytes);
 
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
 /// pages as fast as the driver takes them (the process is OOM-killed, even with MemAvailable high: clean file cache
@@ -112,6 +119,10 @@ bool make_cache_complement_plan(
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
     std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err);
+/// Apply the existing budget/rank policy to an already validated complement inventory.
+void rank_cache_complement(std::vector<uint64_t>& offsets, const std::vector<uint64_t>& layer_blob_bytes,
+                            int64_t n_expert, const std::vector<std::pair<int32_t,int32_t>>* rank,
+                            uint64_t budget, uint64_t& bytes, int64_t& held);
 
 /// Resolve one blob through the compact copy when present, otherwise preserve its exact mapped-file fallback.
 const uint8_t* cache_complement_blob_or_fallback(
@@ -521,13 +532,15 @@ public:
         const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr,
+        const plan::LaunchSettings* strict = nullptr);
     void close();
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
+    std::vector<uint64_t> resident_order() const;
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
@@ -586,6 +599,8 @@ public:
     /// the original staging policy. An explicit headroom rechecks RAM and commit before optional retention
     /// allocations; UINT64_MAX preserves the caller-budgeted policy. Mandatory live staging may still exceed it.
     uint64_t set_file_cache_bytes(uint64_t bytes, bool compact = false, uint64_t headroom = ~uint64_t{0});
+    bool set_file_cache_exact(uint64_t requested, bool compact, uint64_t headroom, uint64_t approved,
+                              std::string& error);
     struct FileCacheStats {
         uint64_t target_bytes = 0, allocated_bytes = 0;
         size_t buffers = 0;

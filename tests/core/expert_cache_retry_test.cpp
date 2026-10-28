@@ -30,7 +30,7 @@ struct Operations {
     int64_t last_free = -1, last_reserve = -1;
     std::string err, order;
 
-    strata::core::ExpertCacheRetryResult run(bool automatic = true, int64_t reserve = 512 * mib) {
+    strata::core::ExpertCacheRetryResult run(bool automatic = true, int64_t reserve = 512 * mib, bool strict = false) {
         return strata::core::retry_expert_cache(automatic, reserve, err,
             [&](std::string& why) {
                 order += 'O';
@@ -78,13 +78,35 @@ struct Operations {
                 last_free = available;
                 last_reserve = reserve_bytes;
                 return reserve_shrink_ok;
-            });
+            }, strict);
     }
 };
 } // namespace
 
 int main() {
     std::printf("expert_cache_retry_test\n");
+    for (bool automatic : {false, true}) {
+        Operations ok;
+        auto result=ok.run(automatic,512*mib,true);
+        check(result.status==ExpertCacheRetryStatus::ready && ok.order=="OTSQ", "strict manual and auto validate the actual touched candidate");
+        Operations allocation;
+        allocation.failed_opens={1};
+        result=allocation.run(automatic,512*mib,true);
+        check(result.status==ExpertCacheRetryStatus::allocation_failed && allocation.order=="O" && result.allocation_retries==0,
+              "strict allocation failure never calls shrink or retries");
+        Operations low;
+        low.readings={511*mib};
+        result=low.run(automatic,512*mib,true);
+        check(result.status==ExpertCacheRetryStatus::validation_failed && low.order=="OTSQ" && low.reserve_shrinks==0,
+              "strict post-touch reserve refuses even inside ordinary 64 MiB tolerance");
+        for (int fault=0;fault<3;++fault) {
+            Operations op;
+            op.fail_touch=fault==0; op.fail_sync=fault==1; op.fail_query=fault==2;
+            result=op.run(automatic,512*mib,true);
+            check(result.status==ExpertCacheRetryStatus::validation_failed && op.opens==1 &&
+                  op.allocation_shrinks==0 && op.reserve_shrinks==0, "strict touch/sync/query failure cannot resize");
+        }
+    }
     {
         Operations op;
         const auto result = op.run();

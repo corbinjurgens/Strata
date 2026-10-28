@@ -493,7 +493,7 @@ uint64_t Verifier::workspace_bytes(const ModelGeometry& g, int64_t cells, int64_
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-                    const NativeHead* head, int max_t, std::string& err) {
+                    const NativeHead* head, int max_t, std::string& err, bool strict) {
     g_diag_verifier.store(this);
     (void) route_resident_cfg().stats();   // STRATA_ROUTE_RESIDENT: the counters are allocated outside graph capture
     diag_verify_fn().store(&diag_active_verifier);
@@ -599,7 +599,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
-    cudaMemset(arena_, 0, count.used);
+    const auto cleared=cudaMemset(arena_, 0, count.used);
+    if (strict && cleared!=cudaSuccess) { err="verify: strict arena initialization failed"; return false; }
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -662,7 +663,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             for (int i = 0; i < 2 && okb; ++i)
                 okb = cudaStreamCreateWithFlags(&df_side_[i], cudaStreamNonBlocking) == cudaSuccess &&
                       cudaEventCreateWithFlags(&df_join_[i], cudaEventDisableTiming) == cudaSuccess;
-            if (!okb) { cudaGetLastError(); df_branch_ = false; }
+            if (!okb) {
+                if (strict) { err="verify: strict side branch initialization failed"; return false; }
+                cudaGetLastError(); df_branch_ = false;
+            }
         }
     }
     // Check whether 100% of experts across [lb_, le_) are resident in this stage's VRAM cache.
@@ -698,6 +702,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
         if (cudaMalloc((void**) &qcnt_, sizeof(unsigned) * (size_t) (g.n_embd / 32)) != cudaSuccess ||
             cudaMemset(qcnt_, 0, sizeof(unsigned) * (size_t) (g.n_embd / 32)) != cudaSuccess) {
+            if (strict) { err="verify: strict group counter initialization failed"; return false; }
             cudaGetLastError();
             if (qcnt_) cudaFree(qcnt_);
             qcnt_ = nullptr;
@@ -712,7 +717,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                   cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
-        if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+        if (!ok2) {
+            if (strict) { err="verify: strict device plan initialization failed"; return false; }
+            cudaGetLastError(); all_resident_ = false; device_plan_ = false;
+        }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,

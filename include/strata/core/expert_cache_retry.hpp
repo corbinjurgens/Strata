@@ -20,20 +20,21 @@ struct ExpertCacheRetryResult {
 template <class Open, class Touch, class Synchronize, class FreeBytes, class ShrinkAllocation, class ShrinkReserve>
 ExpertCacheRetryResult retry_expert_cache(bool automatic, int64_t reserve_bytes, std::string& err,
                                         Open open, Touch touch, Synchronize synchronize, FreeBytes free_bytes,
-                                        ShrinkAllocation shrink_allocation, ShrinkReserve shrink_reserve) {
+                                        ShrinkAllocation shrink_allocation, ShrinkReserve shrink_reserve,
+                                        bool strict = false) {
     constexpr int max_allocation_retries = 8;
     constexpr int max_candidates = 7;
     int allocation_retries = 0;
     int candidates = 0;
     for (;;) {
         if (!open(err)) {
-            if (automatic && allocation_retries < max_allocation_retries && shrink_allocation()) {
+            if (!strict && automatic && allocation_retries < max_allocation_retries && shrink_allocation()) {
                 ++allocation_retries;
                 continue;
             }
             return {ExpertCacheRetryStatus::allocation_failed, allocation_retries};
         }
-        if (!automatic) return {ExpertCacheRetryStatus::ready, allocation_retries};
+        if (!automatic && !strict) return {ExpertCacheRetryStatus::ready, allocation_retries};
         ++candidates;
         if (!touch(err) || !synchronize(err))
             return {ExpertCacheRetryStatus::validation_failed, allocation_retries};
@@ -43,8 +44,12 @@ ExpertCacheRetryResult retry_expert_cache(bool automatic, int64_t reserve_bytes,
         int64_t available = 0;
         if (!free_bytes(available, err))
             return {ExpertCacheRetryStatus::validation_failed, allocation_retries};
-        if (available >= reserve_bytes - (64ll << 20))
+        if (available >= reserve_bytes - (strict ? 0 : (64ll << 20)))
             return {ExpertCacheRetryStatus::ready, allocation_retries};
+        if (strict) {
+            err = "insufficient_resources: strict expert cache cannot retain the approved reserve and later buffers";
+            return {ExpertCacheRetryStatus::validation_failed, allocation_retries};
+        }
         if (candidates == max_candidates) {
             err = "expert cache auto: reserve still insufficient after " + std::to_string(max_candidates) +
                   " candidates; bounded retries exhausted";

@@ -88,8 +88,16 @@ uint64_t session_bytes_for(const ModelGeometry& g, int64_t cells, int64_t k, con
     return session_count(g, cells, k, g.n_gdn_layers(), qsa);
 }
 
+namespace { thread_local bool strict_initialization = false; }
+bool strict_session_initialization() { return strict_initialization; }
+
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+                      int64_t layer_lo, int64_t layer_hi, bool strict) {
+    struct Restore {
+        bool previous = strict_initialization;
+        ~Restore() { strict_initialization=previous; }
+    } restore;
+    strict_initialization=strict;
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;

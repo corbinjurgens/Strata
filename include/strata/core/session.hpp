@@ -109,7 +109,9 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
                        int64_t layer_hi = -1);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, bool strict = false);
+/// Scoped to the calling thread's session_init; the QSA owner checks initialization operations in strict mode.
+bool strict_session_initialization();
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
