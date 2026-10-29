@@ -455,7 +455,7 @@ int main(int argc, char** argv) {
             auto* old_out=std::cout.rdbuf(output.rdbuf()); auto* old_err=std::cerr.rdbuf(errors.rdbuf());
             const auto code=launch_metadata_main((int)args.size(),args.data());
             std::cout.rdbuf(old_out); std::cerr.rdbuf(old_err);
-            require(code==expected,"price-only CLI exit matches normal insufficiency or invalid input");
+            require(code==expected,"metadata CLI exit matches normal insufficiency or invalid input");
             require(expected==0 ? errors.str().empty() : output.str().empty(),"CLI errors do not publish partial JSON");
             return expected==0 ? output.str() : errors.str();
         };
@@ -501,6 +501,24 @@ int main(int argc, char** argv) {
         strict_args.erase(strict_args.begin()+1);
         require(!parse_launch_request((int)strict_args.size(),strict_args.data(),strict_price,strict_resources,true,error) &&
                 error.find("refuses --price-only")!=std::string::npos,"strict argv rejects price-only as a flag");
+        auto injected_words=price_words;
+        injected_words.erase(injected_words.begin()+2);
+        injected_words.insert(injected_words.end(),{"--plan-vram-free-bytes","6442450944",
+                                                   "--plan-ram-available-bytes","51539607552",
+                                                   "--plan-commit-available-bytes","51539607552"});
+        std::vector<char*> injected_args; for (auto& word:injected_words) injected_args.push_back(word.data());
+        LaunchRequest injected_request; LaunchResources injected_resources;
+        require(parse_launch_request((int)injected_args.size(),injected_args.data(),injected_request,injected_resources,false,error) &&
+                injected_request.budget_given && injected_resources.vram_free==6442450944 &&
+                injected_resources.ram_available==51539607552 && injected_resources.commit_available==51539607552 &&
+                injected_resources.vram_total==0,
+                "complete injected budgets parse exactly without a fabricated observed total");
+        for (size_t resource=0;resource<3;++resource) {
+            auto zero_injected=injected_words;
+            zero_injected[zero_injected.size()-5+2*resource]="0";
+            require(price_cli(zero_injected,2).find("resource")!=std::string::npos,
+                    "zero injected live budget refuses without device or host discovery");
+        }
         core::ModelGeometry geometry; core::SessionSizing kv;
         for (int64_t chunk:{64,2048,8192,32768}) {
             const auto envelope=prefill::Prefill::sizing_envelope(geometry,131072,chunk,kv);

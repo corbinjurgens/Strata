@@ -292,7 +292,7 @@ def bounded_query(argv, *, cwd, env, timeout=20, limit=MAX_JSON) -> bytes:
 
 
 def observe_hardware(gpu=None) -> dict:
-    """One selected GPU query plus one host snapshot, reused by both resolvers."""
+    """Select the GPU and host policy inputs; native CUDA supplies live VRAM."""
     data = bounded_query(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free",
                           "--format=csv,noheader,nounits"], cwd=str(Path.cwd()),
                          env={k: v for k, v in os.environ.items() if k.upper() not in CREDENTIAL_ENV}, limit=65536)
@@ -856,7 +856,8 @@ def _produce_plan(cfg, *, hardware=None, inherited=None, query=bounded_query, so
     if selected is not None and (type(selected) is not int or selected < 0):
         raise PlanError("invalid_launch_plan: single GPU index required")
     inherited = dict(os.environ if inherited is None else inherited)
-    hardware = copy.deepcopy(observe_hardware(selected) if hardware is None else hardware)
+    injected_hardware = hardware is not None
+    hardware = copy.deepcopy(observe_hardware(selected) if not injected_hardware else hardware)
     validate_hardware(hardware)
     if selected is not None and selected != hardware["gpu_index"]:
         raise PlanError("invalid_launch_plan: sample GPU differs from selected GPU")
@@ -903,12 +904,29 @@ def _produce_plan(cfg, *, hardware=None, inherited=None, query=bounded_query, so
     argv = [str(exe), "--resolve-launch", *args]
     for name, key in (("vram-free", "vram_free_bytes"), ("ram-available", "ram_available_bytes"),
                       ("commit-available", "commit_available_bytes")):
+        if name == "vram-free" and not injected_hardware:
+            continue
         argv += ["--plan-" + name + "-bytes", str(hardware[key])]
     result = parse_json(query(argv, cwd=str(cwd), env=env))
     _keys(result, set(CAPABILITIES) | {"native_payload", "effective_payload", "settings", "estimates", "resources"})
-    if result["resources"] != {"vram_free": hardware["vram_free_bytes"], "ram_available": hardware["ram_available_bytes"],
-                               "commit_available": hardware["commit_available_bytes"], "devices": 1}:
+    resources = result["resources"]
+    _keys(resources, {"vram_free", "ram_available", "commit_available", "devices"} |
+          (set() if injected_hardware else {"vram_total"}))
+    for value in resources.values():
+        _uint(value)
+    if (resources["devices"] != 1 or resources["ram_available"] != hardware["ram_available_bytes"] or
+            resources["commit_available"] != hardware["commit_available_bytes"] or
+            (injected_hardware and resources["vram_free"] != hardware["vram_free_bytes"])):
         raise PlanError("invalid_launch_plan: native used a different resource sample")
+    if not injected_hardware:
+        # Validate both CUDA values from one call under the frozen environment.
+        # Inventory total remains the replay identity: CUDA and NVIDIA can report
+        # slightly different totals for the same device. Only free is the budget.
+        _uint(resources["vram_total"], positive=True)
+        if resources["vram_free"] > resources["vram_total"]:
+            raise PlanError("invalid_launch_plan: inconsistent native VRAM snapshot")
+        hardware["vram_free_bytes"] = resources["vram_free"]
+        validate_hardware(hardware)
     payload = result["native_payload"].encode("utf-8")
     native = {"capabilities": {k: result[k] for k in CAPABILITIES},
               "build": {k: v for k, v in build.items() if k != "built_at"},

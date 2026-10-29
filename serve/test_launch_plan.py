@@ -83,6 +83,14 @@ def fake_metadata(argv, env, *, reverse=False):
     effective += "cache_slots=2\ncache_bytes=512\nkv_stage_runs=" + ",".join(map(str, runs)) + "\n"
     effective += "native_payload_fingerprint=" + str(fnv(payload.encode())) + "\n"
     settings.update(layer_blobs=[256] * 48, kv_stage_runs=runs, resident_order=[], slots=slots)
+    resources = {"vram_free": 5326766080,
+                 "ram_available": int(argv[argv.index("--plan-ram-available-bytes") + 1]),
+                 "commit_available": int(argv[argv.index("--plan-commit-available-bytes") + 1]),
+                 "devices": 1}
+    if "--plan-vram-free-bytes" in argv:
+        resources["vram_free"] = int(argv[argv.index("--plan-vram-free-bytes") + 1])
+    else:
+        resources["vram_total"] = 6 << 30
     return dict(schema=1, native_schema=2, kind="native_metadata", strict_consumer=True, ownership_telemetry=True,
                 ownership_protocol="STRATA-OWNERSHIP/1", ownership_frame_limit=1 << 20,
                 ownership_shard_limit=256, effective_protocol="STRATA-EFFECTIVE/1",
@@ -91,10 +99,7 @@ def fake_metadata(argv, env, *, reverse=False):
                                ram={"weights": 1024, "host_headroom_allowance": 1024},
                                vram_required=1024, ram_required=2048, commit_required=3072,
                                unknown_costs="fixture: unmeasured driver/library/runtime overhead"),
-                resources={"vram_free": int(argv[argv.index("--plan-vram-free-bytes") + 1]),
-                           "ram_available": int(argv[argv.index("--plan-ram-available-bytes") + 1]),
-                           "commit_available": int(argv[argv.index("--plan-commit-available-bytes") + 1]),
-                           "devices": 1})
+                resources=resources)
 
 
 def fake_metadata_main():
@@ -266,16 +271,83 @@ class Plans(unittest.TestCase):
                 self.plan(inherited=env)
             self.assertNotIn("do-not-print", str(error.exception))
 
-    def test_resource_changes_are_visible_and_not_resampled(self):
-        with patch.object(lp, "observe_hardware", return_value=HARDWARE) as observed, \
+    def test_live_vram_uses_native_sample_under_frozen_environment(self):
+        observed_hardware = {**HARDWARE, "vram_free_bytes": 6207569920}
+        query = Mock(side_effect=self.query)
+        with patch.object(lp, "observe_hardware", return_value=observed_hardware) as observed, \
                 patch.object(prep, "detected_memory") as memory, patch.object(prep, "detected_gpu") as gpu:
-            a = lp.produce_plan(self.cfg, inherited=self.env, query=self.query)
+            a = lp.produce_plan(self.cfg, inherited=self.env, query=query)
         observed.assert_called_once_with(0)
         memory.assert_not_called()
         gpu.assert_not_called()
+        query.assert_called_once()
+        sent = query.call_args.args[0]
+        self.assertNotIn("--plan-vram-free-bytes", sent)
+        self.assertEqual(sent[sent.index("--plan-ram-available-bytes") + 1], str(48 << 30))
+        self.assertEqual(sent[sent.index("--plan-commit-available-bytes") + 1], str(48 << 30))
+        self.assertEqual(query.call_args.kwargs["env"], lp.replay_environment(a["launch"]["environment"], self.env))
+        self.assertEqual(a["hardware"]["vram_free_bytes"], 5326766080)
+        self.assertEqual(a["hardware"]["vram_total_bytes"], 6 << 30)
+        self.assertEqual(observed_hardware["vram_free_bytes"], 6207569920)
+        saved = self.root / "live-plan.json"
+        saved.write_bytes(lp.canonical(a))
+        self.assertEqual(lp.read_plan(saved), a)
+        self.assertEqual(lp.validate_inputs(a), a)
+        self.assertEqual(lp.strict_frame(lp.read_plan(saved)), lp.strict_frame(a))
         b = self.plan(hardware={**HARDWARE, "vram_free_bytes": (6 << 30) - 1})
         self.assertNotEqual(a["plan_digest"], b["plan_digest"])
         self.assertEqual(b["hardware"]["vram_free_bytes"], (6 << 30) - 1)
+
+    def test_live_cuda_budget_preserves_inventory_identity_for_replay(self):
+        from serve import launch_runtime
+
+        def native_total(argv, *, cwd, env):
+            reply = fake_metadata(argv, env)
+            # Real MSI observation: CUDA total differs from inventory by 512 KiB.
+            reply["resources"]["vram_total"] = (6 << 30) - (512 << 10)
+            return json.dumps(reply).encode()
+        with patch.object(lp, "observe_hardware", return_value=HARDWARE):
+            plan = lp.produce_plan(self.cfg, inherited=self.env, query=native_total)
+            launch_runtime.admit(plan)
+        self.assertEqual(plan["hardware"]["vram_total_bytes"], HARDWARE["vram_total_bytes"])
+        self.assertEqual(plan["hardware"]["vram_free_bytes"], 5326766080)
+
+    def test_live_invalid_native_resources_refuse(self):
+        for field, value in (("vram_total", 0), ("vram_total", 1), ("vram_total", True),
+                             ("vram_total", 2**64), ("vram_free", -1), ("vram_free", 7 << 30),
+                             ("vram_free", False), ("vram_free", 5326766080.0),
+                             ("ram_available", 1), ("commit_available", 1), ("devices", 2), ("devices", True)):
+            def invalid(argv, *, cwd, env):
+                reply = fake_metadata(argv, env)
+                reply["resources"][field] = value
+                return json.dumps(reply).encode()
+            with self.subTest(field=field, value=value), patch.object(lp, "observe_hardware", return_value=HARDWARE), \
+                    self.assertRaises(lp.PlanError):
+                lp.produce_plan(self.cfg, inherited=self.env, query=invalid)
+        def missing_total(argv, *, cwd, env):
+            reply = fake_metadata(argv, env)
+            del reply["resources"]["vram_total"]
+            return json.dumps(reply).encode()
+        with patch.object(lp, "observe_hardware", return_value=HARDWARE), self.assertRaises(lp.PlanError):
+            lp.produce_plan(self.cfg, inherited=self.env, query=missing_total)
+
+    def test_injected_resources_remain_exact_without_observation(self):
+        sample = {**HARDWARE, "vram_free_bytes": 5326766080}
+        query = Mock(side_effect=self.query)
+        with patch.object(lp, "observe_hardware", side_effect=AssertionError("injected hardware must not be observed")):
+            plan = self.plan(hardware=sample, query=query)
+        self.assertEqual(plan["hardware"], sample)
+        self.assertEqual(sample["vram_free_bytes"], 5326766080)
+        sent = query.call_args.args[0]
+        self.assertEqual(sent[sent.index("--plan-vram-free-bytes") + 1], "5326766080")
+        for field, value in (("vram_free", 5326766079), ("ram_available", 1),
+                             ("commit_available", 1), ("devices", 2), ("devices", True), ("vram_total", 6 << 30)):
+            def contradictory(argv, *, cwd, env):
+                reply = fake_metadata(argv, env)
+                reply["resources"][field] = value
+                return json.dumps(reply).encode()
+            with self.subTest(field=field, value=value), self.assertRaises(lp.PlanError):
+                self.plan(hardware=sample, query=contradictory)
 
     def test_insufficient_observed_resources_refuse_before_any_launch(self):
         with self.assertRaisesRegex(lp.PlanError, "insufficient_resources"):

@@ -219,7 +219,9 @@ void print_estimates(const LaunchResolution& out) {
 }
 void print_resources(const LaunchResources& resources) {
     std::cout << "{\"vram_free\":" << resources.vram_free << ",\"ram_available\":" << resources.ram_available
-              << ",\"commit_available\":" << resources.commit_available << ",\"devices\":" << resources.devices << '}';
+              << ",\"commit_available\":" << resources.commit_available << ",\"devices\":" << resources.devices;
+    if (resources.vram_total) std::cout << ",\"vram_total\":" << resources.vram_total;
+    std::cout << '}';
 }
 // Scalar inventory bounds apply to both resolved configurations and an incomplete minimum price.
 // Ordered layout/replay validation remains exclusively in validate_launch_settings().
@@ -740,7 +742,8 @@ bool discover_launch_resources(LaunchResources& resources, std::string& error) {
             size_t free=0,total=0; int devices=0;
             if (cudaGetDeviceCount(&devices)!=cudaSuccess || devices!=1 || cudaMemGetInfo(&free,&total)!=cudaSuccess)
                 throw std::invalid_argument("CUDA resource discovery unavailable or unsupported topology");
-            resources.vram_free=free; resources.devices=(unsigned) devices;
+            if (!total || free>total) throw std::invalid_argument("inconsistent CUDA resource snapshot");
+            resources.vram_free=free; resources.vram_total=total; resources.devices=(unsigned) devices;
         }
         if (!resources.ram_available || !resources.commit_available) {
             core::detail::HostMemory host;
@@ -774,7 +777,9 @@ int launch_metadata_main(int argc, char** argv) {
                       << price.vram_shortfall << ",\"ram\":" << price.ram_shortfall << ",\"commit\":" << price.commit_shortfall << "}}}\n";
             return 0;
         }
-        if (!discover_launch_resources(resources,error)) throw std::invalid_argument(error);
+        // Complete injected budgets, including zero, must never trigger live discovery.
+        default_launch_environment();
+        if (!r.budget_given && !discover_launch_resources(resources,error)) throw std::invalid_argument(error);
         LaunchResolution out;
         if (!resolve_launch(r,resources,out,error)) throw std::invalid_argument(error);
         std::cout << "{\"schema\":1,\"native_schema\":" << launch_schema

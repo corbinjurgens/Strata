@@ -18,6 +18,8 @@ struct LaunchResources {
     uint64_t vram_free = 0, ram_available = 0, commit_available = 0;
     unsigned devices = 1;
     bool cuda = true;
+    // Set only by CUDA discovery; an injected budget has no observed total.
+    uint64_t vram_total = 0;
 };
 
 struct LaunchRequest {

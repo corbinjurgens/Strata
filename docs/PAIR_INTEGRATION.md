@@ -130,13 +130,21 @@ the native payload limit is 1 MiB.
 | `launch` | Absolute `executable`, exact `argv` including executable, absolute `cwd`, native `environment` |
 | `server` | Sanitized effective server settings, without credentials |
 | `inputs` | Sanitized config identity/path, executable SHA256, file identity/metadata records |
-| `hardware` | Selected index/name/identity, device count, total/free VRAM, total/available RAM, commit availability and basis |
+| `hardware` | Selected index/name/identity, device count, inventory total VRAM, native CUDA free VRAM, total/available RAM, commit availability and basis |
 | `requested` | Original args, policy-presence flag and composed native request; automatic markers may remain here |
 | `resolved` | Concrete native numbers, ordered cache slot layout, resident order, layer blob sizes and KV stage runs |
 | `native` | Capabilities, build identity, exact `native_payload_base64`, its SHA256, expected `effective_payload` |
 | `estimates` | Categorized native count-only VRAM/RAM estimates, allowances, unknown costs and unavailable runtime comparison |
 | `admission` | Required `vram_free_bytes`, `ram_available_bytes`, `commit_available_bytes` |
 | `approval` | Explicit statement that integrity is not PAIR authorization |
+
+Live planning samples free VRAM in the native resolver under the frozen CUDA
+environment. NVIDIA inventory supplies device identity and total VRAM; its
+pre-context free counter is not the native allocation budget. The two APIs can
+report slightly different totals for the same card, so replay compares inventory
+identity with inventory identity. Explicit injected test budgets remain exact.
+This does not change the discovery-free pure memory-plan API or guarantee that
+unpriced runtime costs fit. Host policy and strict startup can still refuse.
 
 `launch.environment` has `set`, `remove` and `remove_prefixes`.
 Native controls/search inputs are frozen; unexpected
