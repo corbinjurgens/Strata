@@ -123,3 +123,23 @@ profiles, engines and project-note evidence are separate and are not committed h
   The first tools run lacked build tools on its child PATH; the environment-corrected
   rerun passed without a product change. No speedup, remote validation or PAIR acceptance
   is claimed. See [the integration contract](docs/PAIR_INTEGRATION.md).
+
+## 2026-10-29 - Pure engine memory plans (unreleased)
+
+- **What changed:** an opt-in `--estimate-memory --memory-plan-request` call accepts
+  model/configuration and caller budgets, with an engine-neutral JSON core. Native
+  `--resolve-launch --price-only` reuses the loader's count owners without device
+  discovery. Unknown kernel capability uses a qualified conservative prefill bound.
+- **What worked:** guarded native pricing and the unpatched public CLI with a rebuilt
+  CUDA executable and synthetic metadata return resolved configurations, category
+  prices, normal insufficiency/shortfalls and explicit unknown costs. Caller
+  allowances stay outside automatic cache selection; selection-policy capacity is
+  separate from allocated bytes. Incomplete minimum prices expose no resolved launch.
+- **What remains open:** this is metadata pricing, not automatic live-load acceptance.
+  Required runtime/transient costs may remain unknown, full model content identity is
+  unverified and results are not content-cacheable. V1 supports the bounded single-CUDA
+  serial native profile. No model/GPU workload, speedup, physical-residency, remote,
+  full legacy runtime, HIP or SYCL acceptance is claimed.
+- **Verification:** CUDA compilation, guarded pure native checks, frozen codec
+  roundtrips, focused Python planning/CLI regressions, lint and scoped whitespace.
+  See [the request/response contract](docs/MEMORY_PLAN.md) for fit qualifications.

@@ -63,7 +63,7 @@ def cli_mode_requested(options):
 
 # An installation check must still produce JSON when optional packages are
 # missing. Their imports run in the bounded child probe instead of this process.
-if not cli_mode_requested(("--check-install",)):
+if not cli_mode_requested(("--check-install", "--memory-plan-request")):
     from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,
                                 forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                                 tool_choice_of, unmark_think_literals)
@@ -6287,6 +6287,8 @@ def main() -> int:
                           help="print a resolved read-only launch plan as JSON and exit")
     planning.add_argument("--estimate-memory", action="store_true",
                           help="print the launch plan's qualified memory estimate as JSON and exit")
+    ap.add_argument("--memory-plan-request", metavar="PATH",
+                    help="with --estimate-memory, price a pure engine-neutral JSON request without observing hardware")
     planning.add_argument("--launch-plan", metavar="PATH", help="replay an approved saved launch plan exactly")
     planning.add_argument("--check-install", action="store_true",
                           help="check imports, native build and driver/runtime usability without a model; print JSON and exit")
@@ -6331,15 +6333,16 @@ def main() -> int:
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     planning_options = [option for action in planning._group_actions for option in action.option_strings]
-    if cli_mode_requested(planning_options):
+    if cli_mode_requested([*planning_options, "--memory-plan-request"]):
         def planning_error(_message):
             # argparse errors may repeat arbitrary supplied values, including a
             # credential accidentally supplied as another option's argument.
-            code = "installation_error" if cli_mode_requested(("--check-install",)) else "invalid_launch_plan"
+            code = ("invalid_memory_plan_arguments" if cli_mode_requested(("--memory-plan-request",)) else
+                    "installation_error" if cli_mode_requested(("--check-install",)) else "invalid_launch_plan")
             print(json.dumps({"error": {"code": code, "message": "Invalid planning command arguments."}}))
             raise SystemExit(2)
         ap.error = planning_error
-        if cli_mode_requested(("--check-install",)) and any(value in ("-h", "--help") for value in sys.argv[1:]):
+        if cli_mode_requested(("--check-install", "--memory-plan-request")) and any(value in ("-h", "--help") for value in sys.argv[1:]):
             ap.error("conflicting help mode")
     a = ap.parse_args()
     explicit = set()
@@ -6349,6 +6352,9 @@ def main() -> int:
             actions = [action for action in ap._actions if any(option.startswith(name) for option in action.option_strings)]
             if len(actions) == 1:
                 explicit.add(actions[0].dest)
+    if a.memory_plan_request is not None:
+        from serve.memory_plan import planning_main
+        return planning_main(a, explicit)
     if a.check_install:
         from serve.install_check import check_main
         return check_main(a, explicit)
