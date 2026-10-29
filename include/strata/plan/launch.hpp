@@ -27,6 +27,7 @@ struct LaunchRequest {
     int64_t expert_cache = -1;
     uint64_t resident_budget = 0, file_cache = 0, host_headroom = 0, vram_reserve = 700ull << 20;
     bool no_prefill_borrow = false, reserve_given = false, per_layer = false, prefill_auto = false;
+    bool price_only = false, budget_given = false;
 };
 
 struct LaunchSlot {
@@ -59,6 +60,16 @@ struct LaunchResolution {
     // Unknown runtime/library/OS costs are not invented measurements. Reserve is an admission allowance.
     std::string unknown_costs = "CUDA context/modules, graph capture, CPU TLS/request scratch, driver and OS residency";
     std::string payload;
+    // Optional automatic-policy capacity threshold, not an additional allocated component.
+    uint64_t minimum_policy_vram_free_bytes = 0;
+};
+
+/// Pure metadata pricing. Within-budget covers priced components only, never total runtime fit.
+struct LaunchPrice {
+    LaunchResolution resolution;
+    bool configuration_complete = true;
+    std::string status = "not_evaluated";
+    uint64_t vram_shortfall = 0, ram_shortfall = 0, commit_shortfall = 0;
 };
 
 uint64_t launch_add(uint64_t a, uint64_t b);
@@ -78,6 +89,9 @@ bool read_launch_frame(std::istream&, std::string& payload, std::string& error);
 /// Binary, unbuffered stdin handoff to the later raw-fd command reader.
 bool read_launch_stdin(std::string& payload, std::string& error);
 bool resolve_launch(const LaunchRequest&, const LaunchResources&, LaunchResolution&, std::string& error);
+/// A null budget prices explicit settings only. Zero-valued budgets are explicit insufficiency.
+/// Never discovers resources, mutates the environment, or emits an approved replay payload.
+bool price_launch(const LaunchRequest&, const LaunchResources* budget, LaunchPrice&, std::string& error);
 /// Reprice metadata and admit saved settings without selecting or resizing any settings.
 bool admit_launch(const LaunchRequest&, const LaunchResources&, const LaunchSettings&, std::string& error);
 /// Strict argv subset, shared with the metadata CLI. Rejects unsupported startup owners.

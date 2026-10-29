@@ -69,6 +69,19 @@ public:
     };
     static Sizing sizing_inputs(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
                                 const core::SessionSizing& kv);
+    /// Immutable kernel decisions for count-only callers. Predicates must not observe a device.
+    /// This inventory is not an approved runtime configuration.
+    struct KernelPolicy {
+        std::function<bool(int, int64_t)> mmq_fits;
+        std::function<bool(int, int)> native_fused;
+        int ring = staging_slots;
+        bool fused_layout = false;
+    };
+    static Sizing sizing_inputs_with_policy(const core::ModelGeometry&, int64_t cells, int64_t chunk,
+                                            const core::SessionSizing&, const KernelPolicy&);
+    /// CUDA owned-buffer upper bound over unknown MMQ/fused capability, without device observation.
+    static Sizing sizing_envelope(const core::ModelGeometry&, int64_t cells, int64_t chunk,
+                                  const core::SessionSizing&);
     static uint64_t bytes_needed_for(const Sizing& inputs, bool owned_pages);
     static void resolve_stager(Sizing& inputs, bool files);
     static bool check_strict_sizing(const Sizing& approved, const Sizing& actual, bool borrowed,

@@ -194,10 +194,36 @@ void print_components(const std::map<std::string, uint64_t>& c) {
     for (const auto& [k, v] : c) { if (!first) std::cout << ','; first = false; std::cout << quote(k) << ':' << v; }
     std::cout << '}';
 }
+void print_settings(const LaunchSettings& s) {
+    std::cout << '{'; bool first=true;
+#define JSON_FIELD(name) if (!first) std::cout << ','; first=false; std::cout << "\"" #name "\":" << s.name;
+    LAUNCH_FIELDS(JSON_FIELD)
+#undef JSON_FIELD
+    std::cout << ",\"resident_order\":[" << list(s.resident_order) << "],\"layer_blobs\":[" << list(s.layer_blobs)
+              << "],\"kv_stage_runs\":[" << list(s.kv_stage_runs) << "],\"slots\":[";
+    first=true;
+    for (auto slot:s.slots) {
+        if (!first) std::cout << ','; first=false;
+        std::cout << '[' << slot.layer << ',' << slot.expert << ',' << slot.bytes << ',' << slot.offset << ']';
+    }
+    std::cout << "]}";
 }
-
-bool validate_launch_settings(const LaunchSettings& s, std::string& error) {
-    try {
+void print_estimates(const LaunchResolution& out) {
+    std::cout << "{\"vram\":"; print_components(out.vram);
+    std::cout << ",\"ram\":"; print_components(out.ram);
+    std::cout << ",\"vram_required\":" << out.vram_required << ",\"ram_required\":" << out.ram_required
+              << ",\"commit_required\":" << out.commit_required << ",\"unknown_costs\":" << quote(out.unknown_costs);
+    if (out.minimum_policy_vram_free_bytes)
+        std::cout << ",\"minimum_policy_vram_free_bytes\":" << out.minimum_policy_vram_free_bytes;
+    std::cout << '}';
+}
+void print_resources(const LaunchResources& resources) {
+    std::cout << "{\"vram_free\":" << resources.vram_free << ",\"ram_available\":" << resources.ram_available
+              << ",\"commit_available\":" << resources.commit_available << ",\"devices\":" << resources.devices << '}';
+}
+// Scalar inventory bounds apply to both resolved configurations and an incomplete minimum price.
+// Ordered layout/replay validation remains exclusively in validate_launch_settings().
+void check_launch_inventory(const LaunchSettings& s) {
         if (!s.context || s.context > 1048576 || !s.prefill || s.prefill > 32768 || s.prefill > s.context ||
             s.spec != 2 || s.kv > 3 || !replayable_kv_residency(s.context, s.kv_resident) ||
             s.batch || s.batch_groups != 1 || s.parallel != 1 ||
@@ -209,8 +235,7 @@ bool validate_launch_settings(const LaunchSettings& s, std::string& error) {
             !s.region || s.region > 64 * GiB || s.prefill_mmq > 1 || s.prefill_stage_own ||
             s.prefill_reserve_bo > 1 || s.prefill_ring_enabled > 1 || !s.experts || s.experts > 512 || s.top_k != 10 ||
             !s.vocab || s.vocab > 1048576 || !s.max_blob || s.max_blob > GiB || s.layer_blobs.size() != 48 ||
-            s.slots.empty() || s.slots.size() > 48 * s.experts || s.kv_stage_runs.size() > 4 ||
-            s.resident_experts > 48 * s.experts - s.slots.size() || s.resident_order.size() != s.resident_experts ||
+            s.kv_stage_runs.size() > 4 ||
             s.file_cache_compact > 1 || s.file_cache_effective > s.file_cache || s.cache_request > 48 * 512 ||
             !s.vram_required || !s.ram_required || s.commit_required < s.ram_required ||
             s.vram_required > (1ull << 40) || s.commit_required > (4ull << 40))
@@ -218,6 +243,15 @@ bool validate_launch_settings(const LaunchSettings& s, std::string& error) {
         if (!s.stager_threads || s.stager_threads>32 || s.stager_ring<2 || s.stager_ring>256 ||
             !s.stager_batch || s.stager_batch>32 || s.stager_batch>s.stager_ring)
             throw std::invalid_argument("invalid host stager geometry");
+}
+}
+
+bool validate_launch_settings(const LaunchSettings& s, std::string& error) {
+    try {
+        check_launch_inventory(s);
+        if (s.slots.empty() || s.slots.size()>48*s.experts ||
+            s.resident_experts>48*s.experts-s.slots.size() || s.resident_order.size()!=s.resident_experts)
+            throw std::invalid_argument("unsupported native settings");
         for (auto b : s.layer_blobs) if (!b || b > s.max_blob) throw std::invalid_argument("invalid layer blob");
         if (*std::max_element(s.layer_blobs.begin(), s.layer_blobs.end()) != s.max_blob)
             throw std::invalid_argument("max blob mismatch");
@@ -372,14 +406,17 @@ bool read_launch_stdin(std::string& payload, std::string& error) {
     return read_launch_frame(input,payload,error);
 }
 
-static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resources, LaunchResolution& result,
-                           const LaunchSettings* approved, std::string& error) {
+static bool price_launch_geometry(const LaunchRequest& r, const LaunchResources* budget, LaunchResolution& result,
+                                  const LaunchSettings* approved, bool pure, bool& complete, std::string& error) {
     try {
+        complete=true;
+        if (!budget && (r.expert_cache==-1 || r.prefill_auto))
+            throw std::invalid_argument("requires_budget: automatic launch pricing requires a complete budget");
         if (approved && r.prefill_auto) throw std::invalid_argument("strict launch requires resolved numeric prefill");
         const uint64_t chunk=r.prefill_auto ? prefill::owned_auto_chunk(r.no_prefill_borrow,!r.profile.empty()) : r.prefill;
-        if (!resources.cuda || resources.devices != 1) throw std::invalid_argument("planned metadata supports one CUDA device only");
+        if (budget && (!budget->cuda || budget->devices != 1)) throw std::invalid_argument("planned metadata supports one CUDA device only");
         if (r.shards.size() > core::ownership_shard_limit) throw std::invalid_argument("planned ownership shard bound exceeded");
-        if (!resources.vram_free || !resources.ram_available || !resources.commit_available)
+        if (!pure && (!budget->vram_free || !budget->ram_available || !budget->commit_available))
             throw std::invalid_argument("required resource snapshot is unavailable");
         if (!r.context || r.context > 1048576 || !chunk || chunk > 32768 || chunk > r.context || r.spec != 2 ||
             r.kv > 3 || !replayable_kv_residency(r.context, r.kv_resident) ||
@@ -467,7 +504,11 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         s.experts=g.n_expert; s.top_k=k; s.vocab=head->shape[1]; s.max_blob=layout.max_blob;
         for (int l=0; l<48; ++l) s.layer_blobs.push_back(layout.blob_bytes(l));
         core::SessionSizing kv; kv.kv=(core::SessionSizing::Kv) r.kv; kv.resident_cells=(int64_t) r.kv_resident;
-        auto pf = prefill::Prefill::sizing_inputs(g, (int64_t) r.context, (int64_t) chunk, kv);
+        auto pf = pure ? prefill::Prefill::sizing_envelope(g,(int64_t)r.context,(int64_t)chunk,kv)
+                       : prefill::Prefill::sizing_inputs(g,(int64_t)r.context,(int64_t)chunk,kv);
+        if (pure) out.unknown_costs += "; prefill_scratch_ring_stage is a conservative CUDA kernel-capability envelope "
+            "(possible MMQ plus FP16 fallback, fused/nonfused carve maxima and native ring bound), not observed runtime allocation; "
+            "prefill settings are envelope count inputs, not replayable runtime settings";
         prefill::Prefill::resolve_stager(pf,!std::filesystem::exists(r.pack+"/experts.bin"));
         s.stager_threads=pf.stager_threads; s.stager_ring=pf.stager_ring; s.stager_batch=pf.stager_batch;
         s.ring=pf.ring; s.workspace=pf.workspace; s.weight_scratch=pf.weight_scratch; s.common=pf.common; s.region=pf.region;
@@ -486,37 +527,55 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         out.vram["cache_tables"] = 4*MiB; // residency and slot-pointer allocations, rounded separately
         out.vram["decode_hit_scratch"] = launch_align(kernels::moe_hit_grouped_scratch_bytes(10,2560,640),2*MiB) + 10*MiB;
         uint64_t base = sum(out.vram);
-        if (!approved && launch_add(base,s.vram_reserve) >= resources.vram_free) throw std::invalid_argument("insufficient VRAM before expert slots");
+        const auto fixed=launch_add(base,s.vram_reserve);
+        const uint64_t available=budget && budget->vram_free>fixed ? budget->vram_free-fixed : 0;
+        if (!pure && !approved && fixed >= budget->vram_free) throw std::invalid_argument("insufficient VRAM before expert slots");
         if (approved) {
             s.slots=approved->slots;
             for (const auto& slot:s.slots)
                 if (!unique.count({(int32_t)slot.layer,(int32_t)slot.expert}))
                     throw std::invalid_argument("saved cache pair is absent from profile");
         } else {
-        const uint64_t available = resources.vram_free-base-s.vram_reserve;
-        uint64_t budget = r.expert_cache == -1 ? available : launch_mul((uint64_t) r.expert_cache,s.max_blob);
-        if (budget > available) throw std::invalid_argument("explicit expert cache exceeds resource admission");
+        uint64_t cache_budget = r.expert_cache == -1 ? available : launch_mul((uint64_t) r.expert_cache,s.max_blob);
+        if (!pure && cache_budget > available) throw std::invalid_argument("explicit expert cache exceeds resource admission");
         // Preserve the native uniform-grant provenance, then fill that byte budget in ranking order.
         // Cache allocations round to backing pages; retain that rounding before selecting slots.
-        budget = budget / (2*MiB) * (2*MiB);
-        if (r.expert_cache == -1) budget = launch_mul(std::min<uint64_t>(budget/s.max_blob,ranked.size()),s.max_blob);
+        cache_budget = cache_budget / (2*MiB) * (2*MiB);
+        if (r.expert_cache == -1) cache_budget = launch_mul(std::min<uint64_t>(cache_budget/s.max_blob,ranked.size()),s.max_blob);
         uint64_t used=0;
         auto add_slot = [&](uint64_t l,uint64_t e) {
             const auto b=s.layer_blobs[l], aligned=launch_align(b,256);
-            if (launch_add(used,aligned)>budget) return false;
+            if (launch_add(used,aligned)>cache_budget) return false;
             s.slots.push_back({l,e,b,used}); used=launch_add(used,aligned); return true;
         };
+        uint64_t layer_sum=0;
+        for (auto b:s.layer_blobs) layer_sum=launch_add(layer_sum,launch_align(b,256));
+        if (pure && r.expert_cache==-1) {
+            const auto minimum=r.per_layer ? layer_sum : launch_align(s.layer_blobs[ranked.front().first],256);
+            const auto grants=minimum/s.max_blob+(minimum%s.max_blob!=0);
+            if (grants>ranked.size()) throw std::invalid_argument("profile cannot support minimum automatic grant");
+            // Selection first rounds available bytes down to pages, then grants whole max_blob units.
+            // Report that policy threshold separately from the actual minimum arena allocation.
+            out.minimum_policy_vram_free_bytes=launch_add(fixed,launch_align(launch_mul(grants,s.max_blob),2*MiB));
+        }
+        auto select_slots = [&] {
         if (r.per_layer) {
-            uint64_t layer_sum=0;
-            for (auto b:s.layer_blobs) layer_sum=launch_add(layer_sum,launch_align(b,256));
-            const auto quota=std::min<uint64_t>(budget/layer_sum,s.experts);
+            const auto quota=std::min<uint64_t>(cache_budget/layer_sum,s.experts);
             for (uint64_t l=0;l<48;++l) {
                 uint64_t n=0;
                 for (auto [pl,pe]:ranked) if ((uint64_t) pl==l && n<quota) { add_slot(l,pe); ++n; }
                 if (n!=quota) throw std::invalid_argument("profile cannot fill per-layer quota");
             }
         } else for (auto [l,e]:ranked) if (!add_slot(l,e)) break;
-        if (s.slots.empty()) throw std::invalid_argument("no expert cache slots fit");
+        };
+        select_slots();
+        if (s.slots.empty()) {
+            if (!pure || r.expert_cache!=-1) throw std::invalid_argument("no expert cache slots fit");
+            // Price the smallest supported policy layout, never a zero-cache launch.
+            complete=false;
+            cache_budget=r.per_layer ? layer_sum : launch_align(s.layer_blobs[ranked.front().first],256);
+            select_slots();
+        }
         }
         uint64_t used=0;
         for (auto slot:s.slots) used=launch_add(used,launch_align(slot.bytes,256));
@@ -546,13 +605,41 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         out.commit_required=launch_add(out.ram_required,out.vram_required);
         s.vram_required=out.vram_required; s.ram_required=out.ram_required; s.commit_required=out.commit_required;
         if (approved && !(s==*approved)) throw std::invalid_argument("saved launch disagrees with metadata, argv or environment");
-        if (out.vram_required>resources.vram_free || out.ram_required>resources.ram_available ||
-            out.commit_required>resources.commit_available) throw std::invalid_argument("insufficient_resources: insufficient launch resources");
-        out.payload=encode_launch_settings(s);
-        LaunchSettings roundtrip;
-        if (!decode_launch_settings(out.payload,roundtrip,error) || !(roundtrip==s)) throw std::logic_error("native codec round trip mismatch");
+        if (!complete) check_launch_inventory(s);
+        if (complete && !validate_launch_settings(s,error)) return false;
         result=std::move(out); return true;
     } catch (const std::exception& e) { error=e.what(); return false; }
+}
+
+static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resources, LaunchResolution& out,
+                           const LaunchSettings* approved, std::string& error) {
+    try {
+        LaunchResolution priced; bool complete;
+        if (!price_launch_geometry(r,&resources,priced,approved,false,complete,error)) return false;
+        if (priced.vram_required>resources.vram_free || priced.ram_required>resources.ram_available ||
+            priced.commit_required>resources.commit_available)
+            throw std::invalid_argument("insufficient_resources: insufficient launch resources");
+        priced.payload=encode_launch_settings(priced.settings);
+        LaunchSettings roundtrip;
+        if (!decode_launch_settings(priced.payload,roundtrip,error) || !(roundtrip==priced.settings))
+            throw std::logic_error("native codec round trip mismatch");
+        out=std::move(priced); return true;
+    } catch (const std::exception& e) { error=e.what(); return false; }
+}
+
+bool price_launch(const LaunchRequest& r, const LaunchResources* budget, LaunchPrice& result, std::string& error) {
+    LaunchPrice out;
+    if (!price_launch_geometry(r,budget,out.resolution,nullptr,true,out.configuration_complete,error)) return false;
+    if (budget) {
+        const auto& p=out.resolution;
+        const auto vram_requirement=std::max(p.vram_required,p.minimum_policy_vram_free_bytes);
+        out.vram_shortfall=vram_requirement>budget->vram_free ? vram_requirement-budget->vram_free : 0;
+        out.ram_shortfall=p.ram_required>budget->ram_available ? p.ram_required-budget->ram_available : 0;
+        out.commit_shortfall=p.commit_required>budget->commit_available ? p.commit_required-budget->commit_available : 0;
+        out.status=out.vram_shortfall || out.ram_shortfall || out.commit_shortfall || !out.configuration_complete
+            ? "does_not_fit" : "within_priced_budget";
+    }
+    result=std::move(out); return true;
 }
 
 bool resolve_launch(const LaunchRequest& r, const LaunchResources& resources, LaunchResolution& out, std::string& error) {
@@ -591,6 +678,10 @@ bool parse_launch_request(int argc, char** argv, LaunchRequest& r, LaunchResourc
             if (key=="generate" || (!strict && key=="--resolve-launch")) continue;
             if (!seen.insert(key).second) throw std::invalid_argument("duplicate metadata option");
             if (strict && (key=="--strict-launch-stdin" || key=="--serve")) continue;
+            if (key=="--price-only") {
+                if (strict) throw std::invalid_argument("strict launch refuses --price-only");
+                r.price_only=true; continue;
+            }
             if (key=="--no-prefill-borrow") { r.no_prefill_borrow=true; continue; }
             if (key=="--expert-cache-per-layer") { r.per_layer=true; continue; }
             if (i+1>=argc) throw std::invalid_argument("metadata option requires a value");
@@ -625,6 +716,10 @@ bool parse_launch_request(int argc, char** argv, LaunchRequest& r, LaunchResourc
         }
         if (strict && (!seen.count("--serve") || !seen.count("--suffix-draft") || !seen.count("--lookup-chain")))
             throw std::invalid_argument("strict startup requires --serve --suffix-draft 0 --lookup-chain 0");
+        const auto budgets=seen.count("--plan-vram-free-bytes")+seen.count("--plan-ram-available-bytes")+
+                           seen.count("--plan-commit-available-bytes");
+        if (r.price_only && budgets && budgets!=3) throw std::invalid_argument("price-only requires all budget fields or none");
+        r.budget_given=budgets==3;
         return true;
     } catch (const std::exception& e) { error=e.what(); return false; }
 }
@@ -659,8 +754,27 @@ bool discover_launch_resources(LaunchResources& resources, std::string& error) {
 int launch_metadata_main(int argc, char** argv) {
     try {
         LaunchRequest r; LaunchResources resources; std::string error;
-        if (!parse_launch_request(argc,argv,r,resources,false,error) || !discover_launch_resources(resources,error))
-            throw std::invalid_argument(error);
+        if (!parse_launch_request(argc,argv,r,resources,false,error)) throw std::invalid_argument(error);
+        if (r.price_only) {
+            LaunchPrice price;
+            if (!resources.cuda) throw std::invalid_argument("planned metadata supports one CUDA device only");
+            if (!price_launch(r,r.budget_given ? &resources : nullptr,price,error)) throw std::invalid_argument(error);
+            std::cout << "{\"schema\":1,\"kind\":\"native_memory_price\",\"configuration_complete\":"
+                      << (price.configuration_complete ? "true" : "false")
+                      << ",\"estimate_basis\":" << quote(price.configuration_complete
+                          ? "resolved_cache_layout_with_conservative_prefill_envelope"
+                          : "minimum_supported_layout_with_conservative_prefill_envelope")
+                      << ",\"settings\":";
+            if (price.configuration_complete) print_settings(price.resolution.settings);
+            else std::cout << "null";
+            std::cout << ",\"estimates\":"; print_estimates(price.resolution);
+            std::cout << ",\"budget\":";
+            if (r.budget_given) print_resources(resources); else std::cout << "null";
+            std::cout << ",\"fit\":{\"status\":" << quote(price.status) << ",\"shortfall_bytes\":{\"vram\":"
+                      << price.vram_shortfall << ",\"ram\":" << price.ram_shortfall << ",\"commit\":" << price.commit_shortfall << "}}}\n";
+            return 0;
+        }
+        if (!discover_launch_resources(resources,error)) throw std::invalid_argument(error);
         LaunchResolution out;
         if (!resolve_launch(r,resources,out,error)) throw std::invalid_argument(error);
         std::cout << "{\"schema\":1,\"native_schema\":" << launch_schema
@@ -669,23 +783,10 @@ int launch_metadata_main(int argc, char** argv) {
                   << ",\"ownership_shard_limit\":" << core::ownership_shard_limit << ','
                   << "\"effective_protocol\":\"STRATA-EFFECTIVE/1\",\"effective_payload\":" << quote(encode_effective_launch(out.settings))
                   << ",\"native_payload\":" << quote(out.payload)
-                  << ",\"settings\":{";
-        bool first=true;
-#define JSON_FIELD(name) if (!first) std::cout << ','; first=false; std::cout << "\"" #name "\":" << out.settings.name;
-        LAUNCH_FIELDS(JSON_FIELD)
-#undef JSON_FIELD
-        std::cout << ",\"resident_order\":[" << list(out.settings.resident_order) << "],\"layer_blobs\":[" << list(out.settings.layer_blobs) << "],\"kv_stage_runs\":[" << list(out.settings.kv_stage_runs) << "],\"slots\":[";
-        first=true;
-        for (auto slot:out.settings.slots) {
-            if (!first) std::cout << ','; first=false;
-            std::cout << '[' << slot.layer << ',' << slot.expert << ',' << slot.bytes << ',' << slot.offset << ']';
-        }
-        std::cout << "]},\"estimates\":{\"vram\":"; print_components(out.vram);
-        std::cout << ",\"ram\":"; print_components(out.ram);
-        std::cout << ",\"vram_required\":" << out.vram_required << ",\"ram_required\":" << out.ram_required
-                  << ",\"commit_required\":" << out.commit_required << ",\"unknown_costs\":" << quote(out.unknown_costs)
-                  << "},\"resources\":{\"vram_free\":" << resources.vram_free << ",\"ram_available\":" << resources.ram_available
-                  << ",\"commit_available\":" << resources.commit_available << ",\"devices\":" << resources.devices << "}}\n";
+                  << ",\"settings\":";
+        print_settings(out.settings);
+        std::cout << ",\"estimates\":"; print_estimates(out);
+        std::cout << ",\"resources\":"; print_resources(resources); std::cout << "}\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << core::native_error_message("native launch metadata",e.what(),"invalid_launch_plan") << '\n'; return 2;

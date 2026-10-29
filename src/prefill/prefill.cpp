@@ -307,9 +307,17 @@ inline int ring_budget_slots() {
     const int cap = ring_cap();
     return (int) (n <= 0 ? 0 : (n > cap ? cap : n));
 }
-inline int ring_slots(size_t T) {
+inline int resolve_ring_slots(size_t T, int pinned_ring, int cap) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
+    const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
+    const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
+    if (v && r == STAGE) return STAGE;
+    const int big = r < Prefill::streaming_ring_min ? Prefill::streaming_ring_min : r > cap ? cap : r;
+    return (int64_t) T >= stream_all_min() ? big : STAGE;
+}
+inline int ring_slots(size_t T) {
 #if defined(STRATA_USE_HIP)
+    const char* v = std::getenv("STRATA_PREFILL_RING");
     // S6: with the opt-in RDNA4 matrix-core attention (STRATA_HIP_WMMA=1) a 96-slot ring: measured with it, 9070 XT
     // 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
     static const bool wmma = [] {
@@ -324,11 +332,7 @@ inline int ring_slots(size_t T) {
     // 0.1.39's ring (1024 fused / 384 pinned, 96 when a large share goes through host copies), and the #583 byte
     // budget the auto scan chose for chunks past the size 0.1.39's rule would have picked (set_ring_budget)
     const int pinned_ring = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
-    const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
-    const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
-    if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
-    const int big = r < Prefill::streaming_ring_min ? Prefill::streaming_ring_min : r > ring_cap() ? ring_cap() : r;
-    return (int64_t) T >= stream_all_min() ? big : STAGE;
+    return resolve_ring_slots(T,pinned_ring,ring_cap());
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
@@ -1016,8 +1020,8 @@ struct MmqPlan {
                                                // (gfx11: UD-Q4_K_XL's Q4_K / Q5_K and Q5_1 / Q8_0 experts, STRATA_PF_FUSED=1)
     size_t gu_max = 0, d_max = 0;
 };
-const MmqPlan& mmq_plan() {
-    static const MmqPlan plan = [] {
+template<class Fits, class NativeFused>
+MmqPlan build_mmq_plan(Fits fits, NativeFused native_fused) {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
@@ -1029,10 +1033,10 @@ const MmqPlan& mmq_plan() {
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
-            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+            if (!fits(gt, 1280) || !fits(dt, N)) {
                 p.fallback = true;
                 // the fused path's buffers (Xq, H) exist for it; a chunk it does not take (a small one) keeps the FP16 path
-                if (on && lay.native && fused::native_supported(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
+                if (on && lay.native && native_fused(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
                 continue;
             }
             p.layer[(size_t) l] = 1;
@@ -1041,16 +1045,18 @@ const MmqPlan& mmq_plan() {
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
         return p;
-    }();
+}
+const MmqPlan& mmq_plan() {
+    static const MmqPlan plan = build_mmq_plan(mmq::fits,fused::native_supported);
     return plan;
 }
-detail::WeightScratchLayout weight_scratch_layout() {
-    const MmqPlan& mp = mmq_plan();
+detail::WeightScratchLayout weight_scratch_layout(const MmqPlan& mp) {
     return detail::weight_scratch_layout((uint64_t) GEMM_SCRATCH * sizeof(uint16_t),
         mp.any ? MMQ_GROUP * mp.gu_max + MMQ_TAIL : 0,
         mp.any ? MMQ_GROUP * mp.d_max + MMQ_TAIL : 0,
         1280ull * 2560 * sizeof(uint16_t), 2560ull * 640 * sizeof(uint16_t), mp.fallback ? DQ : 0);
 }
+detail::WeightScratchLayout weight_scratch_layout() { return weight_scratch_layout(mmq_plan()); }
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
 // int8 activations, and Hq nothing: ~100 KB a token less than MMQ's FP32 GU / H and per-slot q8_1 rows, which is what
@@ -1072,8 +1078,7 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), 640)};
 }
-uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
-    const MmqPlan& mp = mmq_plan();
+uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused, const MmqPlan& mp) {
     const MoeBufs mb = moe_bufs(T, n_expert, fused);
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
@@ -1089,6 +1094,9 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
         a.take<uint8_t>(mb.hq, ok);
     }
     return a.used;
+}
+uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
+    return moe_set_bytes(T,n_expert,fused,mmq_plan());
 }
 }
 
@@ -2096,25 +2104,29 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
     return bytes_needed_impl(g, ss, chunk, true);
 }
 
-Prefill::Sizing Prefill::sizing_inputs(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
-                                       const core::SessionSizing& kv) {
+namespace {
+Prefill::Sizing sizing_inventory(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
+                                const core::SessionSizing& kv, const MmqPlan& mp, int ring,
+                                bool f16, bool fused, bool envelope) {
     if (cells <= 0 || chunk <= 0)
         throw std::invalid_argument("unsupported prefill count geometry");
-    Sizing i;
+    Prefill::Sizing i;
     const size_t T = (size_t) chunk;
     i.chunk = T; i.experts = g.n_expert;
-    i.weight_scratch = weight_scratch_layout().bytes;
+    i.weight_scratch = weight_scratch_layout(mp).bytes;
     i.workspace = GEMM_WS;
-    i.ring = ring_slots(T); i.max_blob = MAXBLOB(); i.mmq = mmq_plan().any;
+    i.ring = ring; i.max_blob = MAXBLOB(); i.mmq = mp.any;
     i.ring_enabled = ring_bytes_on(); i.reserve_bo = !emb_reuse_account(); i.stage_own = stage_own();
-    i.common = common_set_bytes(T, prompt_f16(), false, i.reserve_bo);
+    i.common = common_set_bytes(T, f16, false, i.reserve_bo);
     auto s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
     s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const auto batches = detail::prompt_batch_caps(T);
+    auto moe=moe_set_bytes(T,g.n_expert,fused,mp);
+    if (envelope && mp.any && fused::built()) moe=std::max(moe,moe_set_bytes(T,g.n_expert,true,mp));
     i.region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, cells / s.idx_block + 2,
-                         batches.select, batches.attention, s), moe_set_bytes(T, g.n_expert, fused_layout(T, true))});
+                         batches.select, batches.attention, s), moe});
     if (kv.resident_cells > 0 && kv.resident_cells < cells) {
         const uint64_t pages = (uint64_t) (cells + s.page_size - 1) / s.page_size;
         const uint64_t rows = pages * s.n_head_kv * s.page_size;
@@ -2128,6 +2140,48 @@ Prefill::Sizing Prefill::sizing_inputs(const core::ModelGeometry& g, int64_t cel
         else i.kv_runs = {rows * s.head_dim * 2, rows * s.head_dim * 2};
     }
     return i;
+}
+}
+
+Prefill::Sizing Prefill::sizing_inputs(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
+                                     const core::SessionSizing& kv) {
+    if (cells<=0 || chunk<=0) throw std::invalid_argument("unsupported prefill count geometry");
+    const auto& mp=mmq_plan();
+    const auto ring=ring_slots((size_t)chunk);
+    const auto f16=prompt_f16();
+    const auto fused=fused_layout((size_t)chunk,true);
+    return sizing_inventory(g,cells,chunk,kv,mp,ring,f16,fused,false);
+}
+
+Prefill::Sizing Prefill::sizing_inputs_with_policy(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
+                                                  const core::SessionSizing& kv, const KernelPolicy& policy) {
+    if (cells<=0 || cells>1048576 || chunk<=0 || chunk>32768 || chunk>cells || g.n_expert<=0 || g.n_expert>512 ||
+        !policy.mmq_fits || !policy.native_fused || stream_all_min()<=0 ||
+        !valid_native_ring(policy.ring)) throw std::invalid_argument("unsupported pure prefill policy");
+    const auto mp=build_mmq_plan(policy.mmq_fits,policy.native_fused);
+    return sizing_inventory(g,cells,chunk,kv,mp,policy.ring,false,policy.fused_layout,false);
+}
+
+Prefill::Sizing Prefill::sizing_envelope(const core::ModelGeometry& g, int64_t cells, int64_t chunk,
+                                       const core::SessionSizing& kv) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL)
+    throw std::invalid_argument("pure prefill envelope supports CUDA only");
+#endif
+    if (cells<=0 || cells>1048576 || chunk<=0 || chunk>32768 || chunk>cells || g.n_expert<=0 || g.n_expert>512 ||
+        !kernels::cpu::expert_layout().native)
+        throw std::invalid_argument("unsupported pure prefill envelope");
+    if (stream_all_min()<=0) throw std::invalid_argument("unsupported STRATA_PREFILL_STREAM_MIN for pure pricing");
+    auto mp=build_mmq_plan([](int type,int64_t) { return mmq::supported(type); },
+                          [](int,int) { return fused::built(); });
+    // Any supported MMQ group may coexist with FP16 fallback on other layers. This union bounds
+    // every subset of fitting types, including fused-only layers, without assuming a device tile fits.
+    mp.fallback=true;
+    // Native rings never exceed 512. The shared policy resolver preserves explicit eight-slot routing,
+    // small-chunk routing, overrides and byte-budget clamps, without fused_ring()/device observation.
+    const int ring=resolve_ring_slots((size_t)chunk,native_ring_capacity,native_ring_capacity);
+    // CUDA's prompt_f16() is unconditionally false. Count both MoE branches: fused grouping may exceed
+    // full-chunk MMQ for small shapes, so their maxima are taken through the same carve owner.
+    return sizing_inventory(g,cells,chunk,kv,mp,ring,false,false,true);
 }
 
 uint64_t Prefill::bytes_needed_for(const Sizing& i, bool owned_pages) {
