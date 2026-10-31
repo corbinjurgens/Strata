@@ -98,6 +98,8 @@ bool price_launch(const LaunchRequest&, const LaunchResources* budget, LaunchPri
 bool admit_launch(const LaunchRequest&, const LaunchResources&, const LaunchSettings&, std::string& error);
 /// Strict argv subset, shared with the metadata CLI. Rejects unsupported startup owners.
 bool parse_launch_request(int argc, char** argv, LaunchRequest&, LaunchResources&, bool strict, std::string& error);
+/// Live CUDA free bytes include required prefill BLAS setup with its temporary handle still alive.
+/// Metadata and strict replay share this basis; complete injected budgets bypass discovery.
 bool discover_launch_resources(LaunchResources&, std::string& error);
 /// Existing engine process default, applied before the first CUDA discovery call.
 void default_launch_environment();

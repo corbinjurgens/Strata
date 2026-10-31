@@ -12,6 +12,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -740,8 +741,17 @@ bool discover_launch_resources(LaunchResources& resources, std::string& error) {
         default_launch_environment();
         if (!resources.vram_free) {
             size_t free=0,total=0; int devices=0;
-            if (cudaGetDeviceCount(&devices)!=cudaSuccess || devices!=1 || cudaMemGetInfo(&free,&total)!=cudaSuccess)
+            if (cudaGetDeviceCount(&devices)!=cudaSuccess || devices!=1)
                 throw std::invalid_argument("CUDA resource discovery unavailable or unsupported topology");
+            // Use the real prefill owner, without model buffers. Keep its handle alive through the
+            // snapshot so required library setup, including transient handle storage, is already covered.
+            // No work is submitted, so the default stream needs no separately allocated stream owner.
+            prefill::Gemm gemm;
+            if (!gemm.init_external(nullptr,nullptr,0,nullptr,0,error,true)) return false;
+            if (const auto status=cudaDeviceSynchronize(); status!=cudaSuccess)
+                throw std::invalid_argument(std::string("CUDA resource discovery synchronize: ")+cudaGetErrorString(status));
+            if (const auto status=cudaMemGetInfo(&free,&total); status!=cudaSuccess)
+                throw std::invalid_argument(std::string("CUDA resource discovery snapshot: ")+cudaGetErrorString(status));
             if (!total || free>total) throw std::invalid_argument("inconsistent CUDA resource snapshot");
             resources.vram_free=free; resources.vram_total=total; resources.devices=(unsigned) devices;
         }

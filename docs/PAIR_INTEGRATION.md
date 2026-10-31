@@ -82,6 +82,16 @@ byte equality across different observations. Replay can observe current
 resources for admission, but does not run policy or resize approved settings.
 Conflicting replay CLI overrides refuse; supply credentials separately.
 
+Live native metadata planning and strict replay initialize the required prefill
+cuBLAS setup through the existing GEMM owner before synchronizing and reading
+CUDA free memory. The temporary handle stays alive during the reading, with no
+model buffers allocated. Its destructor then releases the handle; production
+prefill creates its own handle later. This measures the live library basis and
+does not deduct an invented fixed library cost or reduce the reserve allowance.
+Other runtime, driver and OS costs remain unknown. Pure `--price-only` and
+complete injected budgets, including zero budgets, perform no live discovery
+or BLAS setup. Ordinary startup keeps its existing initialization path.
+
 Saved replay also retains `log` from the original local config, outside the
 public plan and its digest. Relative log paths resolve against the saved launch
 working directory. PAIR should set a private local diagnostic destination before

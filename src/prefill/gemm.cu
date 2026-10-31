@@ -419,7 +419,7 @@ uint64_t trace_free_bytes(const char* where) {
 #endif
 
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                         std::string& err, bool require_stream_binding) {
+                         std::string& err, bool require_setup) {
     cublasHandle_t h = nullptr;
 #if defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
     const uint64_t free_pre = trace_free_bytes("before cublasCreate");
@@ -438,14 +438,24 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     stream_ = stream;
     external_ = true;
     const cublasStatus_t stream_status = cublasSetStream(h, (cudaStream_t) stream);
-    if (require_stream_binding && stream_status != CUBLAS_STATUS_SUCCESS) {
+    if (require_setup && stream_status != CUBLAS_STATUS_SUCCESS) {
         err = "prefill gemm: cublasSetStream: cuBLAS status " + std::to_string((int) stream_status);
         return false;
     }
     note(stream_status, "cublasSetStream");
     workspace_ = workspace;
-    note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
-    note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+    const cublasStatus_t workspace_status = cublasSetWorkspace(h, workspace_, ws_bytes);
+    if (require_setup && workspace_status != CUBLAS_STATUS_SUCCESS) {
+        err = "prefill gemm: cublasSetWorkspace: cuBLAS status " + std::to_string((int) workspace_status);
+        return false;
+    }
+    note(workspace_status, "cublasSetWorkspace");
+    const cublasStatus_t math_status = cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+    if (require_setup && math_status != CUBLAS_STATUS_SUCCESS) {
+        err = "prefill gemm: cublasSetMathMode: cuBLAS status " + std::to_string((int) math_status);
+        return false;
+    }
+    note(math_status, "cublasSetMathMode");
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)

@@ -8,6 +8,9 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+#include <cublas_v2.h>
+#endif
 
 #include <filesystem>
 #include <fstream>
@@ -48,12 +51,77 @@ void require(bool pass, const char* what) {
     ++checks;
     if (!pass) throw std::runtime_error(what);
 }
-#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)) && \
+    !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+struct DiscoveryControl {
+    std::string events, fail;
+    int devices=1;
+    bool alive=false, inconsistent=false;
+} discovery;
+void discovery_event(const char* name) { discovery.events+=std::string(name)+";"; }
+cudaError_t CUDARTAPI discovery_devices(int* devices) {
+    discovery_event("devices"); *devices=discovery.devices;
+    return discovery.fail=="devices" ? cudaErrorInvalidValue : cudaSuccess;
+}
+cudaError_t CUDARTAPI discovery_sync() {
+    require(discovery.alive,"BLAS handle stays alive during synchronization");
+    discovery_event("sync");
+    return discovery.fail=="sync" ? cudaErrorInvalidValue : cudaSuccess;
+}
+cudaError_t CUDARTAPI discovery_memory(size_t* free, size_t* total) {
+    require(discovery.alive,"BLAS handle stays alive during the resource snapshot");
+    require(discovery.events=="devices;create;stream;workspace;math;sync;","required BLAS setup precedes snapshot");
+    discovery_event("sample"); *free=8ull<<30; *total=discovery.inconsistent ? 1 : 16ull<<30;
+    return discovery.fail=="sample" ? cudaErrorInvalidValue : cudaSuccess;
+}
+const char* CUDARTAPI discovery_error(cudaError_t) { return "injected CUDA failure"; }
+cublasStatus_t CUBLASWINAPI discovery_create(cublasHandle_t* handle) {
+    require(discovery.events=="devices;","topology validated before BLAS setup");
+    discovery_event("create");
+    if (discovery.fail=="create") return CUBLAS_STATUS_ALLOC_FAILED;
+    *handle=reinterpret_cast<cublasHandle_t>(1); discovery.alive=true;
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t CUBLASWINAPI discovery_destroy(cublasHandle_t handle) {
+    require(discovery.alive && handle==reinterpret_cast<cublasHandle_t>(1),"real GEMM owner releases its handle once");
+    discovery_event("destroy"); discovery.alive=false;
+    return CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t CUBLASWINAPI discovery_stream(cublasHandle_t, cudaStream_t stream) {
+    require(discovery.alive && stream==nullptr,"library-only discovery uses the default stream");
+    discovery_event("stream");
+    return discovery.fail=="stream" ? CUBLAS_STATUS_INVALID_VALUE : CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t CUBLASWINAPI discovery_workspace(cublasHandle_t, void* workspace, size_t bytes) {
+    require(discovery.alive && workspace==nullptr && bytes==0,"discovery allocates no model workspace");
+    discovery_event("workspace");
+    return discovery.fail=="workspace" ? CUBLAS_STATUS_INVALID_VALUE : CUBLAS_STATUS_SUCCESS;
+}
+cublasStatus_t CUBLASWINAPI discovery_math(cublasHandle_t, cublasMath_t mode) {
+    require(discovery.alive && mode==CUBLAS_DEFAULT_MATH,"discovery uses production GEMM math setup");
+    discovery_event("math");
+    return discovery.fail=="math" ? CUBLAS_STATUS_INVALID_VALUE : CUBLAS_STATUS_SUCCESS;
+}
+void (*discovery_override(const char* name))() {
+#define DISCOVERY_OVERRIDE(symbol, replacement) \
+    if (std::strstr(name,#symbol)) return reinterpret_cast<void(*)()>(&replacement)
+    DISCOVERY_OVERRIDE(cudaGetDeviceCount,discovery_devices);
+    DISCOVERY_OVERRIDE(cudaDeviceSynchronize,discovery_sync);
+    DISCOVERY_OVERRIDE(cudaMemGetInfo,discovery_memory);
+    DISCOVERY_OVERRIDE(cudaGetErrorString,discovery_error);
+    DISCOVERY_OVERRIDE(cublasCreate,discovery_create);
+    DISCOVERY_OVERRIDE(cublasDestroy,discovery_destroy);
+    DISCOVERY_OVERRIDE(cublasSetStream,discovery_stream);
+    DISCOVERY_OVERRIDE(cublasSetWorkspace,discovery_workspace);
+    DISCOVERY_OVERRIDE(cublasSetMathMode,discovery_math);
+#undef DISCOVERY_OVERRIDE
+    return nullptr;
+}
 [[noreturn]] void forbidden_device_call() {
     std::cerr << "FAIL CPU launch test reached a device/runtime call\n";
     std::abort();
 }
-void forbid_device_calls() {
+void forbid_device_calls(bool discovery_mode=false) {
     // This build may link cudart statically, so guard its entry points as well as DLL imports.
     auto guard=[](auto function, void (*failure)()) {
         unsigned char jump[12]={0x48,0xb8}; // mov rax, address; jmp rax (Windows x64)
@@ -65,8 +133,10 @@ void forbid_device_calls() {
         require(VirtualProtect(address,sizeof jump,old,&ignored)!=0,"restore static runtime entry protection");
         require(FlushInstructionCache(GetCurrentProcess(),address,sizeof jump)!=0,"publish static runtime guard");
     };
-#define GUARD_DEVICE(function) guard(function,+[]{ std::cerr << "FAIL CPU launch test reached " #function "\n"; std::abort(); })
+#define GUARD_DEVICE(function) guard(function,discovery_mode && discovery_override(#function) ? discovery_override(#function) : \
+    +[]{ std::cerr << "FAIL CPU launch test reached " #function "\n"; std::abort(); })
     GUARD_DEVICE(&cudaGetDeviceCount); GUARD_DEVICE(&cudaMemGetInfo); GUARD_DEVICE(&cudaGetDevice); GUARD_DEVICE(&cudaSetDevice);
+    GUARD_DEVICE(&cudaDeviceSynchronize); GUARD_DEVICE(&cudaGetErrorString);
     GUARD_DEVICE(&cudaGetDeviceProperties);
     GUARD_DEVICE(&cudaDeviceGetAttribute);
     GUARD_DEVICE((static_cast<cudaError_t(CUDARTAPI*)(void**,size_t)>(&cudaMalloc)));
@@ -93,13 +163,48 @@ void forbid_device_calls() {
             DWORD old=0,ignored=0;
             require(VirtualProtect(&addresses->u1.Function,sizeof addresses->u1.Function,PAGE_READWRITE,&old)!=0,
                     "guard runtime import");
-            addresses->u1.Function=reinterpret_cast<ULONG_PTR>(&forbidden_device_call);
+            const auto replacement=discovery_mode ? discovery_override(name) : nullptr;
+            addresses->u1.Function=reinterpret_cast<ULONG_PTR>(replacement ? replacement : &forbidden_device_call);
             require(VirtualProtect(&addresses->u1.Function,sizeof addresses->u1.Function,old,&ignored)!=0,
                     "restore runtime import protection");
             ++guarded;
         }
     }
     require(guarded>0,"device/runtime imports guarded for CPU test");
+}
+void discovery_controls() {
+    // Tracing would add extra samples; these controls exercise the admission snapshot alone.
+    _putenv_s("STRATA_TRACE","");
+    auto resources=[] { return LaunchResources{0,48ull<<30,96ull<<30,1,true}; };
+    std::string error;
+    discovery={}; auto live=resources();
+    require(discover_launch_resources(live,error),"live discovery succeeds through real GEMM owner");
+    require(live.vram_free==8ull<<30 && live.vram_total==16ull<<30 && live.devices==1,"live snapshot is used without fixed deduction");
+    require(discovery.events=="devices;create;stream;workspace;math;sync;sample;destroy;" && !discovery.alive,
+            "snapshot covers complete BLAS setup and owner cleanup follows sample");
+    for (const auto& test:std::vector<std::pair<std::string,std::string>>{
+            {"devices","devices;"}, {"create","devices;create;"},
+            {"stream","devices;create;stream;destroy;"},
+            {"workspace","devices;create;stream;workspace;destroy;"},
+            {"math","devices;create;stream;workspace;math;destroy;"},
+            {"sync","devices;create;stream;workspace;math;sync;destroy;"},
+            {"sample","devices;create;stream;workspace;math;sync;sample;destroy;"}}) {
+        discovery={}; discovery.fail=test.first; live=resources(); error.clear();
+        require(!discover_launch_resources(live,error),"required library/discovery failures refuse admission");
+        require(!error.empty() && live.vram_free==0 && !discovery.alive && discovery.events==test.second,
+                "failure preserves no snapshot, skips later work and releases the real owner");
+        if (test.first=="create") require(error.find("cublasCreate: cuBLAS status 3")!=std::string::npos,"creation status preserved");
+        if (test.first=="workspace") require(error.find("cublasSetWorkspace: cuBLAS status 7")!=std::string::npos,"workspace status preserved");
+        if (test.first=="math") require(error.find("cublasSetMathMode: cuBLAS status 7")!=std::string::npos,"math status preserved");
+    }
+    discovery={}; discovery.devices=2; live=resources();
+    require(!discover_launch_resources(live,error) && discovery.events=="devices;","unsupported topology never initializes BLAS");
+    discovery={}; discovery.inconsistent=true; live=resources();
+    require(!discover_launch_resources(live,error) && !discovery.alive && live.vram_free==0,"inconsistent sample still releases handle");
+    discovery={}; live={123,456,789,1,true};
+    require(discover_launch_resources(live,error) && discovery.events.empty() && live.vram_free==123 &&
+            live.ram_available==456 && live.commit_available==789,"injected discovery values stay exact without BLAS");
+    std::cout << "PASS launch_discovery_owner checks=" << checks << '\n';
 }
 #endif
 template<class T> void put(std::ostream& out, T value) { out.write((const char*) &value, sizeof value); }
@@ -266,11 +371,13 @@ void runtime_controls(const LaunchSettings& saved, uint64_t context, uint64_t kv
 int main(int argc, char** argv) {
     try {
         const bool guarded_mode=argc>1 && std::string(argv[1]).starts_with("--");
-#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
-        if (guarded_mode) forbid_device_calls();
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)) && \
+    !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_USE_SYCL)
+        if (guarded_mode) forbid_device_calls(std::string(argv[1])=="--discovery-owner");
+        if (argc==2 && std::string(argv[1])=="--discovery-owner") { discovery_controls(); return 0; }
 #elif defined(_WIN32)
         if (guarded_mode)
-            throw std::runtime_error("CPU runtime guards require Windows x64; no unguarded execution on this architecture");
+            throw std::runtime_error("CPU runtime guards require Windows x64 CUDA; no unguarded execution on this build");
 #else
         (void)guarded_mode;
 #endif
