@@ -110,8 +110,13 @@ true. Neither can silently select an unpriced mode.
 Omitting the budget is supported for explicit cache and microbatch settings,
 returning `not_evaluated`. Either automatic setting without a budget returns
 `requires_budget`. No host RAM value substitutes for commit and no explicit zero
-causes a live resource fallback. Automatic cache filling uses the existing native
-selection; largest-fitting-context search is deferred.
+causes a live resource fallback. Automatic cache selection checks the declared
+device, host RAM and host commit budgets through the native slot and resident
+complement owners. It backs off at whole grant boundaries if needed, retaining
+fixed settings and allowances. This bounded deterministic policy does not promise
+the largest cache or search every feasible configuration; largest-fitting-context
+search remains deferred. Explicit cache requests retain their counts and return
+shortfalls rather than resizing.
 
 `environment` accepts only these explicitly named native allocation controls:
 

@@ -90,6 +90,7 @@ std::string frame_launch_settings(const std::string& payload);
 bool read_launch_frame(std::istream&, std::string& payload, std::string& error);
 /// Binary, unbuffered stdin handoff to the later raw-fd command reader.
 bool read_launch_stdin(std::string& payload, std::string& error);
+/// Automatic cache grants back off against exact VRAM/RAM/commit pricing; explicit and approved layouts never resize.
 bool resolve_launch(const LaunchRequest&, const LaunchResources&, LaunchResolution&, std::string& error);
 /// A null budget prices explicit settings only. Zero-valued budgets are explicit insufficiency.
 /// Never discovers resources, mutates the environment, or emits an approved replay payload.

@@ -533,35 +533,18 @@ static bool price_launch_geometry(const LaunchRequest& r, const LaunchResources*
         const auto fixed=launch_add(base,s.vram_reserve);
         const uint64_t available=budget && budget->vram_free>fixed ? budget->vram_free-fixed : 0;
         if (!pure && !approved && fixed >= budget->vram_free) throw std::invalid_argument("insufficient VRAM before expert slots");
-        if (approved) {
-            s.slots=approved->slots;
-            for (const auto& slot:s.slots)
-                if (!unique.count({(int32_t)slot.layer,(int32_t)slot.expert}))
-                    throw std::invalid_argument("saved cache pair is absent from profile");
-        } else {
-        uint64_t cache_budget = r.expert_cache == -1 ? available : launch_mul((uint64_t) r.expert_cache,s.max_blob);
-        if (!pure && cache_budget > available) throw std::invalid_argument("explicit expert cache exceeds resource admission");
-        // Preserve the native uniform-grant provenance, then fill that byte budget in ranking order.
-        // Cache allocations round to backing pages; retain that rounding before selecting slots.
-        cache_budget = cache_budget / (2*MiB) * (2*MiB);
-        if (r.expert_cache == -1) cache_budget = launch_mul(std::min<uint64_t>(cache_budget/s.max_blob,ranked.size()),s.max_blob);
-        uint64_t used=0;
+        uint64_t cache_budget=0;
+        uint64_t layer_sum=0;
+        for (auto b:s.layer_blobs) layer_sum=launch_add(layer_sum,launch_align(b,256));
+        const auto minimum_cache=r.per_layer ? layer_sum : launch_align(s.layer_blobs[ranked.front().first],256);
+        const auto minimum_grants=minimum_cache/s.max_blob+(minimum_cache%s.max_blob!=0);
+        auto select_slots = [&] {
+        s.slots.clear(); uint64_t used=0;
         auto add_slot = [&](uint64_t l,uint64_t e) {
             const auto b=s.layer_blobs[l], aligned=launch_align(b,256);
             if (launch_add(used,aligned)>cache_budget) return false;
             s.slots.push_back({l,e,b,used}); used=launch_add(used,aligned); return true;
         };
-        uint64_t layer_sum=0;
-        for (auto b:s.layer_blobs) layer_sum=launch_add(layer_sum,launch_align(b,256));
-        if (pure && r.expert_cache==-1) {
-            const auto minimum=r.per_layer ? layer_sum : launch_align(s.layer_blobs[ranked.front().first],256);
-            const auto grants=minimum/s.max_blob+(minimum%s.max_blob!=0);
-            if (grants>ranked.size()) throw std::invalid_argument("profile cannot support minimum automatic grant");
-            // Selection first rounds available bytes down to pages, then grants whole max_blob units.
-            // Report that policy threshold separately from the actual minimum arena allocation.
-            out.minimum_policy_vram_free_bytes=launch_add(fixed,launch_align(launch_mul(grants,s.max_blob),2*MiB));
-        }
-        auto select_slots = [&] {
         if (r.per_layer) {
             const auto quota=std::min<uint64_t>(cache_budget/layer_sum,s.experts);
             for (uint64_t l=0;l<48;++l) {
@@ -571,15 +554,34 @@ static bool price_launch_geometry(const LaunchRequest& r, const LaunchResources*
             }
         } else for (auto [l,e]:ranked) if (!add_slot(l,e)) break;
         };
+        if (approved) {
+            s.slots=approved->slots;
+            for (const auto& slot:s.slots)
+                if (!unique.count({(int32_t)slot.layer,(int32_t)slot.expert}))
+                    throw std::invalid_argument("saved cache pair is absent from profile");
+        } else {
+        cache_budget = r.expert_cache == -1 ? available : launch_mul((uint64_t) r.expert_cache,s.max_blob);
+        if (!pure && cache_budget > available) throw std::invalid_argument("explicit expert cache exceeds resource admission");
+        // Preserve the native uniform-grant provenance, then fill that byte budget in ranking order.
+        // Cache allocations round to backing pages; retain that rounding before selecting slots.
+        cache_budget = cache_budget / (2*MiB) * (2*MiB);
+        if (r.expert_cache == -1) cache_budget = launch_mul(std::min<uint64_t>(cache_budget/s.max_blob,ranked.size()),s.max_blob);
+        if (pure && r.expert_cache==-1) {
+            if (minimum_grants>ranked.size()) throw std::invalid_argument("profile cannot support minimum automatic grant");
+            // Selection first rounds available bytes down to pages, then grants whole max_blob units.
+            // Report that policy threshold separately from the actual minimum arena allocation.
+            out.minimum_policy_vram_free_bytes=launch_add(fixed,launch_align(launch_mul(minimum_grants,s.max_blob),2*MiB));
+        }
         select_slots();
         if (s.slots.empty()) {
             if (!pure || r.expert_cache!=-1) throw std::invalid_argument("no expert cache slots fit");
             // Price the smallest supported policy layout, never a zero-cache launch.
             complete=false;
-            cache_budget=r.per_layer ? layer_sum : launch_align(s.layer_blobs[ranked.front().first],256);
+            cache_budget=minimum_cache;
             select_slots();
         }
         }
+        auto price_slots = [&] {
         uint64_t used=0;
         for (auto slot:s.slots) used=launch_add(used,launch_align(slot.bytes,256));
         out.vram["expert_cache"] = launch_align(used,2*MiB);
@@ -592,6 +594,7 @@ static bool price_launch_geometry(const LaunchRequest& r, const LaunchResources*
         int64_t held=0;
         core::detail::rank_cache_complement(offsets,s.layer_blobs,s.experts,&ranked,s.resident_budget,s.resident_bytes,held);
         s.resident_experts=held;
+        s.resident_order.clear();
         for (auto [l,e]:ranked) if (offsets[l*s.experts+e]!=core::detail::kNoCacheComplement)
             s.resident_order.push_back(l*s.experts+e);
         out.ram["resident_experts"] = s.resident_bytes;
@@ -607,6 +610,29 @@ static bool price_launch_geometry(const LaunchRequest& r, const LaunchResources*
         out.vram_required=sum(out.vram); out.ram_required=sum(out.ram);
         out.commit_required=launch_add(out.ram_required,out.vram_required);
         s.vram_required=out.vram_required; s.ram_required=out.ram_required; s.commit_required=out.commit_required;
+        return true;
+        };
+        if (!price_slots()) return false;
+        if (!approved && r.expert_cache==-1) {
+            auto fits = [&] { return out.vram_required<=budget->vram_free && out.ram_required<=budget->ram_available &&
+                                    out.commit_required<=budget->commit_available; };
+            uint64_t step=1;
+            while (!fits() && cache_budget>minimum_cache) {
+                const auto grants=cache_budget/s.max_blob;
+                if (grants>minimum_grants) {
+                    const auto shortfall=std::max(out.ram_required>budget->ram_available ? out.ram_required-budget->ram_available : 0,
+                        out.commit_required>budget->commit_available ? out.commit_required-budget->commit_available : 0);
+                    step=std::max(step,shortfall/s.max_blob+(shortfall%s.max_blob!=0));
+                    cache_budget=launch_mul(grants-std::min(step,grants-minimum_grants),s.max_blob);
+                    step=std::min<uint64_t>(ranked.size(),launch_mul(step,2));
+                } else cache_budget=minimum_cache;
+                // Back off only at existing grant boundaries, then try the supported minimum.
+                // Complement membership can change RAM cost: reprice each actual layout with its owner.
+                // This bounded deterministic search makes no monotonicity or maximum-cache claim.
+                select_slots();
+                if (!price_slots()) return false;
+            }
+        }
         if (approved && !(s==*approved)) throw std::invalid_argument("saved launch disagrees with metadata, argv or environment");
         if (!complete) check_launch_inventory(s);
         if (complete && !validate_launch_settings(s,error)) return false;
@@ -763,7 +789,9 @@ bool discover_launch_resources(LaunchResources& resources, std::string& error) {
         if (!resources.ram_available || !resources.commit_available) {
             core::detail::HostMemory host;
             if (!core::detail::host_available_memory(host)) throw std::invalid_argument("host resources unavailable");
-            resources.ram_available=host.available; resources.commit_available=host.commit;
+            resources.ram_available=host.available;
+            // Planned admission uses available RAM conservatively where commit accounting is unavailable.
+            resources.commit_available=host.commit==UINT64_MAX ? host.available : host.commit;
         }
         return true;
     } catch (const std::exception& e) { error=e.what(); return false; }

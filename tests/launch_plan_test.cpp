@@ -366,6 +366,99 @@ void runtime_controls(const LaunchSettings& saved, uint64_t context, uint64_t kv
     require(frame_effective_launch(saved,1).rfind("STRATA-EFFECTIVE/1\n1\n",0)==0,
             "existing strict effective framing remains compatible");
 }
+void joint_budget_controls(LaunchRequest request, LaunchResources ample, bool pure) {
+    request.expert_cache=-1;
+    std::string error;
+    auto resolve=[&](const LaunchRequest& r,const LaunchResources& budget,LaunchResolution& result) {
+        if (!pure) return resolve_launch(r,budget,result,error);
+        LaunchPrice price;
+        if (!price_launch(r,&budget,price,error)) return false;
+        result=std::move(price.resolution); return price.status=="within_priced_budget";
+    };
+    for (bool per_layer:{false,true}) {
+        request.per_layer=per_layer;
+        LaunchResolution old,chosen,repeated;
+        require(resolve(request,ample,old),"VRAM-filled automatic baseline fits ample joint budgets");
+        if (!pure && !per_layer) require(old.settings.slots.size()==1748 && old.vram.at("expert_cache")==4229955584 &&
+                old.settings.slots.back()==LaunchSlot{19,36,2662400,4226099200},
+                "ample automatic layout retains the independently captured pre-change slot transport");
+        auto extra=ample; extra.ram_available=64ull<<30; extra.commit_available=96ull<<30;
+        require(resolve(request,extra,repeated) && old.settings==repeated.settings && old.payload==repeated.payload,
+                "additional nonlimiting host budgets leave the ample layout unchanged");
+        auto limited=ample; limited.commit_available=old.commit_required-(256ull<<20);
+        require(old.vram_required<=limited.vram_free && old.ram_required<=limited.ram_available &&
+                old.commit_required>limited.commit_available,"old VRAM-only candidate exceeds only current commit budget");
+        require(resolve(request,limited,chosen),"automatic cache backs off to fit current joint budgets");
+        require(chosen.settings.slots.size()<old.settings.slots.size() && chosen.vram_required<=limited.vram_free &&
+                chosen.ram_required<=limited.ram_available && chosen.commit_required<=limited.commit_available,
+                "reduced automatic cache fits every supplied budget");
+        auto fixed=chosen.settings;
+        fixed.slots=old.settings.slots; fixed.resident_order=old.settings.resident_order;
+        fixed.resident_bytes=old.settings.resident_bytes; fixed.resident_experts=old.settings.resident_experts;
+        fixed.vram_required=old.settings.vram_required; fixed.ram_required=old.settings.ram_required;
+        fixed.commit_required=old.settings.commit_required;
+        require(fixed==old.settings,"joint selection preserves every requested control and fixed owner setting");
+        for (const auto& [name,bytes]:old.vram) if (name!="expert_cache")
+            require(chosen.vram.at(name)==bytes,"joint selection retains fixed VRAM categories");
+        for (const auto& [name,bytes]:old.ram) if (name!="resident_experts")
+            require(chosen.ram.at(name)==bytes,"joint selection retains fixed RAM categories");
+        uint64_t resident_bytes=0; bool complement=true;
+        std::vector<bool> cached(chosen.settings.layer_blobs.size()*chosen.settings.experts);
+        for (auto slot:chosen.settings.slots) cached[slot.layer*chosen.settings.experts+slot.expert]=true;
+        for (auto index:chosen.settings.resident_order) {
+            complement=complement && !cached[index];
+            resident_bytes+=chosen.settings.layer_blobs[index/chosen.settings.experts];
+        }
+        require(complement && resident_bytes==chosen.ram.at("resident_experts") &&
+                chosen.settings.resident_order!=old.settings.resident_order,"changed membership gets an exact fresh resident complement");
+        require(resolve(request,limited,repeated) && chosen.settings==repeated.settings && chosen.payload==repeated.payload,
+                "joint-budget automatic payload repeats deterministically");
+        if (!pure) {
+            const auto frozen=old.settings;
+            require(!admit_launch(request,limited,frozen,error) && frozen==old.settings &&
+                    error.find("commit_required_bytes="+std::to_string(old.commit_required))!=std::string::npos,
+                    "strict replay refuses frozen oversized cache without repairing its approved layout");
+            require(admit_launch(request,limited,chosen.settings,error),"reduced approved layout replays without resizing");
+        }
+        std::cout << "JOINT_BUDGET pure=" << pure << " per_layer=" << per_layer << " old_slots=" << old.settings.slots.size()
+                  << " chosen_slots=" << chosen.settings.slots.size() << " old_commit=" << old.commit_required
+                  << " chosen_commit=" << chosen.commit_required << " budget=" << limited.commit_available << '\n';
+    }
+    request.per_layer=false; request.expert_cache=64;
+    LaunchResolution explicit_plan,refused;
+    require(resolve(request,ample,explicit_plan),"explicit cache baseline fits ample budgets");
+    auto insufficient=ample; insufficient.commit_available=explicit_plan.commit_required-1;
+    require(!resolve(request,insufficient,refused),"explicit cache refuses a commit deficit instead of resizing");
+    if (pure) {
+        LaunchPrice explicit_price;
+        require(price_launch(request,&insufficient,explicit_price,error) && explicit_price.status=="does_not_fit" &&
+                explicit_price.commit_shortfall==1 && explicit_price.resolution.settings==explicit_plan.settings,
+                "pure explicit insufficiency retains its exact frozen count and shortfall");
+    }
+    request.expert_cache=-1;
+    for (bool ram_shortage:{false,true}) {
+        insufficient=ample;
+        if (ram_shortage) insufficient.ram_available=1; else insufficient.commit_available=1;
+        if (!pure) {
+            require(!resolve(request,insufficient,refused) && error.starts_with("insufficient_resources:"),
+                    "impossible host budget refuses without weakening requested controls");
+            continue;
+        }
+        LaunchPrice minimum;
+        require(price_launch(request,&insufficient,minimum,error) && minimum.status=="does_not_fit" &&
+                minimum.resolution.settings.slots.size()==1,"impossible joint budget returns the supported minimum as price data");
+        const auto& priced=minimum.resolution;
+        require(minimum.ram_shortfall==(ram_shortage ? priced.ram_required-1 : 0) &&
+                minimum.commit_shortfall==(ram_shortage ? 0 : priced.commit_required-1) && !minimum.vram_shortfall,
+                "minimum joint shortfalls use the full exact component totals");
+        for (const auto& [name,bytes]:explicit_plan.vram) if (name!="expert_cache")
+            require(priced.vram.at(name)==bytes,"impossible minimum retains every fixed VRAM category");
+        for (const auto& [name,bytes]:explicit_plan.ram) if (name!="resident_experts")
+            require(priced.ram.at(name)==bytes,"impossible minimum retains every fixed RAM category");
+        require(priced.settings.resident_budget==request.resident_budget && priced.settings.host_headroom==request.host_headroom &&
+                priced.settings.vram_reserve==request.vram_reserve,"minimum price never relaxes protected requested allowances");
+    }
+}
 }
 
 int main(int argc, char** argv) {
@@ -474,6 +567,7 @@ int main(int argc, char** argv) {
                 require(core::native_error_message("strict launch admission",error,"invalid_launch_plan").starts_with(
                     "insufficient_resources: strict launch admission:"),"strict wrapper retains resource cause and diagnostic");
             }
+            joint_budget_controls(r,resources,false);
             std::cout << "PASS launch_admission_resources checks=" << checks << '\n';
             return 0;
         }
@@ -489,6 +583,7 @@ int main(int argc, char** argv) {
         require(resolve_launch(r,resources,b,error) && a.payload==b.payload,"fixed inputs resolve deterministically");
         }
         if (pure_mode) {
+        joint_budget_controls(r,resources,true);
         auto explicit_request=r; explicit_request.expert_cache=97;
         LaunchPrice explicit_price;
         require(price_launch(explicit_request,nullptr,explicit_price,error),"explicit counts price without observation or budget");
