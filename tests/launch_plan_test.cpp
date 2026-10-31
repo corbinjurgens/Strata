@@ -435,7 +435,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         const bool pure_mode=argc>1 && std::string(argv[1])=="--pure";
-        const auto root=pure_mode && argc>2 ? fs::path(argv[2]) : argc>1 && !pure_mode ? fs::path(argv[1])
+        const bool admission_mode=argc>1 && std::string(argv[1])=="--admission-resources";
+        const auto root=(pure_mode || admission_mode) && argc>2 ? fs::path(argv[2]) : argc>1 && !pure_mode && !admission_mode ? fs::path(argv[1])
                            : fs::temp_directory_path()/(pure_mode ? "strata-launch-price-test" : "strata-launch-plan-test");
         require(root.is_absolute(),"fixtures must be outside checkout at an absolute path");
         fixture(root);
@@ -447,6 +448,35 @@ int main(int argc, char** argv) {
         r.vram_reserve=448ull<<20; r.reserve_given=true;
         LaunchResources resources{6ull<<30,48ull<<30,48ull<<30,1,true};
         LaunchResolution a,b; std::string error;
+        if (admission_mode) {
+            // Select the existing FP16 capability path so resource admission is CPU-only.
+            environment("STRATA_PREFILL_MMQ","0");
+            environment("STRATA_PF_FUSED","0");
+            r.expert_cache=64;
+            require(resolve_launch(r,resources,a,error),"fixed synthetic plan resolves without device discovery");
+            const auto approved=a.settings;
+            LaunchResources exact{a.vram_required,a.ram_required,a.commit_required,1,true};
+            require(admit_launch(r,exact,approved,error),"all exact resource boundaries admit frozen settings");
+            for (int resource=0;resource<3;++resource) {
+                auto current=exact;
+                if (resource==0) --current.vram_free;
+                if (resource==1) --current.ram_available;
+                if (resource==2) --current.commit_available;
+                require(!admit_launch(r,current,approved,error),"one-byte shortage refuses before startup");
+                const auto expected="insufficient_resources: insufficient launch resources (vram_required_bytes="+
+                    std::to_string(exact.vram_free)+" vram_available_bytes="+std::to_string(current.vram_free)+
+                    " ram_required_bytes="+std::to_string(exact.ram_available)+
+                    " ram_available_bytes="+std::to_string(current.ram_available)+
+                    " commit_required_bytes="+std::to_string(exact.commit_available)+
+                    " commit_available_bytes="+std::to_string(current.commit_available)+")";
+                require(error==expected,"refusal identifies every required and current resource byte value");
+                require(approved==a.settings,"diagnostics do not resize or mutate approved settings");
+                require(core::native_error_message("strict launch admission",error,"invalid_launch_plan").starts_with(
+                    "insufficient_resources: strict launch admission:"),"strict wrapper retains resource cause and diagnostic");
+            }
+            std::cout << "PASS launch_admission_resources checks=" << checks << '\n';
+            return 0;
+        }
         bool resolved=false;
         if (!pure_mode) {
         resolved=resolve_launch(r,resources,a,error);

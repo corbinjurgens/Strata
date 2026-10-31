@@ -621,7 +621,12 @@ static bool prepare_launch(const LaunchRequest& r, const LaunchResources& resour
         if (!price_launch_geometry(r,&resources,priced,approved,false,complete,error)) return false;
         if (priced.vram_required>resources.vram_free || priced.ram_required>resources.ram_available ||
             priced.commit_required>resources.commit_available)
-            throw std::invalid_argument("insufficient_resources: insufficient launch resources");
+            throw std::invalid_argument("insufficient_resources: insufficient launch resources (vram_required_bytes="+
+                std::to_string(priced.vram_required)+" vram_available_bytes="+std::to_string(resources.vram_free)+
+                " ram_required_bytes="+std::to_string(priced.ram_required)+
+                " ram_available_bytes="+std::to_string(resources.ram_available)+
+                " commit_required_bytes="+std::to_string(priced.commit_required)+
+                " commit_available_bytes="+std::to_string(resources.commit_available)+")");
         priced.payload=encode_launch_settings(priced.settings);
         LaunchSettings roundtrip;
         if (!decode_launch_settings(priced.payload,roundtrip,error) || !(roundtrip==priced.settings))
