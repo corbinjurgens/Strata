@@ -82,15 +82,37 @@ byte equality across different observations. Replay can observe current
 resources for admission, but does not run policy or resize approved settings.
 Conflicting replay CLI overrides refuse; supply credentials separately.
 
-Live native metadata planning and strict replay initialize the required prefill
-cuBLAS setup through the existing GEMM owner before synchronizing and reading
-CUDA free memory. The temporary handle stays alive during the reading, with no
-model buffers allocated. Its destructor then releases the handle; production
-prefill creates its own handle later. This measures the live library basis and
-does not deduct an invented fixed library cost or reduce the reserve allowance.
-Other runtime, driver and OS costs remain unknown. Pure `--price-only` and
-complete injected budgets, including zero budgets, perform no live discovery
-or BLAS setup. Ordinary startup keeps its existing initialization path.
+Live native metadata planning sends no injected VRAM, RAM or commit budgets.
+The native owner initializes the required prefill cuBLAS setup through the
+existing GEMM owner, synchronizes, and samples free CUDA memory and host
+resources on that initialized basis. No model buffers are allocated. The
+returned plan retains those native admission samples and the inventory's GPU
+identity, VRAM total and physical RAM total. CUDA and NVIDIA inventory totals
+can differ slightly for the same GPU; the CUDA total validates its free-memory
+reading and does not replace the inventory identity. Strict replay repeats
+native admission with current resources and the frozen geometry, without
+resizing the approved cache or other settings.
+
+An unapproved automatic cache starts with the existing VRAM grant and backs off
+at whole grant boundaries when a host budget is limiting. Each candidate reuses
+the exact slot and resident-complement pricing. This bounded selection policy
+checks VRAM, RAM and commit; it does not promise the largest cache or search all
+possible configurations. Explicit cache requests and approved replay never resize.
+Fixed settings and protected allowances stay unchanged if no candidate fits.
+
+On Windows, host commit is the separately observed available commit capacity;
+it can differ from available or total physical RAM. On other hosts, planned
+admission conservatively uses available RAM for both host budgets and retains
+`commit_basis: "available_ram"`. It does not claim to observe a Windows-style
+commit limit there.
+
+This basis does not deduct an invented fixed library cost or reduce the reserve
+allowance. It is a point-in-time observation, not a resource reservation or
+complete process accounting; runtime, driver and OS costs remain unknown.
+Pure `--price-only` and complete injected budgets, including zero budgets,
+perform no live discovery or BLAS setup. Python's pure `memory_plan` interface
+also remains independent of live hardware observation. Ordinary startup keeps
+its existing initialization path.
 
 Saved replay also retains `log` from the original local config, outside the
 public plan and its digest. Relative log paths resolve against the saved launch
@@ -521,5 +543,7 @@ two-token chat, settled a streaming disconnect and unloaded with confirmed child
 exit. This is bounded correctness evidence, not a performance benchmark or
 acceptance of every generated profile. The automatic profile was refused because
 the planning NVIDIA free-memory reading exceeded the later CUDA-context reading.
-That admission discrepancy remains open; reducing reserve floors is not a remedy
-established by this check. Physical residency and HIP/SYCL remain unverified.
+That check predates native post-initialization resource sampling; the sampling
+correction does not establish that this earlier automatic profile now loads.
+Reducing reserve floors is not a remedy established by this check. Physical
+residency and HIP/SYCL remain unverified.

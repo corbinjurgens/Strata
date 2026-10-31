@@ -680,6 +680,31 @@ class Runtime(unittest.TestCase):
                                                query=query or self.query, source_config=cfg, config_path=self.config_path)
         self.saved_path.write_bytes(lp.canonical(self.saved))
 
+    def test_live_native_samples_survive_saved_replay_and_public_admission(self):
+        with patch.object(fixtures.prep, "refreshed_config", self.original_refresh):
+            self.saved = self.original_producer(self.cfg, inherited=self.env, query=self.query,
+                                               source_config=self.cfg, config_path=self.config_path)
+        self.saved_path.write_bytes(lp.canonical(self.saved))
+        self.assertEqual(lp.read_plan(self.saved_path)["hardware"], {
+            **fixtures.HARDWARE, "vram_free_bytes": 5326766080,
+            "ram_available_bytes": 36 << 30, "commit_available_bytes": 40 << 30})
+        args = SimpleNamespace(launch_plan=str(self.saved_path), config=None, engine="strata", api_key=None)
+        with patch.dict(os.environ, self.env, clear=True):
+            replay, cfg, key = lr.replay_cli(args, set())
+        self.assertEqual(replay, self.saved)
+        self.assertEqual(cfg["args"], self.saved["launch"]["argv"][3:])
+        self.assertEqual(key, "")
+        self.assertEqual(self.spawns, [])
+        frozen = lp.canonical(self.saved)
+        for resource, required in (("vram_free_bytes", 1024), ("ram_available_bytes", 2048),
+                                   ("commit_available_bytes", 3072)):
+            with self.subTest(resource=resource):
+                self.hardware.return_value = copy.deepcopy(self.saved["hardware"])
+                self.hardware.return_value[resource] = required - 1
+                self.assertEqual(self.main_refusal([])["code"], "insufficient_resources")
+                self.assertEqual(lp.canonical(lp.read_plan(self.saved_path)), frozen)
+        self.assertEqual(self.spawns, [])
+
     def test_documented_first_use_cli_http_and_cleanup(self):
         """PAIR_INTEGRATION.md sequence, with synthetic hardware/artifacts only."""
         with socket.socket() as listener:

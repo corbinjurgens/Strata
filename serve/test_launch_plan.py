@@ -83,12 +83,11 @@ def fake_metadata(argv, env, *, reverse=False):
     effective += "cache_slots=2\ncache_bytes=512\nkv_stage_runs=" + ",".join(map(str, runs)) + "\n"
     effective += "native_payload_fingerprint=" + str(fnv(payload.encode())) + "\n"
     settings.update(layer_blobs=[256] * 48, kv_stage_runs=runs, resident_order=[], slots=slots)
-    resources = {"vram_free": 5326766080,
-                 "ram_available": int(argv[argv.index("--plan-ram-available-bytes") + 1]),
-                 "commit_available": int(argv[argv.index("--plan-commit-available-bytes") + 1]),
-                 "devices": 1}
+    resources = {"vram_free": 5326766080, "ram_available": 36 << 30,
+                 "commit_available": 40 << 30, "devices": 1}
     if "--plan-vram-free-bytes" in argv:
-        resources["vram_free"] = int(argv[argv.index("--plan-vram-free-bytes") + 1])
+        for name in ("vram-free", "ram-available", "commit-available"):
+            resources[name.replace("-", "_")] = int(argv[argv.index("--plan-" + name + "-bytes") + 1])
     else:
         resources["vram_total"] = 6 << 30
     return dict(schema=1, native_schema=2, kind="native_metadata", strict_consumer=True, ownership_telemetry=True,
@@ -271,7 +270,7 @@ class Plans(unittest.TestCase):
                 self.plan(inherited=env)
             self.assertNotIn("do-not-print", str(error.exception))
 
-    def test_live_vram_uses_native_sample_under_frozen_environment(self):
+    def test_live_budgets_use_native_samples_under_frozen_environment(self):
         observed_hardware = {**HARDWARE, "vram_free_bytes": 6207569920}
         query = Mock(side_effect=self.query)
         with patch.object(lp, "observe_hardware", return_value=observed_hardware) as observed, \
@@ -282,13 +281,17 @@ class Plans(unittest.TestCase):
         gpu.assert_not_called()
         query.assert_called_once()
         sent = query.call_args.args[0]
-        self.assertNotIn("--plan-vram-free-bytes", sent)
-        self.assertEqual(sent[sent.index("--plan-ram-available-bytes") + 1], str(48 << 30))
-        self.assertEqual(sent[sent.index("--plan-commit-available-bytes") + 1], str(48 << 30))
+        for name in ("vram-free", "ram-available", "commit-available"):
+            self.assertNotIn("--plan-" + name + "-bytes", sent)
         self.assertEqual(query.call_args.kwargs["env"], lp.replay_environment(a["launch"]["environment"], self.env))
         self.assertEqual(a["hardware"]["vram_free_bytes"], 5326766080)
         self.assertEqual(a["hardware"]["vram_total_bytes"], 6 << 30)
+        self.assertEqual(a["hardware"]["ram_available_bytes"], 36 << 30)
+        self.assertEqual(a["hardware"]["commit_available_bytes"], 40 << 30)
+        self.assertEqual(a["hardware"]["ram_total_bytes"], 64 << 30)
         self.assertEqual(observed_hardware["vram_free_bytes"], 6207569920)
+        self.assertEqual(observed_hardware["ram_available_bytes"], 48 << 30)
+        self.assertEqual(observed_hardware["commit_available_bytes"], 48 << 30)
         saved = self.root / "live-plan.json"
         saved.write_bytes(lp.canonical(a))
         self.assertEqual(lp.read_plan(saved), a)
@@ -311,12 +314,18 @@ class Plans(unittest.TestCase):
             launch_runtime.admit(plan)
         self.assertEqual(plan["hardware"]["vram_total_bytes"], HARDWARE["vram_total_bytes"])
         self.assertEqual(plan["hardware"]["vram_free_bytes"], 5326766080)
+        self.assertEqual(plan["hardware"]["ram_available_bytes"], 36 << 30)
+        self.assertEqual(plan["hardware"]["commit_available_bytes"], 40 << 30)
 
     def test_live_invalid_native_resources_refuse(self):
         for field, value in (("vram_total", 0), ("vram_total", 1), ("vram_total", True),
                              ("vram_total", 2**64), ("vram_free", -1), ("vram_free", 7 << 30),
                              ("vram_free", False), ("vram_free", 5326766080.0),
-                             ("ram_available", 1), ("commit_available", 1), ("devices", 2), ("devices", True)):
+                             ("ram_available", -1), ("ram_available", 65 << 30),
+                             ("ram_available", True), ("ram_available", 2**64),
+                             ("commit_available", -1), ("commit_available", False),
+                             ("commit_available", 40.0), ("commit_available", 2**64),
+                             ("devices", 0), ("devices", 2), ("devices", True)):
             def invalid(argv, *, cwd, env):
                 reply = fake_metadata(argv, env)
                 reply["resources"][field] = value
@@ -331,6 +340,39 @@ class Plans(unittest.TestCase):
         with patch.object(lp, "observe_hardware", return_value=HARDWARE), self.assertRaises(lp.PlanError):
             lp.produce_plan(self.cfg, inherited=self.env, query=missing_total)
 
+    def test_live_insufficient_native_budgets_refuse(self):
+        for field in ("vram_free", "ram_available", "commit_available"):
+            for value in (0, 1):
+                def insufficient(argv, *, cwd, env):
+                    reply = fake_metadata(argv, env)
+                    reply["resources"][field] = value
+                    return json.dumps(reply).encode()
+                with self.subTest(field=field, value=value), \
+                        patch.object(lp, "observe_hardware", return_value=HARDWARE), \
+                        self.assertRaisesRegex(lp.PlanError, "insufficient_resources"):
+                    lp.produce_plan(self.cfg, inherited=self.env, query=insufficient)
+
+    def test_live_host_commit_keeps_platform_basis(self):
+        non_windows = {**HARDWARE, "windows_commit": False, "commit_basis": "available_ram"}
+        def native_commit(value):
+            def query(argv, *, cwd, env):
+                reply = fake_metadata(argv, env)
+                reply["resources"]["commit_available"] = value
+                return json.dumps(reply).encode()
+            return query
+        with patch.object(lp, "observe_hardware", return_value=non_windows):
+            plan = lp.produce_plan(self.cfg, inherited=self.env, query=native_commit(36 << 30))
+            self.assertEqual(plan["hardware"]["ram_available_bytes"], 36 << 30)
+            self.assertEqual(plan["hardware"]["commit_available_bytes"], 36 << 30)
+            self.assertEqual(plan["hardware"]["commit_basis"], "available_ram")
+            for value in (40 << 30, 2**64 - 1):
+                with self.subTest(value=value), self.assertRaisesRegex(lp.PlanError, "inconsistent native host"):
+                    lp.produce_plan(self.cfg, inherited=self.env, query=native_commit(value))
+        with patch.object(lp, "observe_hardware", return_value=HARDWARE):
+            plan = lp.produce_plan(self.cfg, inherited=self.env, query=native_commit(70 << 30))
+        self.assertEqual(plan["hardware"]["commit_available_bytes"], 70 << 30)
+        self.assertEqual(plan["hardware"]["commit_basis"], "available_commit")
+
     def test_injected_resources_remain_exact_without_observation(self):
         sample = {**HARDWARE, "vram_free_bytes": 5326766080}
         query = Mock(side_effect=self.query)
@@ -339,7 +381,9 @@ class Plans(unittest.TestCase):
         self.assertEqual(plan["hardware"], sample)
         self.assertEqual(sample["vram_free_bytes"], 5326766080)
         sent = query.call_args.args[0]
-        self.assertEqual(sent[sent.index("--plan-vram-free-bytes") + 1], "5326766080")
+        for name, value in (("vram-free", "5326766080"), ("ram-available", str(48 << 30)),
+                            ("commit-available", str(48 << 30))):
+            self.assertEqual(sent[sent.index("--plan-" + name + "-bytes") + 1], value)
         for field, value in (("vram_free", 5326766079), ("ram_available", 1),
                              ("commit_available", 1), ("devices", 2), ("devices", True), ("vram_total", 6 << 30)):
             def contradictory(argv, *, cwd, env):
@@ -348,6 +392,19 @@ class Plans(unittest.TestCase):
                 return json.dumps(reply).encode()
             with self.subTest(field=field, value=value), self.assertRaises(lp.PlanError):
                 self.plan(hardware=sample, query=contradictory)
+
+    def test_injected_zero_budgets_are_complete_and_never_discover_live_resources(self):
+        cfg = copy.deepcopy(self.cfg)
+        del cfg["memory_policy"]
+        sample = {**HARDWARE, "vram_free_bytes": 0, "ram_available_bytes": 0, "commit_available_bytes": 0}
+        query = Mock(side_effect=self.query)
+        with patch.object(lp, "observe_hardware", side_effect=AssertionError("live discovery")), \
+                self.assertRaisesRegex(lp.PlanError, "insufficient_resources"):
+            self.plan(cfg, hardware=sample, query=query)
+        query.assert_called_once()
+        sent = query.call_args.args[0]
+        for name in ("vram-free", "ram-available", "commit-available"):
+            self.assertEqual(sent[sent.index("--plan-" + name + "-bytes") + 1], "0")
 
     def test_insufficient_observed_resources_refuse_before_any_launch(self):
         with self.assertRaisesRegex(lp.PlanError, "insufficient_resources"):
