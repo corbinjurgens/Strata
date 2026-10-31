@@ -6782,8 +6782,11 @@ int main(int argc, char** argv) {
             int64_t need = 0, fb = 0;
             if (!own_fits(o.prefill_chunk, dev, need, fb)) {
                 if (strict_launch) {
-                    std::fprintf(stderr,own_query_failed ? "ERROR prefill_resource_query: free memory unavailable\n" :
-                        "ERROR insufficient_resources: approved prefill buffers no longer fit\n"); return 1;
+                    if (own_query_failed) std::fprintf(stderr,"ERROR prefill_resource_query: free memory unavailable\n");
+                    else std::fprintf(stderr,"ERROR insufficient_resources: approved prefill buffers no longer fit "
+                        "(device=%d need_bytes=%lld headroom_bytes=%lld free_bytes=%lld chunk=%lld)\n",
+                        dev,(long long)need,(long long)kHeadroom,(long long)fb,(long long)o.prefill_chunk);
+                    return 1;
                 }
                 int64_t c = 0;
                 for (const int64_t s : kStepChunks) {
@@ -8478,7 +8481,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr,"ERROR final_resource_query: %s\n",cudaGetErrorString(query)); return 1;
                 }
                 if (free<effective.vram_reserve) {
-                    std::fprintf(stderr,"ERROR insufficient_resources: approved final VRAM reserve unavailable\n"); return 1;
+                    std::fprintf(stderr,"ERROR insufficient_resources: approved final VRAM reserve unavailable "
+                        "(free_bytes=%llu reserve_bytes=%llu total_bytes=%llu)\n",
+                        (unsigned long long)free,(unsigned long long)effective.vram_reserve,(unsigned long long)total);
+                    return 1;
                 }
                 const auto frame=strata::plan::frame_effective_launch(effective,1);
                 if (std::fwrite(frame.data(),1,frame.size(),stdout)!=frame.size()) return 1;

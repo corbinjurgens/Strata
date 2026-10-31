@@ -99,6 +99,9 @@ def fake_runtime_main():
         stream.write(json.dumps(capture) + "\n")
     if mode == "exit-before-ready":
         return
+    if mode == "native-resource-refusal":
+        print("ERROR insufficient_resources: diagnostic fixture final reserve unavailable", file=sys.stderr, flush=True)
+        return
     build = json.loads((cwd / "BUILD.json").read_text())["build"]
     if mode == "bad-build":
         build["commit"] = "mismatch"
@@ -1075,6 +1078,40 @@ class Runtime(unittest.TestCase):
         self.assertFalse(readers[0].is_alive())
         self.assertTrue(logs[0].closed)
 
+    def test_public_replay_retains_local_native_failure_log_and_cleanup(self):
+        tokenizer = self.root / "tokenizer"
+        tokenizer.mkdir()
+        for name, value in (("vocab.json", "{}"), ("merges.txt", ""), ("token_type.json", "[]")):
+            (tokenizer / name).write_text(value)
+        cfg = {**self.cfg, "tokenizer": str(tokenizer), "log": "native-failure.log"}
+        self.replace_plan(cfg)
+        self.assertNotIn("log", self.saved["server"])
+        digest = self.saved["plan_digest"]
+        # Local diagnostic rotation is independent of approved settings/identity.
+        cfg["log"] = "native-failure-rotated.log"
+        self.config_path.write_bytes(lp.canonical(cfg))
+        (self.root / "mode.txt").write_text("native-resource-refusal")
+        output = io.StringIO()
+        with self.startup_handles() as (processes, readers, logs), \
+                patch.object(sys, "argv", ["server", "--launch-plan", str(self.saved_path)]), \
+                patch.object(server, "Server", return_value=SimpleNamespace(server_close=lambda: None)), \
+                patch.object(server, "Service", side_effect=AssertionError("service started after refusal")), \
+                patch.object(server, "narrate_start"), \
+                patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=lambda *a: server.ByteTokenizer())}), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(server.main(), 2)
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1])["error"]["code"], "insufficient_resources",
+                         output.getvalue())
+        self.assertNotIn("diagnostic fixture", output.getvalue())
+        self.assertEqual(lp.read_plan(self.saved_path)["plan_digest"], digest)
+        retained = self.root / "native-failure-rotated.log"
+        self.assertIn("diagnostic fixture final reserve unavailable", retained.read_text())
+        self.assertFalse((self.root / "native-failure.log").exists())
+        self.assertEqual(len(processes), 1)
+        self.assertTrue(all(p.poll() is not None and p.stdin.closed and p.stdout.closed for p in processes))
+        self.assertTrue(readers and all(not reader.is_alive() for reader in readers))
+        self.assertTrue(logs and all(log.closed for log in logs))
+
     def test_ordinary_restart_retries_after_constructor_cleanup(self):
         for transient in (False, True):
             with self.subTest(transient=transient):
@@ -1381,6 +1418,21 @@ class Runtime(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     replay_cli(cli, {"api_key"})
             self.assertEqual(read.call_count, 1)
+
+    def test_replay_local_log_destination_validation(self):
+        def args():
+            return SimpleNamespace(launch_plan=str(self.saved_path), config=None, engine="strata", api_key=None)
+
+        for value in (True, False, 1, [], {}, "bad\nSYNTHETIC-SECRET"):
+            cfg = {**self.cfg, "log": value}
+            self.config_path.write_bytes(lp.canonical(cfg))
+            with self.subTest(value=value), self.assertRaises(lp.PlanError) as error:
+                lr.replay_cli(args(), set())
+            self.assertNotIn("SYNTHETIC-SECRET", str(error.exception))
+        for value in (None, ""):
+            self.config_path.write_bytes(lp.canonical({**self.cfg, "log": value}))
+            with self.subTest(value=value):
+                self.assertNotIn("log", lr.replay_cli(args(), set())[1])
 
     def test_public_abbreviated_replay_bad_arguments_are_bounded_json(self):
         output = io.StringIO()

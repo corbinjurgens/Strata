@@ -53,7 +53,7 @@ def admit(plan):
 
 
 def replay_cli(args, explicit):
-    """Load the original credential source separately from frozen public settings."""
+    """Load local credentials/diagnostic destination separately from approved settings."""
     plan = lp.read_plan(args.launch_plan)
     cfg = {}
     source = plan["inputs"]["config_path"]
@@ -85,6 +85,14 @@ def replay_cli(args, explicit):
     frozen = copy.deepcopy(plan["server"])
     frozen.update(exe=plan["launch"]["executable"], cwd=plan["launch"]["cwd"],
                   args=plan["launch"]["argv"][3:], gpu=plan["hardware"]["gpu_index"], backend="cuda")
+    # Logs are local operational destinations, excluded from public plan identity.
+    # Retain the source config's destination so replay does not discard native
+    # startup diagnostics. Use the existing engine log/cleanup owner unchanged.
+    log = cfg.get("log")
+    if log not in (None, ""):
+        if not isinstance(log, str) or any(ord(c) < 32 for c in log):
+            raise lp.PlanError("invalid_launch_plan: invalid local log destination")
+        frozen["log"] = str((Path(plan["launch"]["cwd"]) / log).absolute())
     for flag, name in fields.items():
         if flag in ("host", "port", "tokenizer"):
             setattr(args, flag, frozen.get(name, defaults[flag]))

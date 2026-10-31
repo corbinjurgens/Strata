@@ -82,6 +82,14 @@ byte equality across different observations. Replay can observe current
 resources for admission, but does not run policy or resize approved settings.
 Conflicting replay CLI overrides refuse; supply credentials separately.
 
+Saved replay also retains `log` from the original local config, outside the
+public plan and its digest. Relative log paths resolve against the saved launch
+working directory. PAIR should set a private local diagnostic destination before
+startup so native refusal details survive; HTTP errors remain sanitized. The
+existing engine owner opens and closes that log. Changing only its destination
+does not change approved native settings or the plan digest. Do not put secrets
+in native arguments or share raw logs without checking their contents.
+
 In another PowerShell terminal, these are executable authenticated HTTP
 requests. `PAIR_API_KEY` below is a client-side placeholder environment variable,
 not a Strata credential source. It must contain the same key as the server.
