@@ -252,8 +252,9 @@ def bounded_query(argv, *, cwd, env, timeout=20, limit=MAX_JSON) -> bytes:
             reader.join(timeout=min(5, max(0, cleanup_deadline - time.monotonic())))
         if any(reader.is_alive() for reader in readers):
             raise PlanError("invalid_launch_plan: metadata pipe did not close")
-        if code and not failed.is_set() and (errors.startswith(b"invalid_launch_plan: insufficient ") or
-                errors.startswith(b"invalid_launch_plan: explicit expert cache exceeds resource admission")):
+        if code and not failed.is_set() and errors.startswith((
+                b"insufficient_resources:", b"invalid_launch_plan: insufficient ",
+                b"invalid_launch_plan: explicit expert cache exceeds resource admission")):
             raise PlanError("insufficient_resources: native metadata admission refused")
         if failed.is_set() or code:
             raise PlanError("invalid_launch_plan: bounded metadata query refused or exceeded limit")

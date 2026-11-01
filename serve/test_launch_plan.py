@@ -820,6 +820,42 @@ class Queries(unittest.TestCase):
                 lp.bounded_query([sys.executable, "-B", "-c", script], cwd=tempfile.gettempdir(), env=dict(os.environ))
             self.assertNotIn("synthetic-secret", str(error.exception))
 
+    def test_resource_refusal_prefix_survives_query_and_public_json(self):
+        prefixes = ("insufficient_resources: native launch metadata: insufficient launch resources",
+                    "invalid_launch_plan: insufficient VRAM before expert slots",
+                    "invalid_launch_plan: explicit expert cache exceeds resource admission",
+                    "noise insufficient_resources: incidental diagnostic")
+        original = server.popen
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                processes = []
+                def capture(*args, **kwargs):
+                    proc = original(*args, **kwargs)
+                    processes.append(proc)
+                    return proc
+                def query(*args, **kwargs):
+                    script = "import sys;sys.stderr.write(" + repr(prefix + " synthetic-secret") + ");sys.exit(2)"
+                    return lp.bounded_query([sys.executable, "-B", "-c", script],
+                                            cwd=tempfile.gettempdir(), env=dict(os.environ))
+                output = io.StringIO()
+                with patch.object(server, "popen", side_effect=capture), \
+                        patch.object(lp, "_read", return_value=b"{}"), \
+                        patch.object(lp, "produce_plan", side_effect=query), \
+                        patch.object(sys, "argv", ["strata", "--print-launch-plan", "--config", "synthetic.json",
+                                                  "--engine", "strata"]), contextlib.redirect_stdout(output):
+                    code = server.main()
+                self.assertEqual(code, 2)
+                body = json.loads(output.getvalue())
+                resource = not prefix.startswith("noise")
+                self.assertEqual(body["error"]["code"], "insufficient_resources" if resource else "invalid_launch_plan")
+                message = ("insufficient_resources: native metadata admission refused" if resource else
+                           "invalid_launch_plan: bounded metadata query refused or exceeded limit")
+                self.assertEqual(body["error"]["message"], message)
+                self.assertNotIn("synthetic-secret", output.getvalue())
+                self.assertEqual(len(processes), 1)
+                self.assertIsNotNone(processes[0].poll())
+                self.assertTrue(processes[0].stdout.closed and processes[0].stderr.closed)
+
 
 if __name__ == "__main__":
     unittest.main()
