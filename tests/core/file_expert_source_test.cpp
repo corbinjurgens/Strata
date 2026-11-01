@@ -162,6 +162,9 @@ struct FileExpertSourceTestAccess {
     }
     static void age(FileExpertSource& s) { s.epoch_ += FileExpertSource::kStageAge; }
     static bool has(FileExpertSource& s, int64_t key) { return s.stage_of_.count(key) != 0; }
+    static bool mapped_release(const FileExpertSource& s) { return s.mapped_release_; }
+    static const uint8_t* role_ptr(const FileExpertSource& s, size_t index) { return s.role_ptr_.at(index); }
+    static uint64_t role_bytes(const FileExpertSource& s, size_t index) { return s.role_bytes_.at(index); }
 };
 }
 
@@ -233,6 +236,14 @@ void check_file_size_rejection(strata::core::FileExpertSource& source, const fs:
 }
 
 #if defined(_WIN32)
+bool page_resident(const void* address) {
+    PSAPI_WORKING_SET_EX_INFORMATION state{};
+    state.VirtualAddress = const_cast<void*>(address);
+    require(QueryWorkingSetEx(GetCurrentProcess(), &state, sizeof state) != 0,
+            "QueryWorkingSetEx failed for the release fixture");
+    return state.VirtualAttributes.Valid != 0;
+}
+
 void check_mapped_release(strata::core::FileExpertSource& source, int64_t layer, int64_t expert, uint64_t bytes) {
     const uint8_t* p = source.blob(layer, expert);
     require(p != nullptr, "release fixture has no mapped blob");
@@ -243,13 +254,7 @@ void check_mapped_release(strata::core::FileExpertSource& source, int64_t layer,
     const uintptr_t first = ((uintptr_t) p + page - 1) / page * page;
     const uintptr_t end = ((uintptr_t) p + bytes) / page * page;
     require(end > first, "release fixture has no full interior page");
-    auto resident = [&](uintptr_t address) {
-        PSAPI_WORKING_SET_EX_INFORMATION state{};
-        state.VirtualAddress = (void*) address;
-        require(QueryWorkingSetEx(GetCurrentProcess(), &state, sizeof state) != 0,
-                "QueryWorkingSetEx failed for the release fixture");
-        return state.VirtualAttributes.Valid != 0;
-    };
+    auto resident = [](uintptr_t address) { return page_resident((const void*) address); };
     const char* setting = std::getenv("STRATA_FILE_RELEASE");
     const bool enabled = setting != nullptr && std::strcmp(setting, "1") == 0;
     for (int round = 0; round < 3; ++round) {
@@ -323,6 +328,260 @@ void test_canonical_layout() {
     source.close();
     require(source.release(0, 0) == 0, "a closed file source released pages");
 }
+
+#if defined(_WIN32)
+// The strict launch's planned mapped-copy release (Windows; startup-only): after a COMPLETED CPU copy of a mapped
+// source blob into caller-owned staging, the blob's full interior mapped pages are advised out with release()'s
+// geometry. The mapping, its pointers and every allocation geometry stay; a later read re-faults the file. The
+// speculative mapped hints are suppressed, while mandatory stage filling still runs.
+void test_mapped_copy_release() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    using FM = FileExpertSource::FetchMetric;
+    using Access = strata::core::detail::FileExpertSourceTestAccess;
+    std::string err;
+
+    // ---- the mapped experts.bin mapping: default off, then the option's exact per-copy advice ----
+    const int64_t layers = 2, experts = 3;
+    const uint64_t layer_bytes2 = (uint64_t) experts * BLOB;
+    TempDirectory bin_dir;
+    require(expert_layout_load(bin_dir.path.string(), layers, experts, err), err);
+    std::vector<uint8_t> truth((size_t) (layers * layer_bytes2));
+    for (size_t i = 0; i < truth.size(); ++i) truth[i] = (uint8_t) ((i * 131u) ^ (i >> 9) ^ (i >> 17));
+    {
+        std::ofstream out(bin_dir.path / "experts.bin", std::ios::binary);
+        require((bool) out, "could not create the mapped-copy release fixture");
+        out.write((const char*) truth.data(), (std::streamsize) truth.size());
+        require((bool) out, "could not size the mapped-copy release fixture");
+    }
+    FileExpertSource source;
+    require(source.open(bin_dir.path.string(), layers, experts, err), err);
+    require(!Access::mapped_release(source) && !source.mapped_copy_release(),
+            "mapped-copy release did not default to off");
+    source.set_fetch_profiling(true);
+    SavedEnv saved_release("STRATA_FILE_RELEASE"), saved_pvm("STRATA_FETCH_PVM");
+    set_env("STRATA_FILE_RELEASE", nullptr);
+    set_env("STRATA_FETCH_PVM", "1");
+
+#if defined(_WIN32)
+    SYSTEM_INFO sys{};
+    GetSystemInfo(&sys);
+    const uint64_t page = sys.dwPageSize;
+    // full interior pages of one mapped range: the contract release() is documented to advise
+    auto interior = [&](const uint8_t* p, uint64_t bytes) -> uint64_t {
+        const uintptr_t mis = (uintptr_t) p % page;
+        const uintptr_t skip = mis == 0 ? 0 : page - mis;
+        return bytes <= skip ? (uint64_t) 0 : (bytes - skip) / page * page;
+    };
+#endif
+
+    // default off: an exact copy and no advice, and no stage/exchange/resident geometry at all
+    std::vector<uint8_t> dst((size_t) BLOB, 0xA5);
+    const FileExpertSource::FileCacheStats geometry = source.file_cache_stats();
+    require(geometry.buffers == 0, "a plain open allocated stage buffers");
+    require(source.copy_blob(0, 0, dst.data()) &&
+                std::memcmp(dst.data(), truth.data(), (size_t) BLOB) == 0,
+            "the default-off copy differs from the file");
+    const uint8_t* p0 = source.blob(0, 0);
+    require(p0 != nullptr, "the mapping lost a blob pointer to a plain copy");
+    require(source.fetch_stats().get(FM::mapped_release_bytes) == 0, "the default off advised mapped pages");
+#if defined(_WIN32)
+    require(page_resident(p0), "reading the expert left its page out of the working set");
+#endif
+
+#if defined(_WIN32)
+    // option on: copies stay exact and each advises exactly its blob's full interior pages once per copy
+    source.set_mapped_copy_release(true);
+    require(Access::mapped_release(source), "the option setter did not stick");
+    const uint8_t* p1 = source.blob(0, 1);
+    require(p1 != nullptr && p1 != p0, "the mapping lost distinct blob pointers");
+    const uint64_t expect = interior(p1, BLOB);
+    require(expect > 0 && expect < BLOB, "the release fixture has no shared boundary page");
+    require(source.copy_blob(0, 1, dst.data()) &&
+                std::memcmp(dst.data(), truth.data() + (size_t) BLOB, (size_t) BLOB) == 0,
+            "the advised copy differs from the file");
+    require(source.fetch_stats().get(FM::mapped_release_bytes) == expect,
+            "the first advised copy advised byte counts that are not the blob's full interior pages");
+    require(page_resident(p1), "the advised copy dropped the blob's shared first page");
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        require(source.copy_blob(0, 1, dst.data()) &&
+                    std::memcmp(dst.data(), truth.data() + (size_t) BLOB, (size_t) BLOB) == 0,
+                "a repeated advised copy differs from the file");
+    }
+    require(source.fetch_stats().get(FM::mapped_release_bytes) == 3 * expect,
+            "repeated copies did not repeat the full-interior-page advice");
+    // BLOB is 337.5 pages: blob (0,1) starts mid-page (shared head, whole interior tail), while the page-aligned
+    // blob (0,0) ends in a shared half-page that must survive its own advice. Trimmed pages may be mapped back
+    // at once from standby, so nothing is asserted about their residency.
+    require(source.copy_blob(0, 0, dst.data()) &&
+                std::memcmp(dst.data(), truth.data(), (size_t) BLOB) == 0,
+            "the advised copy of the page-aligned blob differs from the file");
+    require(page_resident((const void*) (p0 + (size_t) BLOB - 1)),
+            "the advised copy dropped the page-aligned blob's shared last page");
+
+    uint64_t expected = source.fetch_stats().get(FM::mapped_release_bytes);
+    for (int64_t l = 0; l < layers; ++l)
+        for (int64_t e = 0; e < experts; ++e) {
+            require(source.copy_blob(l, e, dst.data()) &&
+                        std::memcmp(dst.data(), truth.data() + (size_t) ((l * experts + e) * BLOB), (size_t) BLOB) == 0,
+                    "an advised copy of another blob differs from the file");
+            const uint8_t* p = source.blob(l, e);
+            require(p != nullptr, "the mapping lost a blob pointer after the advice");
+            expected += interior(p, BLOB);
+        }
+    require(source.fetch_stats().get(FM::mapped_release_bytes) == expected,
+            "the advised byte total did not match every copied blob's full interior pages");
+
+    const FileExpertSource::FileCacheStats after = source.file_cache_stats();
+    require(after.buffers == 0 && after.allocated_bytes == 0,
+            "an advised copy allocated stage geometry");
+    require(source.exchange_buffer(0) == nullptr && !source.complement_ready(),
+            "an advised copy grew exchange or resident geometry");
+    for (int64_t l = 0; l < layers; ++l)
+        for (int64_t e = 0; e < experts; ++e) {
+            const uint8_t* p = source.blob(l, e);
+            require(p != nullptr &&
+                        std::memcmp(p, truth.data() + (size_t) ((l * experts + e) * BLOB), (size_t) BLOB) == 0,
+                    "the advice corrupted a mapped blob");
+        }
+    require(source.release(1, 2) == interior(source.blob(1, 2), BLOB),
+            "release() did not act while the option is on (expected full interior bytes)");
+#endif
+    require(source.release(-1, 0) == 0 && source.release(0, -1) == 0 && source.release(layers, 0) == 0 &&
+                source.release(0, experts) == 0 && source.release(-1, -1) == 0 &&
+                source.release(std::numeric_limits<int64_t>::max(), 0) == 0 &&
+                source.release(0, std::numeric_limits<int64_t>::max()) == 0,
+            "release accepted an invalid layer or expert");
+
+    source.close();
+    require(!source.mapped_copy_release() && !Access::mapped_release(source),
+            "close kept the mapped-copy release option");
+    require(source.open(bin_dir.path.string(), layers, experts, err), err);
+    require(!source.mapped_copy_release() && !Access::mapped_release(source),
+            "a reopened source inherited the mapped-copy release option");
+    source.close();
+
+#if defined(STRATA_NATIVE_EXPERTS)
+    // ---- a GGUF fixture in place: warm and the mapped fill hint do not touch pages under the option ----
+    constexpr int64_t glayers = 2, gexperts = 6;
+    TempDirectory gguf_dir;
+    NativeFmt gfmt;
+    require(native_fmt(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640, gfmt, err), err);
+    const uint64_t glayer_bytes = (uint64_t) gexperts * gfmt.bytes;
+    std::vector<uint8_t> gheader, gpayload, gtruth((size_t) (glayers * glayer_bytes));
+    auto put = [](std::vector<uint8_t>& out, uint64_t n, size_t bytes) {
+        for (size_t i = 0; i < bytes; ++i) out.push_back((uint8_t) (n >> (8 * i)));
+    };
+    auto str = [&](std::vector<uint8_t>& out, const std::string& s) {
+        put(out, s.size(), 8); out.insert(out.end(), s.begin(), s.end());
+    };
+    for (size_t i = 0; i < gtruth.size(); ++i)
+        gtruth[i] = (uint8_t) ((i * 157u) ^ (i >> 8) ^ (i >> 19));
+    put(gheader, 0x46554747, 4); put(gheader, 3, 4);
+    put(gheader, (uint64_t) glayers * 3, 8); put(gheader, 0, 8);   // three role tensors per layer, no metadata
+    uint64_t absolute[6] = {}, relative[6] = {}, per[6] = {};
+    const char* roles[3] = {"gate", "up", "down"};
+    for (int l = 0; l < (int) glayers; ++l) {
+        uint64_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const int i = 3 * l + r;
+            per[i] = r < 2 ? gfmt.up_off : gfmt.bytes - gfmt.down_off;
+            relative[i] = gpayload.size();
+            str(gheader, "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight");
+            put(gheader, 3, 4);
+            put(gheader, r < 2 ? 2560 : 640, 8);
+            put(gheader, r < 2 ? 640 : 2560, 8);
+            put(gheader, (uint64_t) gexperts, 8);
+            put(gheader, r < 2 ? gfmt.gu_type : gfmt.d_type, 4);
+            put(gheader, relative[i], 8);
+            for (int64_t e = 0; e < gexperts; ++e) {
+                const auto first = gtruth.begin() +
+                    (ptrdiff_t) ((uint64_t) l * glayer_bytes + (uint64_t) e * gfmt.bytes + at);
+                gpayload.insert(gpayload.end(), first, first + (ptrdiff_t) per[i]);
+            }
+            at += per[i];
+        }
+    }
+    gheader.resize((gheader.size() + 31) / 32 * 32, 0);
+    for (int i = 0; i < 6; ++i) absolute[i] = gheader.size() + relative[i];
+    {
+        std::ofstream out(gguf_dir.path / "roles.gguf", std::ios::binary);
+        out.write((const char*) gheader.data(), (std::streamsize) gheader.size());
+        out.write((const char*) gpayload.data(), (std::streamsize) gpayload.size());
+        require((bool) out, "could not write the warm-fixture GGUF");
+    }
+    {
+        std::ofstream metadata(gguf_dir.path / "native_experts.txt");
+        for (int l = 0; l < (int) glayers; ++l) {
+            metadata << l << ' ' << gfmt.gu_type << ' ' << gfmt.d_type << ' ' << (l == 0 ? 0 : glayer_bytes)
+                     << ' ' << gfmt.bytes;
+            for (int r = 0; r < 3; ++r) metadata << ' ' << absolute[3 * l + r];
+            metadata << " roles.gguf,roles.gguf,roles.gguf\n";
+        }
+        require((bool) metadata, "could not write the warm-fixture layout");
+    }
+    require(expert_layout_load(gguf_dir.path.string(), glayers, gexperts, err), err);
+    FileExpertSource warm_src;
+    warm_src.set_gguf((gguf_dir.path / "roles.gguf").string());
+    require(warm_src.open(gguf_dir.path.string(), glayers, gexperts, err), err);
+    require(warm_src.gguf_mode() && warm_src.warms(), "the warm fixture did not open the GGUF in place");
+    warm_src.set_fetch_profiling(true);
+
+    const std::vector<int64_t> early{0, 1, 2}, late{3, 4, 5};
+    // control (option off): the speculative hints and fills run as they always did
+    const uint64_t warm_hint0 = warm_src.fetch_stats().get(FM::prefetch_hint_ns);
+    warm_src.warm(0, late.data(), (int64_t) late.size());
+    require(warm_src.fetch_stats().get(FM::prefetch_hint_ns) > warm_hint0,
+            "the ordinary warm control did not issue its native mapped hint");
+    require(warm_src.warmed() == (int64_t) late.size(), "warm did not record its predictions");
+    const uint64_t hint0 = warm_src.fetch_stats().get(FM::prefetch_hint_ns);
+    warm_src.prefetch(0, early.data(), (int64_t) early.size());
+    const uint64_t hint_delta = warm_src.fetch_stats().get(FM::prefetch_hint_ns) - hint0;
+    require(hint_delta > 0, "the ordinary fill control did not issue its native mapped hint");
+    for (int64_t e : early) {
+        const uint8_t* b = warm_src.blob(0, e);
+        require(b != nullptr &&
+                    std::memcmp(b, gtruth.data() + (size_t) ((uint64_t) e * gfmt.bytes), (size_t) gfmt.bytes) == 0,
+                "layer 0's staged blob differs from the file");
+    }
+
+    // option on: warm and the mapped fill's speculative hint are suppressed, the copies are not
+    warm_src.set_mapped_copy_release(true);
+    require(Access::mapped_release(warm_src), "the option setter did not stick on the GGUF source");
+    const uint64_t advice_before = warm_src.fetch_stats().get(FM::mapped_release_bytes);
+    uint64_t gguf_advice = 0;
+    for (int64_t e : early)
+        for (size_t r = 3; r < 6; ++r) {
+            const uint64_t bytes = Access::role_bytes(warm_src, r);
+            gguf_advice += interior(Access::role_ptr(warm_src, r) + (size_t) ((uint64_t) e * bytes), bytes);
+        }
+    require(gguf_advice > 0, "the GGUF fixture has no full interior source pages");
+    const uint64_t warm_hint1 = warm_src.fetch_stats().get(FM::prefetch_hint_ns);
+    warm_src.warm(1, late.data(), (int64_t) late.size());
+    require(warm_src.fetch_stats().get(FM::prefetch_hint_ns) == warm_hint1,
+            "the option-on warm still issued a native speculative hint");
+    require(warm_src.warmed() == (int64_t) 2 * late.size(),
+            "warm stopped recording under the mapped-copy release option");
+    const uint64_t hint1 = warm_src.fetch_stats().get(FM::prefetch_hint_ns);
+    warm_src.prefetch(1, early.data(), (int64_t) early.size());
+    require(warm_src.fetch_stats().get(FM::prefetch_hint_ns) == hint1,
+            "the option-on mapped fill still made a speculative hint");
+    for (int64_t e : early) {
+        const uint8_t* b = warm_src.blob(1, e);
+        require(b != nullptr && std::memcmp(b, gtruth.data() + (size_t) (glayer_bytes + (uint64_t) e * gfmt.bytes),
+                                            (size_t) gfmt.bytes) == 0,
+                "the option-on staged fill lost its mandatory copy");
+    }
+    require(warm_src.fetch_stats().get(FM::mapped_release_bytes) - advice_before == gguf_advice,
+            "the GGUF staged fills did not advise every copied role's full interior pages");
+    warm_src.close();
+    require(!Access::mapped_release(warm_src), "close kept the option on the GGUF source");
+#endif   // STRATA_NATIVE_EXPERTS
+
+    std::cout << "mapped copy release: default off, exact advised bytes, boundary pages, repeats, "
+                 "geometry, warm/hint suppression, reset PASS\n";
+}
+#endif  // _WIN32
 
 #if defined(STRATA_NATIVE_EXPERTS)
 void test_direct_mapping_retirement() {
@@ -1896,6 +2155,16 @@ void test_rotating_source(bool rotate, bool pin) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--mapped-copy-release") {
+#if defined(_WIN32)
+            test_mapped_copy_release();
+            std::cout << "file_expert_source_test --mapped-copy-release: PASS\n";
+            return 0;
+#else
+            std::cerr << "mapped-copy release fixture requires Windows\n";
+            return 2;
+#endif
+        }
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
@@ -1904,6 +2173,9 @@ int main(int argc, char** argv) {
         test_cgroup_memory_budget();
         test_host_memory();
         test_canonical_layout();
+#if defined(_WIN32)
+        test_mapped_copy_release();
+#endif
         test_unbuffered_reads();
         test_fetch_profiling();
         test_ready_copy_out();

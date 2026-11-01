@@ -622,11 +622,14 @@ public:
     /// removed on safe replacement/reclamation, not failed fills. fill_ns is the inclusive fill_many duration.
     /// read_ns is direct-read time; buffered_read_ns is the retired-view fallback. Both contribute to OS
     /// submit/wait/request/byte counters. Fallback writes into the caller's buffer and needs no assembly copy.
+    /// mapped_release_bytes counts the mapped source bytes ADVISED back to the OS after a completed copy
+    /// (set_mapped_copy_release); advice may repeat for the same bytes and is never a physical-RAM reclaim count.
     enum class FetchMetric : size_t {
         caller_ns, claim_ns, lookup_ns, scan_ns, allocation_ns, eviction_ns, lock_wait_ns, fill_wait_ns,
         fill_ns, publish_ns, read_ns, read_plan_ns, read_submit_ns, read_wait_ns, direct_copy_ns, mapped_copy_ns,
         prefetch_hint_ns, claims, hits, busy_hits, misses, scan_slots, allocations, allocation_bytes, evictions,
         read_batches, read_requests, submitted_bytes, completed_bytes, direct_copy_bytes, mapped_copy_bytes,
+        mapped_release_bytes,
         buffered_read_ns, buffered_read_bytes, count
     };
     struct FetchStats {
@@ -664,6 +667,16 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// Windows, startup-only and default off: the planned mapped-copy release. After a COMPLETED CPU copy of a
+    /// mapped source blob into caller-owned host staging, the mapping's full interior pages (release()'s
+    /// geometry) are advised out of the process working set. The mapping, views, pointers and allocation
+    /// geometry remain valid; later reads may fault the pages back in. Advice may repeat and does not guarantee
+    /// physical reclamation. release() also acts without STRATA_FILE_RELEASE=1 while this is on.
+    /// Speculative mapped PrefetchVirtualMemory hints in fill_many and warm are suppressed; mandatory copies
+    /// still read their source pages. Ordinary startup and the STRATA_FILE_RELEASE=1 switch stay unchanged.
+    /// close() resets the option. Automatic enabling is Windows-only.
+    void set_mapped_copy_release(bool enable) { mapped_release_ = enable; }
+    bool mapped_copy_release() const { return mapped_release_; }
     /// Every expert's bytes (n_layers x n_expert blobs).
     uint64_t expert_bytes() const;
     /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
@@ -758,6 +771,15 @@ private:
     std::array<std::atomic<uint64_t>, (size_t) CopyMetric::count> copy_counts_{};
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+#if defined(_WIN32)
+    /// The trim body release() shares with the mapped-copy release option: VirtualUnlock one mapped range's
+    /// full interior pages, so a shared boundary page stays for the neighboring expert. Returns bytes ADVISED;
+    /// not a measurement of physical RAM reclaimed.
+    uint64_t release_mapped_pages(const uint8_t* p, uint64_t bytes, int64_t layer, int64_t expert) const;
+#endif
+    /// The option's step after a completed mapped copy: advise the blob's mapped spans and count the bytes.
+    uint64_t release_copied_pages(int64_t layer, int64_t expert) const;
+    bool mapped_release_ = false;   ///< the set_mapped_copy_release option; close() resets it
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false,

@@ -1044,6 +1044,7 @@ void FileExpertSource::close() {
     file_us_.store(0);
     fetch_profiling_ = false;
     for (auto& value : fetch_counts_) value.store(0, std::memory_order_relaxed);
+    mapped_release_ = false;   // the mapped-copy release option is startup-only
     io_cached_.store(0); io_uncached_.store(0); io_pread_bytes_.store(0); io_pread_us_.store(0); io_pread_n_.store(0);
     io_pf_jobs_.store(0); io_pf_blobs_.store(0); io_pf_skips_.store(0); io_pf_dropped_.store(0);
     io_pf_used_.store(0); io_pf_unused_.store(0); io_crit_us_.store(0); io_crit_n_.store(0);
@@ -1212,12 +1213,14 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
             fetch_add(FetchMetric::mapped_copy_bytes, per);
             at += per;
         }
+        release_copied_pages(layer, expert);   // the bytes have reached the caller-owned destination
         return true;
     }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
     fetch_add(FetchMetric::mapped_copy_bytes, layer_blob_bytes_[(size_t) layer]);
+    release_copied_pages(layer, expert);   // after the completed copy, not before and not a pread/IO buffer
     return true;
 }
 
@@ -1741,7 +1744,8 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             if (v != nullptr && std::atoi(v) == 0) return (Pvm) nullptr;
             return (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
         }();
-        if (pvm != nullptr) {
+        // Planned copies fault in their required pages, then advise them out. Do not queue speculative hints.
+        if (pvm != nullptr && !mapped_release_) {
             FetchTimer hint(fetch_counter(FetchMetric::prefetch_hint_ns));
             std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
             ranges.reserve(todo.size() * 3);
@@ -2314,6 +2318,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
 #if defined(_WIN32)
     using Pvm = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
     static const Pvm pvm = (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    // Keep prediction stamps but do not queue speculative mapped hints while copy release is enabled.
     std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
 #endif
     for (int64_t j = 0; j < n; ++j) {
@@ -2333,7 +2338,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             const size_t i = (size_t) (3 * layer + r);
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * role_bytes_[i]);
 #if defined(_WIN32)
-            ranges.push_back({(PVOID) p, (SIZE_T) role_bytes_[i]});
+            if (!mapped_release_) ranges.push_back({(PVOID) p, (SIZE_T) role_bytes_[i]});
 #else
             const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
             (void) madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_WILLNEED);
@@ -2341,7 +2346,10 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         }
     }
 #if defined(_WIN32)
-    if (pvm != nullptr && !ranges.empty()) (void) pvm(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0);
+    if (pvm != nullptr && !ranges.empty() && !mapped_release_) {
+        FetchTimer hint(fetch_counter(FetchMetric::prefetch_hint_ns));
+        (void) pvm(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0);
+    }
 #endif
 }
 
@@ -2641,50 +2649,78 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
     return base_ + (size_t) offset;
 }
 
+#if defined(_WIN32)
+uint64_t FileExpertSource::release_mapped_pages(const uint8_t* p, uint64_t bytes, int64_t layer,
+                                                int64_t expert) const {
+    static const uint64_t page = [] {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        return (uint64_t) info.dwPageSize;
+    }();
+    const uint64_t misalignment = (uintptr_t) p % page;
+    const uint64_t skip = misalignment == 0 ? 0 : page - misalignment;
+    if (bytes <= skip) return 0;
+    const uint64_t whole = (bytes - skip) / page * page;
+    if (whole == 0) return 0;
+    SetLastError(ERROR_SUCCESS);
+    if (!VirtualUnlock((LPVOID) (p + (size_t) skip), (SIZE_T) whole)) {
+        const DWORD error = GetLastError();
+        // VirtualUnlock trims an unlocked range and reports FALSE / ERROR_NOT_LOCKED for that success.
+        if (error != ERROR_NOT_LOCKED) {
+            std::fprintf(stderr, "FileExpertSource: cannot trim mapped pages for layer %lld expert %lld "
+                                 "(%llu bytes, Windows error %lu)\n",
+                         (long long) layer, (long long) expert, (unsigned long long) whole,
+                         (unsigned long) error);
+            std::fflush(stderr);
+            return 0;
+        }
+    }
+    return whole;   // bytes advised, not a measurement of physical RAM reclaimed
+}
+
+uint64_t FileExpertSource::release_copied_pages(int64_t layer, int64_t expert) const {
+    if (!mapped_release_ || base_ == nullptr) return 0;
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
+    uint64_t advised = 0;
+    if (role_ptr_.empty()) {   // experts.bin: one contiguous range
+        if (const uint8_t* p = mapped_blob(layer, expert))
+            advised += release_mapped_pages(p, layer_blob_bytes_[(size_t) layer], layer, expert);
+        fetch_add(FetchMetric::mapped_release_bytes, advised);
+        return advised;
+    }
+    for (int r = 0; r < 3; ++r) {   // never the complement, exchange, stage or destination buffers
+        const size_t i = (size_t) (3 * layer + r);
+        advised += release_mapped_pages(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]),
+                                        role_bytes_[i], layer, expert);
+    }
+    fetch_add(FetchMetric::mapped_release_bytes, advised);
+    return advised;
+}
+#else
+uint64_t FileExpertSource::release_copied_pages(int64_t layer, int64_t expert) const {
+    (void) layer; (void) expert;
+    return 0;
+}
+#endif
+
 uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #if defined(_WIN32)
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
-    if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if ((!enabled && !mapped_release_) || base_ == nullptr || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_)
         return 0;
-    static const uint64_t page = [] {
-        SYSTEM_INFO info{};
-        GetSystemInfo(&info);
-        return (uint64_t) info.dwPageSize;
-    }();
-    // These read-only file views are not CUDA-registered. blob() may instead return pinned RAM or an exchange
-    // buffer, so resolve the file spans directly. A shared boundary page stays for the neighboring expert.
-    auto trim = [&](const uint8_t* p, uint64_t bytes) -> uint64_t {
-        const uint64_t misalignment = (uintptr_t) p % page;
-        const uint64_t skip = misalignment == 0 ? 0 : page - misalignment;
-        if (bytes <= skip) return 0;
-        const uint64_t whole = (bytes - skip) / page * page;
-        if (whole == 0) return 0;
-        SetLastError(ERROR_SUCCESS);
-        if (!VirtualUnlock((LPVOID) (p + (size_t) skip), (SIZE_T) whole)) {
-            const DWORD error = GetLastError();
-            // VirtualUnlock trims an unlocked range and reports FALSE / ERROR_NOT_LOCKED for that success.
-            if (error != ERROR_NOT_LOCKED) {
-                std::fprintf(stderr, "FileExpertSource: cannot trim mapped pages for layer %lld expert %lld "
-                                     "(%llu bytes, Windows error %lu)\n",
-                             (long long) layer, (long long) expert, (unsigned long long) whole,
-                             (unsigned long) error);
-                std::fflush(stderr);
-                return 0;
-            }
-        }
-        return whole;   // bytes advised, not a measurement of physical RAM reclaimed
-    };
     if (role_ptr_.empty()) {
         const uint8_t* p = mapped_blob(layer, expert);
-        return p == nullptr ? 0 : trim(p, layer_blob_bytes_[(size_t) layer]);
+        return p == nullptr ? 0 : release_mapped_pages(p, layer_blob_bytes_[(size_t) layer], layer, expert);
     }
     uint64_t bytes = 0;
     for (int r = 0; r < 3; ++r) {
         const size_t i = (size_t) (3 * layer + r);
-        bytes += trim(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i]);
+        bytes += release_mapped_pages(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i],
+                                      layer, expert);
     }
     return bytes;
 #else

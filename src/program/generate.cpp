@@ -4207,6 +4207,14 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts; %s)\n",
                      src.gguf_mode() ? "the GGUF shards in place, no experts.bin" : "the A/B arm of R2.1");
+#if defined(_WIN32)
+        // Configure copy-completion advice before readers start; keep mappings and staging geometry intact.
+        if (strict_launch) {
+            src.set_mapped_copy_release(true);
+            std::fprintf(stderr, "strata generate: strict launch: mapped expert pages advised out after host copies; "
+                                 "speculative mapped warming disabled\n");
+        }
+#endif
         // #286: with a RAM budget the hottest experts live in it, and the rest are read from the drive unbuffered
         // when the file cache could not keep them beside the budget anyway (a 32 GB PC) - the mapped reads' page
         // faults are small requests on the critical path, and their pages take the RAM the budget was sized for
@@ -11263,6 +11271,7 @@ int main(int argc, char** argv) {
                     "direct_copy_ns", "mapped_copy_ns", "prefetch_hint_ns", "claims", "hits", "busy_hits", "misses",
                     "scan_slots", "allocations", "allocation_bytes", "evictions", "read_batches", "read_requests",
                     "submitted_bytes", "completed_bytes", "direct_copy_bytes", "mapped_copy_bytes",
+                    "mapped_release_bytes",
                     "buffered_read_ns", "buffered_read_bytes"
                 };
                 static_assert(sizeof(names) / sizeof(names[0]) == (size_t) FM::count);
