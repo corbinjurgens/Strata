@@ -441,7 +441,33 @@ def cmake_settings(bdir: Path) -> dict:
     return selected
 
 
+def selected_ggml_root(metadata: dict) -> Path:
+    """The GGML checkout the receipt names, else this repository's default build input."""
+    settings = metadata.get("cmake_settings")
+    if isinstance(settings, dict) and settings.get("STRATA_GGML_DIR"):
+        return Path(settings["STRATA_GGML_DIR"])
+    recorded = metadata.get("ggml")
+    if isinstance(recorded, dict) and recorded.get("root"):
+        return Path(recorded["root"])
+    return ROOT / "third_party/llama.cpp"
+
+
 def check_source_identity(metadata: dict) -> None:
+    build = metadata.get("build")
+    modern = build.get("source_sha256") if isinstance(build, dict) else None
+    if isinstance(build, dict) and "source_sha256" in build:
+        # A modern receipt owns identity through one digest over engine sources and
+        # the selected GGML tree; never fall back to the legacy src/ggml fields.
+        if not (isinstance(modern, str) and re.fullmatch(r"[0-9a-f]{64}", modern)):
+            raise ValueError("Build receipt has an invalid engine source digest; "
+                             "rebuild before installing or launching.")
+        llama = selected_ggml_root(metadata)
+        if not (llama / "ggml/CMakeLists.txt").is_file():
+            raise ValueError("Selected GGML source is unavailable; rebuild before installing or launching.")
+        if modern != build_provenance.source_identity(ROOT, llama):
+            raise ValueError("Build receipt does not match current engine or selected GGML sources; "
+                             "rebuild before installing or launching.")
+        return
     if metadata.get("src") != setup.source_hash(setup.ENGINE_SOURCES):
         raise ValueError("Build receipt does not match current engine sources; rebuild before installing or launching.")
     recorded = metadata.get("ggml")

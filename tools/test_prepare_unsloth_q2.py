@@ -1457,6 +1457,138 @@ class PortableProfiles(unittest.TestCase):
             prep.check_ready(cfg)
         identity.assert_called_once()
 
+    def engine_sources(self):
+        (self.root / "src").mkdir(parents=True, exist_ok=True)
+        (self.root / "src/engine.cpp").write_text("engine source")
+        llama = self.root / "third_party/llama.cpp"
+        (llama / "ggml").mkdir(parents=True)
+        (llama / "ggml/CMakeLists.txt").write_text("fixture")
+        (llama / "ggml/ggml.c").write_text("selected input")
+        return llama
+
+    def modern_record(self, **extra):
+        return {"schema_version": 1, "commit": "test-commit", "dirty": True,
+                "built_at": "2026-01-01T00:00:00Z", "cuda": "13.4", "version": "test-version",
+                "backend": "cuda", **extra}
+
+    def modern_receipt(self, record, settings=None):
+        payload = b"compiled fixture\0STRATA_BUILD/1:" + prep.build_provenance.json_bytes(record) + b"\n\0"
+        metadata = prep.build_provenance.metadata_for(payload, "strata-unsloth-portable.exe")
+        if settings is not None:
+            metadata["cmake_settings"] = dict(settings)
+        return payload, metadata
+
+    def ready_modern(self, payload, metadata):
+        cfg = self.make_config()
+        Path(cfg["exe"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg["exe"]).write_bytes(payload)
+        Path(cfg["build_metadata"]).write_bytes(prep.json_bytes(metadata))
+        for name in ("native_experts.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja",
+                     "source-verification.json"):
+            path = self.root / "pack" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture")
+        return cfg
+
+    def test_automatic_ready_accepts_modern_receipt_without_legacy_source_fields(self):
+        llama = self.engine_sources()
+        payload, metadata = self.modern_receipt(self.modern_record(
+            source_sha256=prep.build_provenance.source_identity(self.root, llama)))
+        self.assertNotIn("src", metadata)
+        self.assertNotIn("ggml", metadata)
+        with patch.object(prep, "missing_shards", return_value=[]):
+            prep.check_ready(self.ready_modern(payload, metadata))
+
+    def test_modern_receipt_refuses_engine_or_selected_ggml_drift(self):
+        llama = self.engine_sources()
+        payload, metadata = self.modern_receipt(self.modern_record(
+            source_sha256=prep.build_provenance.source_identity(self.root, llama)))
+        cfg = self.ready_modern(payload, metadata)
+        with patch.object(prep, "missing_shards", return_value=[]):
+            prep.check_ready(cfg)
+            source = self.root / "src/engine.cpp"
+            original = source.read_bytes()
+            source.write_bytes(b"mutated")
+            with self.assertRaisesRegex(ValueError, "does not match current engine or selected GGML"):
+                prep.check_ready(cfg)
+            source.write_bytes(original)
+            ggml = llama / "ggml/ggml.c"
+            original = ggml.read_bytes()
+            ggml.write_bytes(b"mutated")
+            with self.assertRaisesRegex(ValueError, "does not match current engine or selected GGML"):
+                prep.check_ready(cfg)
+            ggml.write_bytes(original)
+            prep.check_ready(cfg)
+            (llama / "ggml/untracked.c").write_text("new input")
+            with self.assertRaisesRegex(ValueError, "does not match current engine or selected GGML"):
+                prep.check_ready(cfg)
+
+    def test_modern_receipt_refuses_wrong_executable_sha_or_embedded_build(self):
+        llama = self.engine_sources()
+        record = self.modern_record(source_sha256=prep.build_provenance.source_identity(self.root, llama))
+        payload, metadata = self.modern_receipt(record)
+        cfg = self.ready_modern(payload, metadata)
+        with patch.object(prep, "missing_shards", return_value=[]):
+            Path(cfg["exe"]).write_bytes(payload + b"appended")
+            with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+                prep.check_ready(cfg)
+            Path(cfg["exe"]).write_bytes(payload)
+            metadata["build"] = {**record, "built_at": "2025-01-01T00:00:00Z"}
+            Path(cfg["build_metadata"]).write_bytes(prep.json_bytes(metadata))
+            with self.assertRaisesRegex(ValueError, "embedded build record"):
+                prep.check_ready(cfg)
+
+    def test_modern_hash_refusal_never_falls_back_to_valid_legacy_fields(self):
+        llama = self.engine_sources()
+        valid = prep.build_provenance.source_identity(self.root, llama)
+        self.assertEqual(len(valid), 64)
+        for modern, message in ((None, "invalid engine source digest"),
+                                (0, "invalid engine source digest"),
+                                (False, "invalid engine source digest"),
+                                ([], "invalid engine source digest"),
+                                ({}, "invalid engine source digest"),
+                                ("f" * 63, "invalid engine source digest"),
+                                ("g" * 64, "invalid engine source digest"),
+                                ("0" * 64, "does not match current engine or selected GGML")):
+            with self.subTest(modern=modern):
+                payload, metadata = self.modern_receipt(self.modern_record(source_sha256=modern))
+                metadata.update({"src": "same-engine-source", "ggml": prep.ggml_identity(llama)})
+                cfg = self.ready_modern(payload, metadata)
+                with patch.object(prep, "missing_shards", return_value=[]), \
+                        patch.object(prep.setup, "source_hash", return_value="same-engine-source"):
+                    with self.assertRaisesRegex(ValueError, message):
+                        prep.check_ready(cfg)
+
+    def test_modern_receipt_uses_recorded_selected_ggml_locator(self):
+        default = self.engine_sources()
+        selected = self.root / "selected/llama.cpp"
+        (selected / "ggml").mkdir(parents=True)
+        (selected / "ggml/CMakeLists.txt").write_text("fixture")
+        (selected / "ggml/ggml.c").write_text("selected only")
+        record = self.modern_record(source_sha256=prep.build_provenance.source_identity(self.root, selected))
+        self.assertNotEqual(record["source_sha256"],
+                            prep.build_provenance.source_identity(self.root, default))
+        payload, metadata = self.modern_receipt(record, {"STRATA_GGML_DIR": str(selected)})
+        cfg = self.ready_modern(payload, metadata)
+        with patch.object(prep, "missing_shards", return_value=[]):
+            prep.check_ready(cfg)
+            (selected / "ggml/ggml.c").write_text("changed")
+            with self.assertRaisesRegex(ValueError, "does not match current engine or selected GGML"):
+                prep.check_ready(cfg)
+        via_ggml_root = dict(metadata, cmake_settings={}, ggml={"root": str(selected)})
+        Path(cfg["build_metadata"]).write_bytes(prep.json_bytes(via_ggml_root))
+        with patch.object(prep, "missing_shards", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "does not match current engine or selected GGML"):
+                prep.check_ready(cfg)
+        (selected / "ggml/ggml.c").write_text("selected only")
+        Path(cfg["build_metadata"]).write_bytes(prep.json_bytes(via_ggml_root))
+        with patch.object(prep, "missing_shards", return_value=[]):
+            prep.check_ready(cfg)
+            Path(cfg["build_metadata"]).write_bytes(prep.json_bytes(
+                self.modern_receipt(record, {"STRATA_GGML_DIR": str(self.root / "missing")})[1]))
+            with self.assertRaisesRegex(ValueError, "Selected GGML source is unavailable"):
+                prep.check_ready(cfg)
+
     def test_batch_arguments_are_always_quoted_and_percent_escaped(self):
         self.assertEqual(prep.batch_quote(r"C:\Models&Cache\model.json"), '"C:\\Models&Cache\\model.json"')
         self.assertEqual(prep.batch_quote("name%USER%^!().json"), '"name%%USER%%^!().json"')
